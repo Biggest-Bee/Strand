@@ -7,9 +7,9 @@ Strand answers the question *"what breaks if I change X?"* instantly, on
 graphs with tens of millions of edges, with no server and no query language:
 
 ```console
-$ strand build Cargo.lock-deps.csv -o deps.strand
+$ strand build deps.csv -o deps.strand
 $ strand impact deps.strand serde_json
-impact of [serde_json]: 14 affected (15 direct, ...)
+impact of [serde_json]: 20 affected (6 direct, 14 transitive)
 $ strand why deps.strand my-app serde_json
 my-app -> serde -> serde_json
 ```
@@ -240,7 +240,6 @@ cargo test
 
 ## License
 
-Proprietary — all rights reserved. See [LICENSE](LICENSE), which includes a
-**Content Creation Policy**: you may make content about Strand (reviews,
-videos, tutorials, streams, articles) without prior permission, subject to
-the conditions stated there.
+[Apache-2.0](LICENSE) — permissive, patent-granting, and it explicitly
+allows creating content about the software (reviews, videos, tutorials)
+without permission.

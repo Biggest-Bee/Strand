@@ -3,7 +3,7 @@ name = "strand-import"
 version = "0.1.0"
 edition = "2021"
 description = "Importers for strand graph files (CSV/TSV edge lists, cargo metadata)"
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
 
 [dependencies]
 strand-core = { path = "../strand-core" }

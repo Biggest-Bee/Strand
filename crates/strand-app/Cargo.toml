@@ -3,7 +3,7 @@ name = "strand-app"
 version = "0.2.0"
 edition = "2021"
 description = "Desktop GUI for Strand dependency/impact analysis (eframe/egui)"
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
 
 [dependencies]
 strand-core = { path = "../strand-core" }

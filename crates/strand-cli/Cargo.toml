@@ -3,7 +3,7 @@ name = "strand-cli"
 version = "0.1.0"
 edition = "2021"
 description = "strand: dependency and impact analysis CLI"
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
 
 [[bin]]
 name = "strand"
