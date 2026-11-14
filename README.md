@@ -1,12 +1,12 @@
 # Strand
 
-![Strand GUI](docs/screenshot.png)
+![Strand desktop app showing dependency analysis results](docs/screenshot.png)
 
 A Rust **dependency and impact analysis tool** built on a fast,
 memory-mapped **CSR (compressed sparse row) graph engine**.
 
-Strand answers the question *"what breaks if I change X?"* in about a
-second, even on graphs with tens of millions of edges, with no server and
+Strand answers the question *"what breaks if I change X?"* in a second or
+two, even on graphs with tens of millions of edges, with no server and
 no query language:
 
 ```console
@@ -22,7 +22,7 @@ my-app -> serde -> serde_json
 Existing tools are either in-memory libraries (petgraph, igraph, NetworkX)
 or server databases (Neo4j). Strand's niche:
 
-1. **Instant-open, zero-copy, single-file graphs.** A `.strand` file is a
+1. **Fast-open, zero-copy, single-file graphs.** A `.strand` file is a
    memory-mapped CSR with forward *and* reverse adjacency. Opening is a
    header parse + validation; traversals read straight from the mapping.
 2. **Dependency/impact analysis as a first-class feature**: blast radius,
@@ -162,7 +162,7 @@ See [`docs/FORMAT.md`](docs/FORMAT.md). Highlights:
 
 ## Benchmarks
 
-Criterion, synthetic graph (this machine, release build):
+Criterion, synthetic graph (i5-1335U, 12 threads, 8GB RAM, release build):
 
 | Operation | 200k nodes / ~1M edges |
 |---|---|
