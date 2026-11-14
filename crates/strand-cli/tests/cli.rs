@@ -61,6 +61,40 @@ fn cli_build_and_queries() {
 }
 
 #[test]
+fn cli_impact_counts_consistent() {
+    // Regression: `direct` is a subset of `affected`, so it can never
+    // exceed the total; direct + transitive must equal the total.
+    let dir = tempfile::tempdir().unwrap();
+    let csv = write_csv(&dir);
+    let graph = dir.path().join("deps.strand");
+    strand()
+        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let o = strand()
+        .args(["impact", graph.to_str().unwrap(), "core", "--json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&o.stdout)).unwrap();
+    let total = v["total_affected"].as_u64().unwrap();
+    let direct = v["direct"].as_u64().unwrap();
+    let transitive = v["transitive"].as_u64().unwrap();
+    assert!(direct <= total, "direct {direct} > total {total}");
+    assert_eq!(direct + transitive, total);
+    assert_eq!((total, direct, transitive), (4, 2, 2));
+
+    // Human-readable output agrees.
+    let o = strand()
+        .args(["impact", graph.to_str().unwrap(), "core"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("4 affected (2 direct, 2 transitive)"), "{out}");
+}
+
+#[test]
 fn cli_missing_node_fails() {
     let dir = tempfile::tempdir().unwrap();
     let csv = write_csv(&dir);

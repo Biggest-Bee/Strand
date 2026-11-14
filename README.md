@@ -185,8 +185,9 @@ Notes:
 
 - `open` validates *everything* (layout, monotonic offsets, target bounds,
   UTF-8 names, xxh64 checksum over the whole file), so its cost scales with
-  file size. On warm page cache a 50M-edge file opens in roughly a second;
-  the mapping itself is zero-copy — traversals touch only the pages they
+  file size. Measured on a 790MB / 50M-edge file (below): ~0.5s warm,
+  ~1.8s cold.
+  The mapping itself is zero-copy — traversals touch only the pages they
   need.
 - petgraph has no on-disk CSR format; the comparison above is in-memory
   construction + BFS, not open+query. Strand's advantage is that the "open"
@@ -197,6 +198,21 @@ Notes:
   a condensation-DAG algorithm is planned for very large ones.
 
 Reproduce: `cargo bench` (env `STRAND_BENCH_NODES`, `STRAND_BENCH_EDGES`).
+
+### Large graph (10M nodes / 50M edges)
+
+`cargo run --release -p strand-core --example bigbench` streams a
+10,000,000-node / 50,000,000-edge graph (790MB `.strand` file) directly in
+the file format, then times the real open + analyses. Measured on an
+i5-1335U (12 threads, 8GB RAM), warm page cache:
+
+| Operation | time |
+|---|---|
+| file generation (streaming writer) | ~3.7 s |
+| `Graph::open` (mmap + validation + xxh64 over 790MB) | ~0.5–1.8 s (warm/cold page cache) |
+| forward BFS visiting all 10M nodes / 50M edges | ~1.3 s |
+| Tarjan SCC (iterative) | ~9 s |
+| PageRank (~0.12 s/iter, rayon; converged in ~2 iters on this near-regular graph) | ~0.25 s |
 
 ## Testing
 
