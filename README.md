@@ -1,5 +1,7 @@
 # Strand
 
+![Strand GUI](docs/screenshot.png)
+
 A Rust **dependency and impact analysis tool** built on a fast,
 memory-mapped **CSR (compressed sparse row) graph engine**.
 
