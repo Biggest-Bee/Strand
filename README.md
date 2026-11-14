@@ -1,5 +1,7 @@
 # Strand
 
+[![CI](https://github.com/Biggest-Bee/Strand/actions/workflows/ci.yml/badge.svg)](https://github.com/Biggest-Bee/Strand/actions/workflows/ci.yml)
+
 ![Strand desktop app showing dependency analysis results](docs/screenshot.png)
 
 A Rust **dependency and impact analysis tool** built on a fast,
