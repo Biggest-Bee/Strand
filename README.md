@@ -229,6 +229,12 @@ i5-1335U (12 threads, 8GB RAM), warm page cache:
   always equals exactly some prefix of committed transactions (500 cases in
   CI, 10,000 available via `cargo test -p strand-store -- --ignored`).
 
+Tests live next to the code: `crates/strand-core/tests/` (algorithms,
+proptest, roundtrip/corruption/determinism), `crates/strand-cli/tests/cli.rs`
+(end-to-end CLI incl. impact-count consistency), and
+`crates/strand-store/tests/store.rs` (model-based ops, WAL recovery,
+snapshots, compaction, crash harness).
+
 ```console
 cargo test
 ```
