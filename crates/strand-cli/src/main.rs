@@ -1,0 +1,624 @@
+//! `strand` — dependency and impact analysis on memory-mapped CSR graphs.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand, ValueEnum};
+use strand_core::algo::{self, Dir};
+use strand_core::{Graph, GraphBuilder, MergeOp};
+use strand_import::{self, Format};
+
+#[derive(Parser)]
+#[command(
+    name = "strand",
+    version,
+    about = "Dependency and impact analysis on memory-mapped CSR graphs"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Build a .strand graph from a CSV/TSV edge list or cargo metadata JSON.
+    Build(BuildArgs),
+    /// Show graph statistics.
+    Info(InfoArgs),
+    /// List direct and transitive dependencies of a node.
+    Deps(DepsArgs),
+    /// Blast radius: everything affected if the given nodes change.
+    Impact(ImpactArgs),
+    /// Shortest dependency chain between two nodes.
+    Why(WhyArgs),
+    /// List strongly connected components (cycles).
+    Cycles(CyclesArgs),
+    /// Rank nodes by risk: in-degree, impact size, or PageRank.
+    Top(TopArgs),
+    /// Dependencies-first build order + critical path.
+    Order(OrderArgs),
+    /// Nodes nothing depends on (top-level apps).
+    Roots(RootsArgs),
+    /// Nodes that depend on nothing (leaf libraries).
+    Leaves(LeavesArgs),
+    /// Nodes shared between two nodes: common deps or common impact.
+    Common(CommonArgs),
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+enum InFormat {
+    Auto,
+    Csv,
+    Cargo,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+enum MergeChoice {
+    Sum,
+    Max,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+enum TopBy {
+    InDegree,
+    Impact,
+    Pagerank,
+}
+
+#[derive(Parser)]
+struct BuildArgs {
+    /// Input file: CSV/TSV edge list or `cargo metadata` JSON.
+    input: PathBuf,
+    /// Output .strand file.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Input format (default: auto-detect).
+    #[arg(long, value_enum, default_value_t = InFormat::Auto)]
+    format: InFormat,
+    /// Duplicate-edge merge policy.
+    #[arg(long, value_enum, default_value_t = MergeChoice::Sum)]
+    merge: MergeChoice,
+}
+
+#[derive(Parser)]
+struct InfoArgs {
+    file: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct DepsArgs {
+    file: PathBuf,
+    node: String,
+    #[arg(long)]
+    depth: Option<u32>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct ImpactArgs {
+    file: PathBuf,
+    nodes: Vec<String>,
+    #[arg(long)]
+    depth: Option<u32>,
+    /// Group affected nodes by depth level.
+    #[arg(long)]
+    by_depth: bool,
+    /// Only report nodes with this node_meta kind.
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct WhyArgs {
+    file: PathBuf,
+    from: String,
+    to: String,
+    /// Enumerate alternative shortest chains.
+    #[arg(long)]
+    all_paths: bool,
+    /// Max number of paths when --all-paths.
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct CyclesArgs {
+    file: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct TopArgs {
+    file: PathBuf,
+    #[arg(long, value_enum)]
+    by: TopBy,
+    #[arg(short = 'n', long, default_value_t = 20)]
+    count: usize,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct OrderArgs {
+    file: PathBuf,
+    /// Also print the longest dependency chain.
+    #[arg(long)]
+    critical_path: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct RootsArgs {
+    file: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct LeavesArgs {
+    file: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct CommonArgs {
+    file: PathBuf,
+    /// `deps` = shared dependencies, `impact` = shared impact set.
+    mode: String,
+    a: String,
+    b: String,
+    #[arg(long)]
+    json: bool,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli.command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("strand: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cmd: Commands) -> strand_core::Result<()> {
+    match cmd {
+        Commands::Build(a) => cmd_build(a),
+        Commands::Info(a) => cmd_info(a),
+        Commands::Deps(a) => cmd_deps(a),
+        Commands::Impact(a) => cmd_impact(a),
+        Commands::Why(a) => cmd_why(a),
+        Commands::Cycles(a) => cmd_cycles(a),
+        Commands::Top(a) => cmd_top(a),
+        Commands::Order(a) => cmd_order(a),
+        Commands::Roots(a) => cmd_roots(a),
+        Commands::Leaves(a) => cmd_leaves(a),
+        Commands::Common(a) => cmd_common(a),
+    }
+}
+
+// ---------- helpers ----------
+
+fn open_graph(path: &PathBuf) -> strand_core::Result<Graph> {
+    Graph::open(path)
+}
+
+fn node_id(graph: &Graph, name: &str) -> strand_core::Result<u32> {
+    graph
+        .node_id(name)
+        .ok_or_else(|| strand_core::Error::NodeNotFound(name.to_string()))
+}
+
+fn names_of(graph: &Graph, ids: &[u32]) -> Vec<String> {
+    ids.iter().map(|&i| graph.node_name(i).to_string()).collect()
+}
+
+fn print_json(v: serde_json::Value) {
+    println!("{}", serde_json::to_string_pretty(&v).unwrap());
+}
+
+// ---------- commands ----------
+
+fn cmd_build(a: BuildArgs) -> strand_core::Result<()> {
+    let text = std::fs::read_to_string(&a.input)?;
+    let format = match a.format {
+        InFormat::Auto => strand_import::detect_format(&a.input, &text),
+        InFormat::Csv => Format::Csv,
+        InFormat::Cargo => Format::Cargo,
+    };
+    let edges = strand_import::parse(&text, format)?;
+    let mut b = GraphBuilder::new();
+    b.set_merge(match a.merge {
+        MergeChoice::Sum => MergeOp::Sum,
+        MergeChoice::Max => MergeOp::Max,
+    });
+    strand_import::fill_builder(edges, &mut b)?;
+    let stats = b.build(&a.output)?;
+    eprintln!(
+        "built {}: {} nodes, {} edges, {} bytes",
+        stats.path.display(),
+        stats.n_nodes,
+        stats.n_edges,
+        stats.bytes
+    );
+    Ok(())
+}
+
+fn cmd_info(a: InfoArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    let size = std::fs::metadata(&a.file).map(|m| m.len()).unwrap_or(0);
+    if a.json {
+        print_json(serde_json::json!({
+            "file": a.file.display().to_string(),
+            "n_nodes": g.n_nodes(),
+            "n_edges": g.n_edges(),
+            "has_weights": g.has_weights(),
+            "size_bytes": size,
+        }));
+    } else {
+        println!("file:        {}", a.file.display());
+        println!("nodes:       {}", g.n_nodes());
+        println!("edges:       {}", g.n_edges());
+        println!("weighted:    {}", g.has_weights());
+        println!("size:        {} bytes", size);
+    }
+    Ok(())
+}
+
+fn cmd_deps(a: DepsArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    let id = node_id(&g, &a.node)?;
+    let depths = algo::bfs(&g, &[id], Dir::Out, a.depth);
+
+    // Collect reached nodes sorted by (depth, name).
+    let mut rows: Vec<(u32, u32)> = depths
+        .iter()
+        .enumerate()
+        .filter(|&(_, &d)| d != algo::UNVISITED && d != 0)
+        .map(|(i, &d)| (i as u32, d))
+        .collect();
+    rows.sort_by(|x, y| x.1.cmp(&y.1).then_with(|| g.node_name(x.0).cmp(g.node_name(y.0))));
+
+    if a.json {
+        let deps: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|&(id, d)| {
+                serde_json::json!({"name": g.node_name(id), "depth": d})
+            })
+            .collect();
+        print_json(serde_json::json!({
+            "node": a.node,
+            "dependencies": deps,
+            "count": deps.len(),
+        }));
+    } else {
+        println!("dependencies of {}:", a.node);
+        for (id, d) in &rows {
+            println!("  depth {:>3}  {}", d, g.node_name(*id));
+        }
+        println!("{} transitive dependencies", rows.len());
+    }
+    Ok(())
+}
+
+fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
+    if a.nodes.is_empty() {
+        return Err(strand_core::Error::Invalid(
+            "impact requires at least one node".into(),
+        ));
+    }
+    let g = open_graph(&a.file)?;
+    let seeds: Vec<u32> = a
+        .nodes
+        .iter()
+        .map(|n| node_id(&g, n))
+        .collect::<strand_core::Result<_>>()?;
+    let depths = algo::bfs(&g, &seeds, Dir::In, a.depth);
+    let counts = algo::depth_counts(&depths);
+
+    // Kind filter applies to reported nodes (seeds always count as depth 0).
+    let kind_ok = |id: u32| -> bool {
+        match &a.kind {
+            Some(k) => g.node_kind(id) == Some(k.as_str()),
+            None => true,
+        }
+    };
+
+    let affected: Vec<(u32, u32)> = depths
+        .iter()
+        .enumerate()
+        .filter(|&(i, &d)| d != algo::UNVISITED && d != 0 && kind_ok(i as u32))
+        .map(|(i, &d)| (i as u32, d))
+        .collect();
+    let direct = affected.iter().filter(|&&(_, d)| d == 1).count();
+    let transitive = affected.len() - direct;
+
+    if a.json {
+        let by_depth: BTreeMap<String, Vec<String>> = {
+            let mut m: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+            for &(id, d) in &affected {
+                m.entry(d).or_default().push(g.node_name(id).to_string());
+            }
+            m.into_iter()
+                .map(|(d, v)| (d.to_string(), v))
+                .collect()
+        };
+        print_json(serde_json::json!({
+            "seeds": a.nodes,
+            "total_affected": affected.len(),
+            "direct": direct,
+            "transitive": transitive,
+            "by_depth": by_depth,
+        }));
+    } else {
+        println!(
+            "impact of [{}]: {} affected ({} direct, {} transitive)",
+            a.nodes.join(", "),
+            affected.len(),
+            direct,
+            transitive
+        );
+        if a.by_depth {
+            let mut by_d: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+            for &(id, d) in &affected {
+                by_d.entry(d).or_default().push(id);
+            }
+            for (d, ids) in by_d {
+                let mut names = names_of(&g, &ids);
+                names.sort();
+                println!("  depth {d} ({}):", ids.len());
+                for n in names {
+                    println!("    {n}");
+                }
+            }
+        } else {
+            let mut names: Vec<String> = affected
+                .iter()
+                .map(|&(id, _)| g.node_name(id).to_string())
+                .collect();
+            names.sort();
+            for n in names.iter().take(200) {
+                println!("  {n}");
+            }
+            if names.len() > 200 {
+                println!("  ... and {} more", names.len() - 200);
+            }
+        }
+        let _ = counts;
+    }
+    Ok(())
+}
+
+fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    let from = node_id(&g, &a.from)?;
+    let to = node_id(&g, &a.to)?;
+
+    if a.all_paths {
+        let paths = algo::k_shortest_paths(&g, from, to, a.limit);
+        if a.json {
+            let ps: Vec<Vec<String>> = paths
+                .iter()
+                .map(|p| names_of(&g, p))
+                .collect();
+            print_json(serde_json::json!({"from": a.from, "to": a.to, "paths": ps}));
+        } else if paths.is_empty() {
+            println!("no dependency chain from {} to {}", a.from, a.to);
+        } else {
+            for (i, p) in paths.iter().enumerate() {
+                let names = names_of(&g, p);
+                println!("path {}: {}", i + 1, names.join(" -> "));
+            }
+        }
+        return Ok(());
+    }
+
+    match algo::shortest_path(&g, from, to) {
+        Some(path) => {
+            let names = names_of(&g, &path);
+            if a.json {
+                print_json(serde_json::json!({
+                    "from": a.from, "to": a.to, "path": names, "length": path.len() - 1,
+                }));
+            } else {
+                println!("{}", names.join(" -> "));
+            }
+        }
+        None => {
+            if a.json {
+                print_json(serde_json::json!({
+                    "from": a.from, "to": a.to, "path": null,
+                }));
+            } else {
+                println!("no dependency chain from {} to {}", a.from, a.to);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_cycles(a: CyclesArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    let sccs = algo::strongly_connected(&g);
+    // Cycles = SCCs with >1 member, or a single node with a self-loop.
+    let cycles: Vec<&Vec<u32>> = sccs
+        .iter()
+        .filter(|c| {
+            c.len() > 1 || g.out_targets(c[0]).contains(&c[0])
+        })
+        .collect();
+
+    if a.json {
+        let cs: Vec<Vec<String>> = cycles
+            .iter()
+            .map(|c| names_of(&g, c))
+            .collect();
+        print_json(serde_json::json!({"cycles": cs, "count": cs.len()}));
+    } else if cycles.is_empty() {
+        println!("no cycles");
+    } else {
+        println!("{} cycle(s):", cycles.len());
+        for c in &cycles {
+            let names = names_of(&g, c);
+            println!("  {}", names.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    let n = g.n_nodes() as usize;
+    let scores: Vec<f64> = match a.by {
+        TopBy::InDegree => (0..n as u32).map(|i| g.in_degree(i) as f64).collect(),
+        TopBy::Impact => algo::impact_sizes(&g).into_iter().map(|x| x as f64).collect(),
+        // PageRank on the dependency graph: rank flows dependent ->
+        // dependency, so heavily-depended-upon nodes score highest.
+        TopBy::Pagerank => algo::pagerank(&g, false, 1e-8, 100),
+    };
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by(|&x, &y| {
+        scores[y as usize]
+            .partial_cmp(&scores[x as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| g.node_name(x).cmp(g.node_name(y)))
+    });
+    order.truncate(a.count);
+
+    if a.json {
+        let rows: Vec<serde_json::Value> = order
+            .iter()
+            .map(|&i| {
+                serde_json::json!({
+                    "name": g.node_name(i),
+                    "value": scores[i as usize],
+                })
+            })
+            .collect();
+        print_json(serde_json::json!({"by": format!("{:?}", a.by).to_lowercase(), "nodes": rows}));
+    } else {
+        println!("top {} by {:?}:", a.count, a.by);
+        for &i in &order {
+            println!("  {:>12.4}  {}", scores[i as usize], g.node_name(i));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_order(a: OrderArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    let bo = algo::analyze(&g);
+
+    if a.json {
+        let comps: Vec<serde_json::Value> = bo
+            .sccs
+            .iter()
+            .map(|c| serde_json::json!({"members": names_of(&g, c)}))
+            .collect();
+        let mut out = serde_json::json!({
+            "n_components": bo.sccs.len(),
+            "order": comps,
+        });
+        if a.critical_path {
+            out["critical_path"] = serde_json::json!({
+                "length": bo.critical_len,
+                "nodes": names_of(&g, &bo.critical_path),
+            });
+        }
+        print_json(out);
+    } else {
+        println!("{} component(s), dependencies first:", bo.sccs.len());
+        for (i, c) in bo.sccs.iter().enumerate() {
+            let names = names_of(&g, c);
+            if names.len() == 1 {
+                println!("  {:>4}. {}", i + 1, names[0]);
+            } else {
+                println!("  {:>4}. {{{}}}", i + 1, names.join(", "));
+            }
+        }
+        if a.critical_path {
+            let names = names_of(&g, &bo.critical_path);
+            println!("critical path length: {} nodes", bo.critical_len);
+            println!("{}", names.join(" -> "));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_roots(a: RootsArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    // "Nothing depends on X" => no dependents => in_targets empty.
+    let roots: Vec<u32> = (0..g.n_nodes() as u32)
+        .filter(|&i| g.in_degree(i) == 0)
+        .collect();
+    emit_name_list(&g, &roots, "roots", a.json);
+    Ok(())
+}
+
+fn cmd_leaves(a: LeavesArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    // "X depends on nothing" => no dependencies => out_targets empty.
+    let leaves: Vec<u32> = (0..g.n_nodes() as u32)
+        .filter(|&i| g.out_degree(i) == 0)
+        .collect();
+    emit_name_list(&g, &leaves, "leaves", a.json);
+    Ok(())
+}
+
+fn emit_name_list(g: &Graph, ids: &[u32], label: &str, json: bool) {
+    if json {
+        print_json(serde_json::json!({
+            label: names_of(g, ids),
+            "count": ids.len(),
+        }));
+    } else {
+        println!("{} ({}):", label, ids.len());
+        let mut names = names_of(g, ids);
+        names.sort();
+        for n in names {
+            println!("  {n}");
+        }
+    }
+}
+
+fn cmd_common(a: CommonArgs) -> strand_core::Result<()> {
+    let dir = match a.mode.as_str() {
+        "deps" => Dir::Out,
+        "impact" => Dir::In,
+        other => {
+            return Err(strand_core::Error::Invalid(format!(
+                "common mode must be 'deps' or 'impact', got '{other}'"
+            )))
+        }
+    };
+    let g = open_graph(&a.file)?;
+    let ia = node_id(&g, &a.a)?;
+    let ib = node_id(&g, &a.b)?;
+    let common = algo::common(&g, ia, ib, dir);
+    if a.json {
+        print_json(serde_json::json!({
+            "mode": a.mode, "a": a.a, "b": a.b,
+            "common": names_of(&g, &common), "count": common.len(),
+        }));
+    } else {
+        let mut names = names_of(&g, &common);
+        names.sort();
+        println!("common {} of {} and {} ({}):", a.mode, a.a, a.b, names.len());
+        for n in names {
+            println!("  {n}");
+        }
+    }
+    Ok(())
+}

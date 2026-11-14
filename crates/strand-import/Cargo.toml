@@ -1,0 +1,11 @@
+[package]
+name = "strand-import"
+version = "0.1.0"
+edition = "2021"
+description = "Importers for strand graph files (CSV/TSV edge lists, cargo metadata)"
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+strand-core = { path = "../strand-core" }
+serde_json.workspace = true
+thiserror.workspace = true

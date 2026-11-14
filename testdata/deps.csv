@@ -1,0 +1,6 @@
+app,liba
+app,libb
+liba,core
+libb,core
+core,util
+tool,liba

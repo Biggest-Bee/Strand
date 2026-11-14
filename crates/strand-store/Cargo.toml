@@ -1,0 +1,23 @@
+[package]
+name = "strand-store"
+version = "0.2.0"
+edition = "2021"
+description = "Embeddable read-write graph store: immutable CSR base + WAL delta + compaction"
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+strand-core = { path = "../strand-core" }
+fd-lock.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "store_bench"
+harness = false

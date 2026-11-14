@@ -1,0 +1,22 @@
+[package]
+name = "strand-cli"
+version = "0.1.0"
+edition = "2021"
+description = "strand: dependency and impact analysis CLI"
+license = "LicenseRef-Proprietary"
+
+[[bin]]
+name = "strand"
+path = "src/main.rs"
+
+[dependencies]
+strand-core = { path = "../strand-core" }
+strand-import = { path = "../strand-import" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

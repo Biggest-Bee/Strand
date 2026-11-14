@@ -1,0 +1,23 @@
+[package]
+name = "strand-core"
+version = "0.1.0"
+edition = "2021"
+description = "Memory-mapped CSR graph engine and dependency/impact analysis algorithms"
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+memmap2.workspace = true
+bytemuck.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+petgraph.workspace = true
+
+[[bench]]
+name = "graph_bench"
+harness = false

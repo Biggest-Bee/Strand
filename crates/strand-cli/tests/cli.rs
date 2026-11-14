@@ -1,0 +1,77 @@
+//! End-to-end CLI smoke tests using the built `strand` binary.
+
+use std::process::Command;
+
+fn strand() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_strand"))
+}
+
+fn write_csv(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let p = dir.path().join("deps.csv");
+    std::fs::write(
+        &p,
+        "app,liba\napp,libb\nliba,core\nlibb,core\ncore,util\ntool,liba\n",
+    )
+    .unwrap();
+    p
+}
+
+#[test]
+fn cli_build_and_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = write_csv(&dir);
+    let graph = dir.path().join("deps.strand");
+
+    let out = strand()
+        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let run = |args: &[&str]| {
+        let o = strand().args(args).output().unwrap();
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let g = graph.to_str().unwrap();
+
+    let info = run(&["info", g]);
+    assert!(info.contains("6 nodes") || info.contains("nodes:       6"));
+
+    let deps = run(&["deps", g, "app"]);
+    assert!(deps.contains("liba") && deps.contains("util"));
+
+    let impact = run(&["impact", g, "core"]);
+    assert!(impact.contains("4 affected"));
+
+    let why = run(&["why", g, "app", "util"]);
+    assert!(why.contains("app -> liba -> core -> util") || why.contains("app -> libb -> core -> util"));
+
+    assert!(run(&["cycles", g]).contains("no cycles"));
+    assert!(run(&["roots", g]).contains("app"));
+    assert!(run(&["leaves", g]).contains("util"));
+
+    let common = run(&["common", g, "deps", "app", "tool"]);
+    assert!(common.contains("liba") && common.contains("core"));
+
+    // JSON output parses.
+    let j = run(&["impact", g, "core", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+    assert_eq!(v["total_affected"], 4);
+}
+
+#[test]
+fn cli_missing_node_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = write_csv(&dir);
+    let graph = dir.path().join("deps.strand");
+    strand()
+        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let o = strand()
+        .args(["deps", graph.to_str().unwrap(), "nosuchnode"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+}
