@@ -3,8 +3,9 @@
 A Rust **dependency and impact analysis tool** built on a fast,
 memory-mapped **CSR (compressed sparse row) graph engine**.
 
-Strand answers the question *"what breaks if I change X?"* instantly, on
-graphs with tens of millions of edges, with no server and no query language:
+Strand answers the question *"what breaks if I change X?"* in about a
+second, even on graphs with tens of millions of edges, with no server and
+no query language:
 
 ```console
 $ strand build deps.csv -o deps.strand
@@ -27,7 +28,7 @@ or server databases (Neo4j). Strand's niche:
    and scriptable (`--json` everywhere).
 3. **Embeddable**: `Graph::open("x.strand")` from Rust, no server.
 
-Phase 2 adds **`strand-store`**: an embeddable read-write graph store —
+**`strand-store`** is an embeddable read-write graph store —
 "SQLite for graphs" — with transactions, snapshots, a write-ahead log,
 crash-safe compaction, and the same analysis algorithms running on the
 merged view.
@@ -43,8 +44,10 @@ crates/
   strand-app/       desktop GUI (eframe/egui) for browsing + analysis
 docs/
   FORMAT.md         binary format spec (normative, .strand + .strandb)
-tests/              (integration tests live in each crate)
+testdata/           sample graphs used by tests and docs
 ```
+
+Tests live in each crate's `tests/` directory (see [Testing](#testing)).
 
 ## Quick start
 
@@ -204,15 +207,20 @@ Reproduce: `cargo bench` (env `STRAND_BENCH_NODES`, `STRAND_BENCH_EDGES`).
 `cargo run --release -p strand-core --example bigbench` streams a
 10,000,000-node / 50,000,000-edge graph (790MB `.strand` file) directly in
 the file format, then times the real open + analyses. Measured on an
-i5-1335U (12 threads, 8GB RAM), warm page cache:
+i5-1335U (12 threads, 8GB RAM); page cache warm unless noted:
 
 | Operation | time |
 |---|---|
 | file generation (streaming writer) | ~3.7 s |
-| `Graph::open` (mmap + validation + xxh64 over 790MB) | ~0.5–1.8 s (warm/cold page cache) |
+| `Graph::open` (mmap + validation + xxh64 over 790MB) | ~0.5 s warm / ~1.8 s cold |
 | forward BFS visiting all 10M nodes / 50M edges | ~1.3 s |
 | Tarjan SCC (iterative) | ~9 s |
-| PageRank (~0.12 s/iter, rayon; converged in ~2 iters on this near-regular graph) | ~0.25 s |
+| PageRank (~0.12 s/iter, rayon) | ~0.25 s — converged in ~2 iters |
+
+Caveat: the synthetic graph is near-regular (every node has exactly 5
+out-edges), so PageRank converges unusually fast. Real dependency graphs
+are skewed with a few hub nodes; expect more iterations there. BFS and SCC
+times are edge-count bound and should transfer to skewed graphs.
 
 ## Testing
 
