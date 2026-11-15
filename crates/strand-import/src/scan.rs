@@ -80,7 +80,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
 
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
-            .map_err(|e| Error::Invalid(format!("{}: {e}", abs.display())))?;
+            .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
         // `lex_rs` produces two views: `clean` (comments stripped, string
         // contents kept for `#[path]`/`include!`) and `masked` (string
         // contents blanked, positions preserved) for `mod`/`use` scanning
@@ -805,7 +805,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
 
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
-            .map_err(|e| Error::Invalid(format!("{}: {e}", abs.display())))?;
+            .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
         let clean = strip_hash_comments(&text);
         let mut deps: BTreeSet<String> = BTreeSet::new();
         let parent = parent_rel(rel);
@@ -955,7 +955,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
 
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
-            .map_err(|e| Error::Invalid(format!("{}: {e}", abs.display())))?;
+            .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
         let clean = strip_comments(&text);
         let mut deps: BTreeSet<String> = BTreeSet::new();
         let parent = parent_rel(rel);

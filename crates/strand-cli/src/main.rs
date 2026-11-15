@@ -9,6 +9,7 @@ use strand_core::algo::{self, Dir};
 use strand_core::{Graph, GraphBuilder, MergeOp};
 use strand_import::{self, Format};
 
+mod check;
 mod export;
 
 #[derive(Parser)]
@@ -52,6 +53,8 @@ enum Commands {
     Common(CommonArgs),
     /// Export an impact set or dependency path as a DOT/Mermaid diagram.
     Export(ExportArgs),
+    /// Enforce architecture rules (`forbid A -> B`) from strand.rules.
+    Check(CheckArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
@@ -266,6 +269,19 @@ struct ExportArgs {
 }
 
 #[derive(Parser)]
+struct CheckArgs {
+    file: PathBuf,
+    /// Rules file (default: ./strand.rules).
+    #[arg(long)]
+    rules: Option<PathBuf>,
+    /// Max violations to resolve a target node + chain for.
+    #[arg(long, default_value_t = 10)]
+    max_chains: usize,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
 struct CommonArgs {
     file: PathBuf,
     /// `deps` = shared dependencies, `impact` = shared impact set.
@@ -302,6 +318,7 @@ fn run(cmd: Commands) -> strand_core::Result<()> {
         Commands::Leaves(a) => cmd_leaves(a),
         Commands::Common(a) => cmd_common(a),
         Commands::Export(a) => cmd_export(a),
+        Commands::Check(a) => cmd_check(a),
     }
 }
 
@@ -452,7 +469,7 @@ fn cmd_deps(a: DepsArgs) -> strand_core::Result<()> {
 
 fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
     if a.nodes.is_empty() && a.git_diff.is_none() {
-        return Err(strand_core::Error::Invalid(
+        return Err(strand_core::Error::Usage(
             "impact requires at least one node or --git-diff".into(),
         ));
     }
@@ -475,13 +492,13 @@ fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
             );
         }
         if no_git_matches {
-            return Err(strand_core::Error::Invalid(format!(
+            return Err(strand_core::Error::Usage(format!(
                 "no graph nodes matched files changed vs {reference}"
             )));
         }
     }
     if seed_names.is_empty() {
-        return Err(strand_core::Error::Invalid(
+        return Err(strand_core::Error::Usage(
             "impact requires at least one node or --git-diff".into(),
         ));
     }
@@ -565,7 +582,7 @@ fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
     }
     if let Some(max) = a.max_impact {
         if affected.len() > max {
-            return Err(strand_core::Error::Invalid(format!(
+            return Err(strand_core::Error::Usage(format!(
                 "impact of {} node(s) = {}; exceeds --max-impact {}",
                 seed_names.len(),
                 affected.len(),
@@ -600,7 +617,7 @@ fn git_diff_seeds(
             .args(args)
             .output()?;
         if !out.status.success() {
-            return Err(strand_core::Error::Invalid(format!(
+            return Err(strand_core::Error::Usage(format!(
                 "git {} failed: {}",
                 args.join(" "),
                 String::from_utf8_lossy(&out.stderr).trim()
@@ -690,12 +707,12 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
     let to = node_id(&g, &a.to)?;
 
     if a.all_paths && a.weighted {
-        return Err(strand_core::Error::Invalid(
+        return Err(strand_core::Error::Usage(
             "--all-paths and --weighted cannot be combined".into(),
         ));
     }
     if a.max_depth.is_some() && !a.all_paths {
-        return Err(strand_core::Error::Invalid(
+        return Err(strand_core::Error::Usage(
             "--max-depth requires --all-paths".into(),
         ));
     }
@@ -929,7 +946,7 @@ fn cmd_common(a: CommonArgs) -> strand_core::Result<()> {
         "deps" => Dir::Out,
         "impact" => Dir::In,
         other => {
-            return Err(strand_core::Error::Invalid(format!(
+            return Err(strand_core::Error::Usage(format!(
                 "common mode must be 'deps' or 'impact', got '{other}'"
             )))
         }
@@ -956,12 +973,12 @@ fn cmd_common(a: CommonArgs) -> strand_core::Result<()> {
 
 fn cmd_export(a: ExportArgs) -> strand_core::Result<()> {
     if a.impact.is_empty() && a.why.is_none() {
-        return Err(strand_core::Error::Invalid(
+        return Err(strand_core::Error::Usage(
             "export requires --impact or --why".into(),
         ));
     }
     if !a.impact.is_empty() && a.why.is_some() {
-        return Err(strand_core::Error::Invalid(
+        return Err(strand_core::Error::Usage(
             "--impact and --why are mutually exclusive".into(),
         ));
     }
@@ -980,7 +997,7 @@ fn cmd_export(a: ExportArgs) -> strand_core::Result<()> {
             algo::shortest_path(&g, from, to)
         };
         let Some(path) = path else {
-            return Err(strand_core::Error::Invalid(format!(
+            return Err(strand_core::Error::Usage(format!(
                 "no dependency chain from {} to {}",
                 w[0], w[1]
             )));
@@ -1012,6 +1029,63 @@ fn cmd_export(a: ExportArgs) -> strand_core::Result<()> {
             eprintln!("wrote {}", p.display());
         }
         None => print!("{text}"),
+    }
+    Ok(())
+}
+
+fn cmd_check(a: CheckArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    let rules = check::load_rules(a.rules.as_deref(), Path::new("."))?;
+    let results = check::check(&g, &rules, a.max_chains);
+    let total: usize = results.iter().map(|v| v.len()).sum();
+
+    if a.json {
+        let rules_json: Vec<serde_json::Value> = rules
+            .iter()
+            .zip(&results)
+            .map(|(r, viols)| {
+                serde_json::json!({
+                    "rule": format!("forbid {} -> {}", r.forbid, r.ban),
+                    "violations": viols.iter().map(|v| {
+                        let mut o = serde_json::json!({"node": g.node_name(v.a)});
+                        if let Some(b) = v.b {
+                            o["target"] = serde_json::json!(g.node_name(b));
+                        }
+                        if let Some(c) = &v.chain {
+                            o["chain"] = serde_json::json!(names_of(&g, c));
+                        }
+                        o
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        print_json(serde_json::json!({
+            "rules": rules.len(),
+            "violations": total,
+            "results": rules_json,
+        }));
+    } else {
+        println!("strand check: {} rule(s), {} violation(s)", rules.len(), total);
+        for (r, viols) in rules.iter().zip(&results) {
+            if viols.is_empty() {
+                continue;
+            }
+            println!("rule `forbid {} -> {}`: {} violation(s)", r.forbid, r.ban, viols.len());
+            for v in viols {
+                if let Some(chain) = &v.chain {
+                    let names = names_of(&g, chain);
+                    println!("  {}", names.join(" -> "));
+                } else {
+                    println!("  {} (transitively depends on `{}`)", g.node_name(v.a), r.ban);
+                }
+            }
+        }
+    }
+
+    if total > 0 {
+        return Err(strand_core::Error::Usage(format!(
+            "{total} architecture rule violation(s)"
+        )));
     }
     Ok(())
 }

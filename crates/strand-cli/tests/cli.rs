@@ -244,6 +244,52 @@ fn cli_export_diagrams() {
 }
 
 #[test]
+fn cli_check_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = write_csv(&dir);
+    let graph = dir.path().join("deps.strand");
+    strand()
+        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let rules = dir.path().join("strand.rules");
+    // tool -> liba -> core: transitive violation; app -> liba direct.
+    std::fs::write(&rules, "forbid tool -> core\nforbid app -> liba\n").unwrap();
+
+    let o = strand()
+        .args([
+            "check",
+            graph.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.contains("2 violation(s)"), "{out}");
+    assert!(out.contains("tool -> liba -> core"), "{out}");
+    assert!(out.contains("app -> liba"), "{out}");
+
+    // A clean rules file passes.
+    std::fs::write(&rules, "forbid zzz -> yyy\n").unwrap();
+    let o = strand()
+        .args([
+            "check",
+            graph.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
 fn cli_missing_node_fails() {
     let dir = tempfile::tempdir().unwrap();
     let csv = write_csv(&dir);

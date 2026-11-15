@@ -111,6 +111,13 @@ strand impact deps.strand --git-diff origin/main --max-impact 25
 # Export diagrams for docs/PRs (Graphviz DOT or Mermaid):
 strand export deps.strand --format mermaid --impact serde_json --depth 2
 strand export deps.strand --format dot --why my-app serde_json
+
+# Enforce architecture rules (exit 1 on violations, CI-friendly):
+# strand.rules:
+#   forbid ui/ -> db/        # substring match on node names
+#   forbid *.test -> src/    # * and ? globs also work
+strand check deps.strand            # reads ./strand.rules
+strand check deps.strand --rules ci.rules --json
 ```
 
 Every command accepts `--json` for CI use.

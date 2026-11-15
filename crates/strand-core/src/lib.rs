@@ -28,6 +28,11 @@ pub enum Error {
     #[error("invalid strand file: {0}")]
     Invalid(String),
 
+    /// Generic usage/input error (CLI args, parse failures, rule
+    /// violations) — not a corrupt graph file.
+    #[error("{0}")]
+    Usage(String),
+
     /// A node name was not present in the graph.
     #[error("node not found: {0}")]
     NodeNotFound(String),

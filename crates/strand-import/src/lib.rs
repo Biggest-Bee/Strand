@@ -117,5 +117,5 @@ pub fn build_from_text(
 }
 
 pub(crate) fn err(msg: impl Into<String>) -> Error {
-    Error::Invalid(msg.into())
+    Error::Usage(msg.into())
 }
