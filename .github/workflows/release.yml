@@ -184,6 +184,9 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # gh release needs a git checkout to resolve the repo/tag.
+      - uses: actions/checkout@v7
+
       - name: SHA256 sums
         working-directory: artifacts
         run: sha256sum * > SHA256SUMS.txt
