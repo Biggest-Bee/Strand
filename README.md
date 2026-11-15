@@ -58,6 +58,11 @@ Tests live in each crate's `tests/` directory (see [Testing](#testing)).
 ```console
 cargo install --path crates/strand-cli   # or: cargo build --release
 
+# Prebuilt binaries for Windows/Linux/macOS are on the
+# [Releases](https://github.com/Biggest-Bee/Strand/releases) page.
+# They are unsigned: Windows SmartScreen and macOS Gatekeeper will
+# warn on first run — that's expected for unsigned binaries.
+
 # From an edge list (src,dst[,weight]; "src depends on dst"):
 strand build deps.csv -o deps.strand
 
@@ -222,9 +227,11 @@ Notes:
   construction + BFS, not open+query. Strand's advantage is that the "open"
   cost is paid once and queries then run directly on the mapped file with
   no per-query deserialization.
-- `impact_sizes` (used by `top --by impact`) is the naive per-node reverse
-  BFS, parallelized with rayon — O(V·(V+E)). Fine for small/medium graphs;
-  a condensation-DAG algorithm is planned for very large ones.
+- `impact_sizes` (used by `top --by impact`) collapses the graph to its
+  SCC condensation DAG and computes ancestor sets with bitsets —
+  `O(E·C/64)` word-ops, memory-blocked to ~256MB. On graphs whose
+  component count makes that too expensive it falls back to a
+  per-node reverse BFS (fine for small/medium graphs; see Limitations).
 
 Reproduce: `cargo bench` (env `STRAND_BENCH_NODES`, `STRAND_BENCH_EDGES`).
 
@@ -283,8 +290,11 @@ cargo test
   rendering; beyond that use the CLI. Store edits are limited to
   node/edge add/remove — no batch import or schema changes from the GUI.
 - `top --by impact` uses SCC condensation + bitset ancestor sets
-  (`O(E·C/64)`); graphs with more than ~32k components fall back to the
-  naive per-node BFS.
+  (`O(E·C/64)` word-ops, processed in ~256MB column blocks). It shines
+  on cyclic graphs; on huge mostly-acyclic graphs (`C` ≈ V, e.g. a
+  10M-node DAG) the op count exceeds the budget and it falls back to
+  per-node BFS — so `top --by impact` is *not* yet fast on very large
+  acyclic graphs. Approximate counting is future work.
 - `why --all-paths` enumerates alternative *shortest* chains (cap via
   `--limit`); add `--max-depth N` to enumerate every simple chain of at
   most N hops. Both are step-budgeted so dense graphs can't hang.

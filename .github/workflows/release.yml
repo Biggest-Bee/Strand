@@ -8,7 +8,16 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -16,18 +25,22 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-          - os: ubuntu-latest
+          # ubuntu-22.04 for older glibc so binaries run on more systems.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
             archive: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux GUI deps
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -41,7 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release -p strand-cli -p strand-app --target ${{ matrix.target }}
+        run: cargo build --release --locked -p strand-cli -p strand-app --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -74,6 +87,10 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: SHA256 sums
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS.txt
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
