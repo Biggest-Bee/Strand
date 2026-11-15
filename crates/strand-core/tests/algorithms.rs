@@ -379,3 +379,45 @@ fn impact_sizes_blocked_bitsets() {
     let expect = d.iter().filter(|&&x| x != algo::UNVISITED).count() - 1;
     assert_eq!(sizes[mid as usize] as usize, expect);
 }
+
+#[test]
+fn impact_sizes_approx_tracks_exact() {
+    // Hub-and-spoke: `hub` is depended on by 500 leaves; a few leaves
+    // chain into each other. Exact impact: hub=500, mid-chain nodes
+    // small, everything else ~0.
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    for i in 0..500 {
+        b.add_edge(&format!("leaf{i:04}"), "hub");
+    }
+    // A small chain on top: top -> mid1 -> mid2 -> hub
+    b.add_edge("top", "mid1");
+    b.add_edge("mid1", "mid2");
+    b.add_edge("mid2", "hub");
+    b.add_edge("mid2", "leaf0000");
+    let p = dir.path().join("g.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+
+    let exact = algo::impact_sizes(&g);
+    let hub = g.node_id("hub").unwrap() as usize;
+    assert_eq!(exact[hub], 503); // 500 leaves + top + mid1 + mid2
+
+    // Deterministic: two runs give identical estimates.
+    let a1 = algo::impact_sizes_approx(&g, 128);
+    let a2 = algo::impact_sizes_approx(&g, 128);
+    assert_eq!(a1, a2);
+
+    // Hub estimate should be in the right ballpark (unbiased estimator,
+    // ~1/sqrt(k) noise; 128 samples on ~504 nodes is noisy but the hub
+    // dominates every closure so it must rank first and stay positive).
+    let top_id = g.node_id("top").unwrap() as usize;
+    assert!(a1[hub] > a1[top_id], "hub {} should exceed top {}", a1[hub], a1[top_id]);
+    assert!(a1[hub] > 200.0, "hub estimate {} too low", a1[hub]);
+    assert!(a1[hub] < 900.0, "hub estimate {} too high", a1[hub]);
+
+    // auto() takes the exact path on small graphs.
+    let (v, m) = algo::impact_sizes_auto(&g);
+    assert_eq!(m, algo::ImpactMethod::Exact);
+    assert_eq!(v[hub] as u32, exact[hub]);
+}

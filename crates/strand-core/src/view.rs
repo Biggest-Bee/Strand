@@ -15,6 +15,13 @@ pub trait GraphView: Send + Sync {
     /// Number of nodes (dense ids `0..n_nodes`).
     fn n_nodes(&self) -> usize;
 
+    /// Number of edges (default: sums out-degrees, O(E)).
+    fn n_edges(&self) -> usize {
+        (0..self.n_nodes() as u32)
+            .map(|i| self.out_degree(i))
+            .sum()
+    }
+
     /// Call `f` on each dependency of `id` (forward neighbors).
     fn out_edges(&self, id: u32, f: &mut dyn FnMut(u32));
 
@@ -44,6 +51,11 @@ impl GraphView for crate::Graph {
     #[inline]
     fn n_nodes(&self) -> usize {
         self.n_nodes() as usize
+    }
+
+    #[inline]
+    fn n_edges(&self) -> usize {
+        self.n_edges() as usize
     }
 
     #[inline]

@@ -56,14 +56,154 @@ pub fn depth_counts(depths: &[u32]) -> std::collections::BTreeMap<u32, usize> {
 /// would exceed [`MAX_BITSET_OPS`] (huge mostly-acyclic graphs where
 /// `C ~= V`), it falls back to the naive per-node reverse BFS.
 pub fn impact_sizes<G: GraphView>(graph: &G) -> Vec<u32> {
+    match impact_sizes_inner(graph) {
+        Ok(v) => v,
+        Err(()) => impact_sizes_naive(graph),
+    }
+}
+
+/// Which computation produced [`impact_sizes_auto`] results.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImpactMethod {
+    /// Exact SCC-condensation bitsets.
+    Exact,
+    /// Deterministic landmark-sampling estimate (see
+    /// [`impact_sizes_approx`]). Values are approximate.
+    Approx,
+}
+
+/// Impact sizes for ranking: exact bitsets when affordable, otherwise a
+/// deterministic landmark-sampling approximation. Returns the per-node
+/// estimates (exact counts as `f64`) plus the method used.
+pub fn impact_sizes_auto<G: GraphView>(graph: &G) -> (Vec<f64>, ImpactMethod) {
+    match impact_sizes_inner(graph) {
+        Ok(v) => (
+            v.into_iter().map(|x| x as f64).collect(),
+            ImpactMethod::Exact,
+        ),
+        Err(()) => (
+            impact_sizes_approx(graph, default_approx_samples(graph)),
+            ImpactMethod::Approx,
+        ),
+    }
+}
+
+/// Landmark count for [`impact_sizes_auto`]: ~2G edge visits total,
+/// clamped to [16, 512].
+fn default_approx_samples<G: GraphView>(graph: &G) -> usize {
+    let e = graph.n_edges().max(1) as u64;
+    ((2_000_000_000u64 / e) as usize).clamp(16, 512)
+}
+
+/// Approximate transitive impact sizes via landmark sampling.
+///
+/// Samples `samples` "dependent" nodes uniformly at random (deterministic
+/// xxh64-threshold selection, no RNG state), computes each one's
+/// dependency closure with a forward BFS, and counts how many sampled
+/// dependents reach every node. `estimate(X) ≈ n/k × count(X)` is an
+/// unbiased estimator of the true impact size; relative error is
+/// ~`1/sqrt(k)` for typical graphs. Self-hits from landmark nodes are
+/// subtracted so estimates exclude the node itself like the exact path.
+///
+/// Cost: `O(samples × (V + E))` edge visits, parallelized with rayon;
+/// memory is one bitset + queue per worker plus a shared counter array.
+pub fn impact_sizes_approx<G: GraphView>(graph: &G, samples: usize) -> Vec<f64> {
+    let n = graph.n_nodes();
+    if n == 0 || samples == 0 {
+        return vec![0.0; n];
+    }
+
+    // Deterministic landmark set: ids whose xxh64 hash falls below the
+    // samples/n quantile of hash space. Hash of the id (not the name)
+    // keeps selection independent of lexicographic node order.
+    // threshold ≈ samples * 2^64 / n, computed in u128.
+    let t128 = (samples as u128) << 64;
+    let threshold = t128 / n as u128;
+    let is_landmark = |id: u32| -> bool {
+        let h = xxhash_rust::xxh64::xxh64(&id.to_le_bytes(), 0) as u128;
+        h < threshold
+    };
+    let landmarks: Vec<u32> = (0..n as u32).filter(|&i| is_landmark(i)).collect();
+    if landmarks.is_empty() {
+        // Pathological threshold miss: fall back to a strided sample.
+        let step = (n / samples.min(n)).max(1);
+        let ids: Vec<u32> = (0..n as u32).step_by(step).collect();
+        let set: std::collections::BTreeSet<u32> = ids.iter().copied().collect();
+        return impact_sizes_sampled(graph, &ids, &set);
+    }
+    let self_set: std::collections::BTreeSet<u32> = landmarks.iter().copied().collect();
+    impact_sizes_sampled(graph, &landmarks, &self_set)
+}
+
+/// Shared worker for [`impact_sizes_approx`]: forward-BFS the
+/// dependency closure of each id in `landmarks`, count reachability per
+/// node, scale by `n / landmarks.len()`. `self_ids` marks which nodes
+/// are landmarks themselves (their trivial self-hit is subtracted,
+/// matching the exact path's exclusion of the node itself).
+fn impact_sizes_sampled<G: GraphView>(
+    graph: &G,
+    landmarks: &[u32],
+    self_ids: &std::collections::BTreeSet<u32>,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let n = graph.n_nodes();
+    let k = landmarks.len().max(1);
+    let counters: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+
+    landmarks.par_iter().for_each_init(
+        || (vec![0u64; n.div_ceil(64)], Vec::with_capacity(1024)),
+        |(bits, queue), &y| {
+            bits.fill(0);
+            queue.clear();
+            let yi = y as usize;
+            bits[yi / 64] |= 1u64 << (yi % 64);
+            queue.push(y);
+            while let Some(x) = queue.pop() {
+                graph.out_edges(x, &mut |w| {
+                    let i = w as usize;
+                    let word = &mut bits[i / 64];
+                    let bit = 1u64 << (i % 64);
+                    if *word & bit == 0 {
+                        *word |= bit;
+                        queue.push(w);
+                    }
+                });
+            }
+            for (wi, &word) in bits.iter().enumerate() {
+                let mut b = word;
+                while b != 0 {
+                    let id = wi * 64 + b.trailing_zeros() as usize;
+                    if id < n {
+                        counters[id].fetch_add(1, Ordering::Relaxed);
+                    }
+                    b &= b - 1;
+                }
+            }
+        },
+    );
+
+    let scale = n as f64 / k as f64;
+    (0..n as u32)
+        .map(|i| {
+            let c = counters[i as usize].load(Ordering::Relaxed) as u64;
+            c.saturating_sub(self_ids.contains(&i) as u64) as f64 * scale
+        })
+        .collect()
+}
+
+/// Inner computation: `Ok` = exact bitset result, `Err(())` = graph too
+/// large for the bitset budget (caller decides fallback strategy).
+fn impact_sizes_inner<G: GraphView>(graph: &G) -> std::result::Result<Vec<u32>, ()> {
     let n = graph.n_nodes();
     if n == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let sccs = scc::strongly_connected(graph);
     let nc = sccs.len();
     if nc == 0 {
-        return vec![0; n];
+        return Ok(vec![0; n]);
     }
 
     let cond = scc::condensation(graph, &sccs);
@@ -83,7 +223,7 @@ pub fn impact_sizes<G: GraphView>(graph: &G) -> Vec<u32> {
     // Total word-ops ~= dag_edges * words (each DAG edge ORs one row per
     // block pass; summed over passes this is independent of blocking).
     if dag_edges.saturating_mul(words) > MAX_BITSET_OPS {
-        return impact_sizes_naive(graph);
+        return Err(());
     }
 
     let mut order: Vec<u32> = Vec::with_capacity(nc);
@@ -101,7 +241,7 @@ pub fn impact_sizes<G: GraphView>(graph: &G) -> Vec<u32> {
     // A self-edge inside the condensation would stall Kahn's algorithm;
     // treat an incomplete order as "algorithm can't handle this graph".
     if order.len() != nc {
-        return impact_sizes_naive(graph);
+        return Err(());
     }
 
     // reach[c] = bitset of components that can reach c (incl. c itself),
@@ -155,11 +295,11 @@ pub fn impact_sizes<G: GraphView>(graph: &G) -> Vec<u32> {
 
     // Impact size of a component = sum of member counts over its ancestor
     // set; per-node value subtracts the node itself.
-    (0..n as u32)
+    Ok((0..n as u32)
         .map(|v| {
             comp_impact[cond.comp[v as usize] as usize].saturating_sub(1)
         })
-        .collect()
+        .collect())
 }
 
 /// Memory budget for the reachability bit matrix (~256MB).

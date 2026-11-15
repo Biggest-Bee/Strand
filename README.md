@@ -308,7 +308,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
 
 ## Testing
 
-`cargo test` runs ~68 tests across the workspace:
+`cargo test` runs ~69 tests across the workspace:
 
 - **core algorithms** (`strand-core/tests/algorithms.rs`): BFS/depths,
   shortest & k-shortest paths, non-shortest `paths_within_depth`,
@@ -318,7 +318,9 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   `impact_sizes_match_bfs` and `impact_sizes_match_bfs_on_cycles` check
   every node's count against a naive per-node reverse BFS, acyclic and
   cyclic; `impact_sizes_blocked_bitsets` exercises the multi-block
-  (50k-component chain) path.
+  (50k-component chain) path;
+  `impact_sizes_approx_tracks_exact` checks the landmark-sampling
+  estimate is deterministic and tracks exact counts on a test graph.
 - **proptest** (`proptests.rs`): random graphs built, re-opened, and
   compared against an independent in-memory reference.
 - **roundtrip/corruption/determinism** (`roundtrip.rs`): byte-identical
@@ -366,14 +368,16 @@ cargo test
   rendering; beyond that use the CLI. Store edits are limited to
   node/edge add/remove — no batch import or schema changes from the GUI.
 - `top --by impact` uses SCC condensation + bitset ancestor sets
-  (`O(E·C/64)` word-ops, processed in ~256MB column blocks). It shines
-  on cyclic graphs; on huge mostly-acyclic graphs (`C` ≈ V, e.g. a
-  10M-node DAG) the op count exceeds the budget and it falls back to
-  per-node BFS — so `top --by impact` is *not* yet fast on very large
-  acyclic graphs. Approximate counting is future work.
+  (`O(E·C/64)` word-ops, processed in ~256MB column blocks) when the op
+  count fits the budget. On huge mostly-acyclic graphs (`C` ≈ V) it
+  switches to a deterministic landmark-sampling estimate
+  (`impact_sizes_approx`, ~2G edge visits, output labeled
+  "approximate") — unbiased with ~`1/sqrt(k)` relative error, fine for
+  ranking but not exact counts. `impact_sizes()` still falls back to
+  per-node BFS for small graphs that exceed the bitset budget.
 - `why --all-paths` enumerates alternative *shortest* chains (cap via
-  `--limit`); add `--max-depth N` to enumerate every simple chain of at
-  most N hops. Both are step-budgeted so dense graphs can't hang.
+  `--limit`), or every simple chain up to `--max-depth N` hops. Both are
+  step-budgeted and report truncation, so dense graphs can't hang.
 - Weighted edges: `why --weighted` runs Dijkstra over edge weights
   (unweighted graphs count every edge as 1.0). The store preserves
   weights through compaction.
@@ -385,9 +389,9 @@ cargo test
   `Options::compact_threshold_ops` (default 1M ops, 0 disables) — the
   delta can still spike RAM between compactions, and readers pin their
   snapshot's delta until they drop it.
-- Crash safety covers WAL commits and manifest swaps; a crash *during*
-  base-file writing leaves an orphan `base-*.strand.tmp`-style file that is
-  simply never referenced (the builder writes-then-renames).
+- Crash safety covers WAL commits and manifest swaps; orphaned
+  `*.tmp` files from interrupted writes are garbage-collected on open
+  (writers only publish via rename).
 - mmap assumes files aren't truncated while open (inherent SIGBUS risk);
   the write path always writes-then-renames.
 - `strand scan` is a pattern-matching scanner, not a real parser: it

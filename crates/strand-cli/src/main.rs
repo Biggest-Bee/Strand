@@ -829,9 +829,14 @@ fn cmd_cycles(a: CyclesArgs) -> strand_core::Result<()> {
 fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
     let n = g.n_nodes() as usize;
+    let mut impact_approx = false;
     let scores: Vec<f64> = match a.by {
         TopBy::InDegree => (0..n as u32).map(|i| g.in_degree(i) as f64).collect(),
-        TopBy::Impact => algo::impact_sizes(&g).into_iter().map(|x| x as f64).collect(),
+        TopBy::Impact => {
+            let (v, m) = algo::impact_sizes_auto(&g);
+            impact_approx = m == algo::ImpactMethod::Approx;
+            v
+        }
         // PageRank on the dependency graph: rank flows dependent ->
         // dependency, so heavily-depended-upon nodes score highest.
         TopBy::Pagerank => algo::pagerank(&g, false, 1e-8, 100),
@@ -855,9 +860,22 @@ fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
                 })
             })
             .collect();
-        print_json(serde_json::json!({"by": format!("{:?}", a.by).to_lowercase(), "nodes": rows}));
+        print_json(serde_json::json!({
+            "by": format!("{:?}", a.by).to_lowercase(),
+            "method": if impact_approx { "approx" } else { "exact" },
+            "nodes": rows,
+        }));
     } else {
-        println!("top {} by {:?}:", a.count, a.by);
+        println!(
+            "top {} by {:?}{}:",
+            a.count,
+            a.by,
+            if impact_approx {
+                " (approximate: landmark sampling)"
+            } else {
+                ""
+            }
+        );
         for &i in &order {
             println!("  {:>12.4}  {}", scores[i as usize], g.node_name(i));
         }
