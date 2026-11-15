@@ -166,3 +166,47 @@ fn scan_ignores_use_inside_strings() {
     assert!(edges.contains(&("src/lib.rs".into(), "src/real.rs".into())));
     assert_eq!(edges.len(), 1, "unexpected edges: {edges:?}");
 }
+
+#[test]
+fn scan_handles_literals_and_lifetimes() {
+    let dir = tempfile::tempdir().unwrap();
+    w(dir.path(), "Cargo.toml", "[package]\nname = \"p\"\n");
+    w(
+        dir.path(),
+        "src/lib.rs",
+        concat!(
+            "mod real;\n",
+            "fn f<'a>(x: &'a str) -> char { '\"' }\n",
+            "const RAW: &str = r#\"use fake::dep; mod ghost;\"#;\n",
+            "const ESC: &str = \"use fake::dep; mod ghost;\";\n",
+            "/* block\n use fake::dep; */\n",
+            "/* outer /* inner use fake::dep; */ still comment */\n",
+        ),
+    );
+    w(dir.path(), "src/real.rs", "pub fn f() {}\n");
+    let out = scan_rust(dir.path()).unwrap();
+    let edges = edges_of(&out);
+    assert_eq!(edges.len(), 1, "unexpected edges: {edges:?}");
+    assert_eq!(edges[0], ("src/lib.rs".into(), "src/real.rs".into()));
+}
+
+#[test]
+fn scan_own_repo_is_sane() {
+    // Dogfood: scan the Strand workspace itself. Must produce a non-trivial
+    // file-level graph with no panics or garbage node names.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let out = scan_lang(&root, Lang::Rust).unwrap();
+    assert!(out.edges.len() > 20, "only {} edges", out.edges.len());
+    assert!(out.nodes.iter().all(|n| n.ends_with(".rs")));
+    // strand-app's main.rs uses strand_core::algo/view paths, so it must
+    // resolve into strand-core's module files.
+    assert!(out.edges.iter().any(|(s, d, _)| {
+        s == "crates/strand-app/src/main.rs" && d == "crates/strand-core/src/algo/mod.rs"
+    }));
+    assert!(out.edges.iter().any(|(s, d, _)| {
+        s == "crates/strand-app/src/main.rs" && d == "crates/strand-store/src/lib.rs"
+    }));
+}

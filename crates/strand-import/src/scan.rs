@@ -81,12 +81,11 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
             .map_err(|e| Error::Invalid(format!("{}: {e}", abs.display())))?;
-        let clean = strip_comments(&text);
-        // String-literal contents are blanked (same length, so char
-        // positions still line up) so `mod`/`use` scanning can't see
-        // tokens that only exist inside strings like `"use a::b;"`.
-        // `#[path]`/`include!` still read `clean` — they need the text.
-        let masked = mask_strings(&clean);
+        // `lex_rs` produces two views: `clean` (comments stripped, string
+        // contents kept for `#[path]`/`include!`) and `masked` (string
+        // contents blanked, positions preserved) for `mod`/`use` scanning
+        // so tokens inside literals can't create phantom edges.
+        let (clean, masked) = lex_rs(&text);
         let mut deps: BTreeSet<String> = BTreeSet::new();
 
         // `mod foo;` declarations -> foo.rs or foo/mod.rs under this
@@ -432,46 +431,182 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
-/// Blank out string-literal contents: every char inside `"..."` becomes a
-/// space (newlines preserved), quotes and escapes kept so length and char
-/// positions are unchanged. Heuristic like [`strip_comments`]: it tracks
-/// `"` strings with `\` escapes but not raw strings or char literals.
-fn mask_strings(src: &str) -> String {
+/// Lex Rust source into two aligned views:
+///
+/// - `clean`: comments removed, everything else verbatim (string contents
+///   kept — `#[path]`/`include!` extraction needs them).
+/// - `masked`: identical to `clean` except string/raw-string *contents*
+///   are blanked to spaces (length and char positions preserved), so
+///   `mod`/`use` scanning can't see tokens inside literals.
+///
+/// Handles line comments, nested block comments, normal strings with
+/// escapes, byte strings (`b".."` — the `b` is just a normal char), raw
+/// strings (`r".."`, `r#".."#`, `br#".."#`), char literals vs lifetimes
+/// (`'x'` vs `'a`), and non-ASCII text (char-based, not bytes).
+fn lex_rs(src: &str) -> (String, String) {
     let b: Vec<char> = src.chars().collect();
     let n = b.len();
-    let mut out = String::with_capacity(src.len());
+    let mut clean = String::with_capacity(src.len());
+    let mut masked = String::with_capacity(src.len());
     let mut i = 0;
-    let mut in_str = false;
     while i < n {
         let c = b[i];
-        if in_str {
-            match c {
-                '\\' => {
-                    out.push('\\');
-                    if i + 1 < n {
-                        out.push(' ');
-                        i += 1;
-                    }
-                }
-                '"' => {
-                    out.push('"');
-                    in_str = false;
-                }
-                '\n' => out.push('\n'),
-                _ => out.push(' '),
+        // Line comment: dropped from both views.
+        if c == '/' && i + 1 < n && b[i + 1] == '/' {
+            while i < n && b[i] != '\n' {
+                i += 1;
             }
+            continue;
+        }
+        // Block comment (Rust nests them): dropped from both views.
+        if c == '/' && i + 1 < n && b[i + 1] == '*' {
+            let mut depth = 1usize;
+            i += 2;
+            while i < n && depth > 0 {
+                if i + 1 < n && b[i] == '/' && b[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < n && b[i] == '*' && b[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Raw string: r"..", r#".."#, r##".."##, or br".."/br#".."#.
+        if let Some(end) = raw_string_end(&b, i) {
+            let lit: String = b[i..end].iter().collect();
+            clean.push_str(&lit);
+            masked.push_str(&blank_literal(&lit));
+            i = end;
+            continue;
+        }
+        // Normal string literal (also covers b".." — `b` is emitted as a
+        // normal char on the previous iteration).
+        if c == '"' {
+            let start = i;
+            i += 1;
+            while i < n {
+                if b[i] == '\\' {
+                    i = (i + 2).min(n);
+                    continue;
+                }
+                if b[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            let lit: String = b[start..i.min(n)].iter().collect();
+            clean.push_str(&lit);
+            masked.push_str(&blank_literal(&lit));
+            continue;
+        }
+        // Char literal ('x', '\n', '\'', '"') vs lifetime ('a, 'static).
+        if c == '\'' {
+            if let Some(end) = char_literal_end(&b, i) {
+                let lit: String = b[i..end].iter().collect();
+                clean.push_str(&lit);
+                masked.push_str(&lit);
+                i = end;
+                continue;
+            }
+            clean.push('\'');
+            masked.push('\'');
             i += 1;
             continue;
         }
-        if c == '"' {
-            in_str = true;
-            out.push('"');
-        } else {
-            out.push(c);
-        }
+        clean.push(c);
+        masked.push(c);
         i += 1;
     }
+    (clean, masked)
+}
+
+/// `lit` with its interior blanked to spaces (quotes/delimiters kept,
+/// newlines preserved). Used for the `masked` view of string literals.
+fn blank_literal(lit: &str) -> String {
+    let chars: Vec<char> = lit.chars().collect();
+    if chars.len() <= 2 {
+        return lit.to_string();
+    }
+    let mut out = String::with_capacity(lit.len());
+    out.push(chars[0]);
+    for &ch in &chars[1..chars.len() - 1] {
+        out.push(if ch == '\n' { '\n' } else { ' ' });
+    }
+    out.push(chars[chars.len() - 1]);
     out
+}
+
+/// If a raw string starts at `b[i]` (`r"`, `r#"`, `r##"`, ..., or the
+/// `br` byte-string variants), return the index just past its closing
+/// `"` + `#`s. Requires a non-identifier char before `r`/`b` so `parser`
+/// or `foobar` can't fake one.
+fn raw_string_end(b: &[char], i: usize) -> Option<usize> {
+    let n = b.len();
+    let mut j = i;
+    // Optional `b` prefix for byte raw strings.
+    if j < n && b[j] == 'b' && j + 1 < n && b[j + 1] == 'r' {
+        j += 1;
+    }
+    if j >= n || b[j] != 'r' {
+        return None;
+    }
+    // Boundary: the `r` (or `b`) must not continue an identifier.
+    if i > 0 && is_ident(b[i - 1]) {
+        return None;
+    }
+    j += 1;
+    let mut hashes = 0usize;
+    while j < n && b[j] == '#' {
+        hashes += 1;
+        j += 1;
+    }
+    if j >= n || b[j] != '"' {
+        return None;
+    }
+    // Find closing `"` followed by exactly `hashes` '#'s.
+    let mut k = j + 1;
+    while k < n {
+        if b[k] == '"'
+            && k + 1 + hashes <= n
+            && b[k + 1..k + 1 + hashes].iter().all(|&c| c == '#')
+        {
+            return Some(k + 1 + hashes);
+        }
+        k += 1;
+    }
+    None // unterminated: treat rest of file as not-a-string
+}
+
+/// If a char literal starts at `b[i]` (`'x'`, `'\n'`, `'\''`, `'"'`,
+/// `'\u{..}'`), return the index just past the closing `'`. Anything
+/// else starting with `'` is treated as a lifetime/label and returns
+/// `None` so the `'` is emitted as a normal char.
+fn char_literal_end(b: &[char], i: usize) -> Option<usize> {
+    let n = b.len();
+    if i + 1 >= n {
+        return None;
+    }
+    if b[i + 1] == '\\' {
+        // Escape form: '\<stuff>' — find the closing quote soon after.
+        let mut j = i + 2;
+        while j < n && j <= i + 14 {
+            if b[j] == '\'' {
+                return Some(j + 1);
+            }
+            j += 1;
+        }
+        return None;
+    }
+    // Simple form: '<one char>' — exactly one char between the quotes.
+    if i + 2 < n && b[i + 2] == '\'' {
+        return Some(i + 3);
+    }
+    None
 }
 
 fn is_ident(c: char) -> bool {
