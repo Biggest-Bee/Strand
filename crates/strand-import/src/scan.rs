@@ -82,6 +82,11 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
         let text = fs::read_to_string(abs)
             .map_err(|e| Error::Invalid(format!("{}: {e}", abs.display())))?;
         let clean = strip_comments(&text);
+        // String-literal contents are blanked (same length, so char
+        // positions still line up) so `mod`/`use` scanning can't see
+        // tokens that only exist inside strings like `"use a::b;"`.
+        // `#[path]`/`include!` still read `clean` — they need the text.
+        let masked = mask_strings(&clean);
         let mut deps: BTreeSet<String> = BTreeSet::new();
 
         // `mod foo;` declarations -> foo.rs or foo/mod.rs under this
@@ -89,7 +94,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
         // attribute overrides the location.
         let mdir = module_dir_rel(rel);
         let attrs = path_attrs(&clean);
-        for (idx, seg) in mod_decls(&clean) {
+        for (idx, seg) in mod_decls(&masked) {
             // The attribute applies only if nothing item-like sits
             // between it and this `mod` (no `;`, `{`, `}`).
             let custom = attrs
@@ -97,7 +102,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
                 .rev()
                 .find(|(_, ae, _)| {
                     *ae < idx
-                        && !clean
+                        && !masked
                             .chars()
                             .skip(*ae)
                             .take(idx - ae)
@@ -126,7 +131,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
         }
 
         // `use` paths.
-        for segments in use_paths(&clean) {
+        for segments in use_paths(&masked) {
             let Some((first, rest)) = segments.split_first() else {
                 continue;
             };
@@ -422,6 +427,48 @@ fn strip_comments(src: &str) -> String {
             continue;
         }
         out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Blank out string-literal contents: every char inside `"..."` becomes a
+/// space (newlines preserved), quotes and escapes kept so length and char
+/// positions are unchanged. Heuristic like [`strip_comments`]: it tracks
+/// `"` strings with `\` escapes but not raw strings or char literals.
+fn mask_strings(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let n = b.len();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < n {
+        let c = b[i];
+        if in_str {
+            match c {
+                '\\' => {
+                    out.push('\\');
+                    if i + 1 < n {
+                        out.push(' ');
+                        i += 1;
+                    }
+                }
+                '"' => {
+                    out.push('"');
+                    in_str = false;
+                }
+                '\n' => out.push('\n'),
+                _ => out.push(' '),
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push('"');
+        } else {
+            out.push(c);
+        }
         i += 1;
     }
     out

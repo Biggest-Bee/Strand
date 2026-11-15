@@ -149,3 +149,20 @@ fn scan_js_imports() {
     // 'react' is a bare specifier -> ignored.
     assert!(!edges.iter().any(|(_, d)| d.contains("react")));
 }
+
+#[test]
+fn scan_ignores_use_inside_strings() {
+    let dir = tempfile::tempdir().unwrap();
+    w(dir.path(), "Cargo.toml", "[package]\nname = \"p\"\n");
+    // `use`/`mod` tokens inside string literals must not create edges.
+    w(
+        dir.path(),
+        "src/lib.rs",
+        "mod real;\nconst S: &str = \"use fake::dep; mod ghost;\";\n",
+    );
+    w(dir.path(), "src/real.rs", "pub fn f() {}\n");
+    let out = scan_rust(dir.path()).unwrap();
+    let edges = edges_of(&out);
+    assert!(edges.contains(&("src/lib.rs".into(), "src/real.rs".into())));
+    assert_eq!(edges.len(), 1, "unexpected edges: {edges:?}");
+}

@@ -242,6 +242,7 @@ i5-1335U (12 threads, 8GB RAM); page cache warm unless noted:
 | forward BFS visiting all 10M nodes / 50M edges | ~1.3 s |
 | Tarjan SCC (iterative) | ~9 s |
 | PageRank (~0.12 s/iter, rayon) | ~0.25 s — converged in ~2 iters |
+| `top --by impact` (SCC condensation + bitsets) | ~17 s total incl. open+SCC |
 
 Caveat: the synthetic graph is near-regular (every node has exactly 5
 out-edges), so PageRank converges unusually fast. Real dependency graphs
@@ -291,7 +292,9 @@ cargo test
   (unweighted graphs count every edge as 1.0). The store preserves
   weights through compaction.
 - The store is single-writer per directory (one process holds the write
-  lock); scale-out means one store per shard.
+  lock); scale-out means one store per shard — e.g. one `.strandb` per
+  top-level subtree or per service, queried independently. Cross-shard
+  queries are not supported yet.
 - Store delta is in-memory, but commits auto-compact once it passes
   `Options::compact_threshold_ops` (default 1M ops, 0 disables) — the
   delta can still spike RAM between compactions, and readers pin their
@@ -304,7 +307,9 @@ cargo test
 - `strand scan` is a pattern-matching scanner, not a real parser: it
   handles `mod`/`use`/`#[path]`/`include!` (Rust), `import`/`from`
   incl. relative imports (Python), and `import`/`export-from`/`require`
-  (JS/TS). It misses macro-generated modules, `include_str!` payloads,
+  (JS/TS). It misses macro-generated modules (a real parser can't see
+  them either without expanding macros — `cargo expand` output is a
+  workaround for inspection, not for scanning), `include_str!` payloads,
   tsconfig path aliases, and dynamic language tricks. Nodes are file
   paths, so it answers "what breaks if I change `src/foo.rs`?" —
   package-level questions still want `cargo metadata` input.
