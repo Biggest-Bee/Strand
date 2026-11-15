@@ -952,6 +952,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
     let mut edges: EdgeList = Vec::new();
+    let aliases = load_js_aliases(root);
 
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
@@ -961,15 +962,21 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
         let parent = parent_rel(rel);
 
         for spec in js_import_specs(&clean) {
-            // Only relative specs ('./x', '../x') are intra-project;
-            // bare specifiers resolve to node_modules.
-            if !spec.starts_with(".") {
+            // Relative specs ('./x', '../x') are always intra-project.
+            if spec.starts_with(".") {
+                let Some(norm) = normalize_rel(parent, &spec) else {
+                    continue;
+                };
+                if let Some(dep) = resolve_js(&names, &norm) {
+                    if dep != *rel {
+                        deps.insert(dep);
+                    }
+                }
                 continue;
             }
-            let Some(norm) = normalize_rel(parent, &spec) else {
-                continue;
-            };
-            if let Some(dep) = resolve_js(&names, &norm) {
+            // Bare specifiers: tsconfig `paths` aliases and `baseUrl`
+            // resolve intra-project; anything else is node_modules.
+            if let Some(dep) = resolve_js_alias(&aliases, &names, &spec) {
                 if dep != *rel {
                     deps.insert(dep);
                 }
@@ -1051,3 +1058,242 @@ fn resolve_js(names: &BTreeSet<String>, norm: &str) -> Option<String> {
     None
 }
 
+
+// ---------- tsconfig/jsconfig path aliases ----------
+
+/// Effective `compilerOptions.paths` + `baseUrl` resolved from
+/// `tsconfig.json` or `jsconfig.json` at the scan root, following
+/// `extends` chains (relative paths and `node_modules` lookups).
+struct JsAliases {
+    /// Root-relative dir that `paths` targets and `baseUrl`-relative
+    /// bare specifiers resolve against.
+    base: String,
+    /// `baseUrl` was explicitly set — unmatched bare specifiers fall
+    /// back to `base/spec` (classic baseUrl resolution).
+    has_base_url: bool,
+    /// `(prefix, suffix, targets)` wildcard patterns in `paths` order.
+    /// `prefix`/`suffix` are the literal parts around `*` (suffix may
+    /// be empty); a pattern without `*` is stored with empty suffix
+    /// and matches only the exact spec — handled via `exact` flag.
+    patterns: Vec<PathPattern>,
+}
+
+struct PathPattern {
+    prefix: String,
+    suffix: String,
+    /// `Some(star)` when the key contains `*`; `None` = exact match.
+    star: bool,
+    targets: Vec<String>,
+}
+
+/// Load alias config from `root/tsconfig.json` or `root/jsconfig.json`.
+fn load_js_aliases(root: &Path) -> Option<JsAliases> {
+    for name in ["tsconfig.json", "jsconfig.json"] {
+        let cfg = root.join(name);
+        if cfg.is_file() {
+            let mut seen = BTreeSet::new();
+            let merged = read_tsconfig(root, &cfg, "", 0, &mut seen)?;
+            return merged.into_aliases();
+        }
+    }
+    None
+}
+
+/// One level of a tsconfig `extends` chain, already merged leaf-over-
+/// parent. `dir` is the root-relative dir containing the file that
+/// contributed the *effective* `baseUrl`/`paths` values.
+struct TsConfig {
+    base_url: Option<(String, String)>, // (declaring dir, value)
+    paths: Option<(String, Vec<(String, Vec<String>)>)>, // (declaring dir, entries)
+}
+
+fn read_tsconfig(
+    root: &Path,
+    abs: &Path,
+    dir_rel: &str,
+    depth: u8,
+    seen: &mut BTreeSet<PathBuf>,
+) -> Option<TsConfig> {
+    if depth > 8 || !seen.insert(abs.to_path_buf()) {
+        return None;
+    }
+    let text = fs::read_to_string(abs).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let empty = serde_json::Value::Null;
+    let opts = json.get("compilerOptions").unwrap_or(&empty);
+
+    // `extends` first: parent values apply unless the child overrides.
+    let mut merged = TsConfig {
+        base_url: None,
+        paths: None,
+    };
+    if let Some(ext) = json.get("extends").and_then(|e| e.as_str()) {
+        if let Some(parent_abs) = resolve_extends(root, abs, dir_rel, ext) {
+            let parent_dir = parent_abs
+                .parent()
+                .and_then(|p| p.strip_prefix(root).ok())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if let Some(parent) =
+                read_tsconfig(root, &parent_abs, &parent_dir, depth + 1, seen)
+            {
+                merged = parent;
+            }
+        }
+    }
+
+    if let Some(v) = opts.get("baseUrl").and_then(|v| v.as_str()) {
+        merged.base_url = Some((dir_rel.to_string(), v.to_string()));
+    }
+    if let Some(map) = opts.get("paths").and_then(|v| v.as_object()) {
+        let entries: Vec<(String, Vec<String>)> = map
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|t| t.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        merged.paths = Some((dir_rel.to_string(), entries));
+    }
+    Some(merged)
+}
+
+/// Resolve an `extends` value to a file: relative to the config's dir,
+/// with or without a `.json` suffix, or under `node_modules`.
+fn resolve_extends(
+    root: &Path,
+    cfg_abs: &Path,
+    dir_rel: &str,
+    ext: &str,
+) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if ext.starts_with('.') {
+        // Relative to the config file's directory.
+        let base = cfg_abs.parent()?;
+        for suffix in ["", ".json", "/tsconfig.json"] {
+            candidates.push(base.join(format!("{ext}{suffix}")));
+        }
+    } else {
+        for suffix in ["", ".json"] {
+            candidates.push(root.join("node_modules").join(format!("{ext}{suffix}")));
+        }
+        let _ = dir_rel;
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+impl TsConfig {
+    fn into_aliases(self) -> Option<JsAliases> {
+        // Effective base dir: declaring config's dir + its baseUrl
+        // (baseUrl defaults to the declaring config's dir when only
+        // `paths` is set, per TS >= 4.1).
+        let (base, has_base_url) = match &self.base_url {
+            Some((dir, url)) => {
+                let joined = normalize_rel(dir, url).unwrap_or_else(|| dir.clone());
+                (joined, true)
+            }
+            None => match &self.paths {
+                Some((dir, _)) => (dir.clone(), false),
+                None => return None,
+            },
+        };
+        let patterns = self
+            .paths
+            .map(|(_, entries)| {
+                entries
+                    .into_iter()
+                    .map(|(key, targets)| {
+                        if let Some(star) = key.find('*') {
+                            PathPattern {
+                                prefix: key[..star].to_string(),
+                                suffix: key[star + 1..].to_string(),
+                                star: true,
+                                targets,
+                            }
+                        } else {
+                            PathPattern {
+                                prefix: key.clone(),
+                                suffix: String::new(),
+                                star: false,
+                                targets,
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(JsAliases {
+            base,
+            has_base_url,
+            patterns,
+        })
+    }
+}
+
+/// Resolve a bare (non-relative) import specifier through tsconfig
+/// aliases: `paths` patterns first (first match wins, targets tried in
+/// order), then `baseUrl` fallback for unmatched specifiers.
+fn resolve_js_alias(
+    aliases: &Option<JsAliases>,
+    names: &BTreeSet<String>,
+    spec: &str,
+) -> Option<String> {
+    let a = aliases.as_ref()?;
+    // TypeScript picks the pattern with the longest matching prefix
+    // (exact keys beat wildcards); ties keep `paths` order.
+    let mut best: Option<(&PathPattern, String)> = None;
+    for pat in &a.patterns {
+        let star_text = if pat.star {
+            if !spec.starts_with(&pat.prefix) || !spec.ends_with(&pat.suffix) {
+                continue;
+            }
+            let end = spec.len() - pat.suffix.len();
+            if end < pat.prefix.len() {
+                continue;
+            }
+            spec[pat.prefix.len()..end].to_string()
+        } else if spec == pat.prefix {
+            String::new()
+        } else {
+            continue;
+        };
+        let better = match &best {
+            None => true,
+            Some((bp, _)) => pat.prefix.len() > bp.prefix.len(),
+        };
+        if better {
+            best = Some((pat, star_text));
+        }
+    }
+    if let Some((pat, star_text)) = best {
+        for target in &pat.targets {
+            let t = if pat.star {
+                target.replacen('*', &star_text, 1)
+            } else {
+                target.clone()
+            };
+            let t = t.trim_start_matches('/');
+            if let Some(norm) = normalize_rel(&a.base, t) {
+                if let Some(dep) = resolve_js(names, &norm) {
+                    return Some(dep);
+                }
+            }
+        }
+        return None; // matched pattern but no target resolved
+    }
+    // No pattern matched: classic baseUrl resolution.
+    if a.has_base_url {
+        if let Some(norm) = normalize_rel(&a.base, spec.trim_start_matches('/')) {
+            return resolve_js(names, &norm);
+        }
+    }
+    None
+}

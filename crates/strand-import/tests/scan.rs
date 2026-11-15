@@ -151,6 +151,67 @@ fn scan_js_imports() {
 }
 
 #[test]
+fn scan_js_tsconfig_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(
+        root,
+        "tsconfig.json",
+        r#"{
+            "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                    "@/*": ["src/*"],
+                    "exact-dep": ["lib/exact.ts"],
+                    "@/fallback/*": ["missing/*", "src/fb/*"]
+                }
+            }
+        }"#,
+    );
+    w(root, "src/app/main.ts", "import { x } from '@/util/x';\nimport e from 'exact-dep';\nimport { f } from '@/fallback/thing';\nimport { b } from 'src/lib/base';\nimport 'react';\n");
+    w(root, "src/util/x.ts", "export const x = 1;\n");
+    w(root, "lib/exact.ts", "export default 0;\n");
+    w(root, "src/fb/thing.ts", "export const f = 1;\n");
+    w(root, "src/lib/base.ts", "export const b = 1;\n");
+    let out = scan_lang(root, Lang::Js).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    assert!(has("src/app/main.ts", "src/util/x.ts")); // @/* wildcard
+    assert!(has("src/app/main.ts", "lib/exact.ts")); // exact key
+    assert!(has("src/app/main.ts", "src/fb/thing.ts")); // second target tried
+    assert!(has("src/app/main.ts", "src/lib/base.ts")); // baseUrl fallback
+    assert!(!edges.iter().any(|(_, d)| d.contains("react")));
+}
+
+#[test]
+fn scan_js_tsconfig_extends() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(
+        root,
+        "tsconfig.base.json",
+        r#"{ "compilerOptions": { "paths": { "@core/*": ["core/*"] } } }"#,
+    );
+    w(
+        root,
+        "tsconfig.json",
+        r#"{ "extends": "./tsconfig.base.json",
+             "compilerOptions": { "baseUrl": "src" } }"#,
+    );
+    w(root, "src/app.ts", "import { c } from '@core/thing';\n");
+    w(root, "src/core/thing.ts", "export const c = 1;\n");
+    let out = scan_lang(root, Lang::Js).unwrap();
+    let edges = edges_of(&out);
+    // Parent's `paths` inherited; targets resolve against child's
+    // effective baseUrl (src) -> src/core/thing.ts.
+    assert!(edges.contains(&(
+        "src/app.ts".to_string(),
+        "src/core/thing.ts".to_string()
+    )));
+}
+
+#[test]
 fn scan_ignores_use_inside_strings() {
     let dir = tempfile::tempdir().unwrap();
     w(dir.path(), "Cargo.toml", "[package]\nname = \"p\"\n");

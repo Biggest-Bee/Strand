@@ -308,7 +308,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
 
 ## Testing
 
-`cargo test` runs ~69 tests across the workspace:
+`cargo test` runs ~71 tests across the workspace:
 
 - **core algorithms** (`strand-core/tests/algorithms.rs`): BFS/depths,
   shortest & k-shortest paths, non-shortest `paths_within_depth`,
@@ -327,9 +327,10 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   output regardless of input order, duplicate-edge merging, node kinds,
   truncations and bit flips produce clean errors (never panics).
 - **scanner** (`strand-import/tests/scan.rs`): Rust `mod`/`use`/
-  `#[path]`/`include!`, Python and JS/TS imports, dedup, string-literal
-  masking, char literals vs lifetimes, raw strings, non-ASCII, plus a
-  dogfood test that scans Strand's own repo.
+  `#[path]`/`include!`, Python and JS/TS imports, `tsconfig`/`jsconfig`
+  `paths` aliases + `baseUrl` + `extends` inheritance, dedup,
+  string-literal masking, char literals vs lifetimes, raw strings,
+  non-ASCII, plus a dogfood test that scans Strand's own repo.
 - **store** (`strand-store/tests/store.rs`): transactions, persistence,
   snapshots, compaction (incl. weighted edges), read-only rejection,
   WAL torn-tail/bit-flip recovery, a model-based randomized op test, and
@@ -397,10 +398,12 @@ cargo test
 - `strand scan` is a pattern-matching scanner, not a real parser: it
   handles `mod`/`use`/`#[path]`/`include!` (Rust), `import`/`from`
   incl. relative imports (Python), and `import`/`export-from`/`require`
-  (JS/TS). It misses macro-generated modules (a real parser can't see
+  (JS/TS), including `tsconfig`/`jsconfig` `paths` aliases and
+  `baseUrl` (with `extends` chains followed). It misses
+  macro-generated modules (a real parser can't see
   them either without expanding macros — `cargo expand` output is a
   workaround for inspection, not for scanning), `include_str!` payloads,
-  tsconfig path aliases, and dynamic language tricks. Nodes are file
+  and dynamic language tricks. Nodes are file
   paths, so it answers "what breaks if I change `src/foo.rs`?" —
   package-level questions still want `cargo metadata` input.
 
