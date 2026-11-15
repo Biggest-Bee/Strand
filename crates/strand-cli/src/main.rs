@@ -33,6 +33,8 @@ enum Commands {
     Scan(ScanArgs),
     /// Show graph statistics.
     Info(InfoArgs),
+    /// List every node name in the graph.
+    Nodes(NodesArgs),
     /// List direct and transitive dependencies of a node.
     Deps(DepsArgs),
     /// Blast radius: everything affected if the given nodes change.
@@ -125,6 +127,13 @@ struct ScanArgs {
 
 #[derive(Parser)]
 struct InfoArgs {
+    file: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct NodesArgs {
     file: PathBuf,
     #[arg(long)]
     json: bool,
@@ -321,6 +330,7 @@ fn run(cmd: Commands) -> strand_core::Result<()> {
         Commands::Build(a) => cmd_build(a),
         Commands::Scan(a) => cmd_scan(a),
         Commands::Info(a) => cmd_info(a),
+        Commands::Nodes(a) => cmd_nodes(a),
         Commands::Deps(a) => cmd_deps(a),
         Commands::Impact(a) => cmd_impact(a),
         Commands::Why(a) => cmd_why(a),
@@ -440,6 +450,19 @@ fn cmd_info(a: InfoArgs) -> strand_core::Result<()> {
         println!("edges:       {}", g.n_edges());
         println!("weighted:    {}", g.has_weights());
         println!("size:        {} bytes", size);
+    }
+    Ok(())
+}
+
+fn cmd_nodes(a: NodesArgs) -> strand_core::Result<()> {
+    let g = open_graph(&a.file)?;
+    if a.json {
+        let names: Vec<&str> = (0..g.n_nodes() as u32).map(|i| g.node_name(i)).collect();
+        print_json(serde_json::json!({"nodes": names}));
+    } else {
+        for i in 0..g.n_nodes() as u32 {
+            println!("{}", g.node_name(i));
+        }
     }
     Ok(())
 }

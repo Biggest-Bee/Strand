@@ -38,6 +38,11 @@ fn cli_build_and_queries() {
     let info = run(&["info", g]);
     assert!(info.contains("6 nodes") || info.contains("nodes:       6"));
 
+    let nodes = run(&["nodes", g]);
+    for name in ["app", "liba", "libb", "core", "util", "tool"] {
+        assert!(nodes.lines().any(|l| l == name), "missing node {name}");
+    }
+
     let deps = run(&["deps", g, "app"]);
     assert!(deps.contains("liba") && deps.contains("util"));
 

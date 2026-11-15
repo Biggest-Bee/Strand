@@ -96,16 +96,21 @@ strand build pom.xml -o deps.strand        # Maven
 # (--format cargo-lock|npm-lock|poetry-lock|go-mod|pom overrides)
 
 # Scan a project folder and build a source-level dependency graph
-# (skips target/, .git/, node_modules/):
+# (skips target/, .git/, node_modules/, and build-output dirs like
+# .next/, dist/, out/, coverage/, .turbo/, .firebase/):
 strand scan ./my-project -o deps.strand
 
 # Rust (mod/use/#[path]/include!/...crate paths), Python (import/from,
-# relative imports), JS/TS (import/export-from/require, index resolution).
+# relative + absolute imports resolved against ancestor dirs so nested
+# package roots like repo/pkg/pkg/ work), JS/TS (import/export-from/
+# require, index resolution, tsconfig/jsconfig paths+extends+baseUrl,
+# package.json "imports").
 # --lang rust|python|js restricts to one language; default scans all.
 strand scan ./my-project --lang python -o pydeps.strand
 
 # Analyze:
 strand info deps.strand
+strand nodes deps.strand          # list every node name
 strand deps deps.strand my-crate --depth 3
 strand impact deps.strand serde --by-depth
 strand why deps.strand my-app serde_json
@@ -334,7 +339,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
 
 ## Testing
 
-`cargo test` runs ~74 tests across the workspace:
+`cargo test` runs ~76 tests across the workspace:
 
 - **core algorithms** (`strand-core/tests/algorithms.rs`): BFS/depths,
   shortest & k-shortest paths, non-shortest `paths_within_depth`,
@@ -356,7 +361,9 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   output regardless of input order, duplicate-edge merging, node kinds,
   truncations and bit flips produce clean errors (never panics).
 - **scanner** (`strand-import/tests/scan.rs`): Rust `mod`/`use`/
-  `#[path]`/`include!`, Python and JS/TS imports, `tsconfig`/`jsconfig`
+  `#[path]`/`include!`, Python and JS/TS imports, Python absolute
+  imports resolving against ancestor package roots (nested `pkg/pkg/`
+  layouts), `tsconfig`/`jsconfig`
   `paths` aliases + `baseUrl` + `extends` inheritance, JSONC comments/
   trailing commas, per-package configs in monorepos, `package.json`
   `"imports"` (`#alias`), dedup,
@@ -371,7 +378,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   `cargo test -p strand-store -- --ignored`), plus the auto-compaction
   threshold.
 - **CLI end-to-end** (`strand-cli/tests/cli.rs`): build (single and
-  multi-input), info/deps/impact/why/cycles/top/order/roots/leaves/
+  multi-input), info/nodes/deps/impact/why/cycles/top/order/roots/leaves/
   common/scan/export/check, `--git-diff` seed resolution, `--max-impact`
   gating, impact-count consistency, and missing-node errors via
   `CARGO_BIN_EXE_strand`.
@@ -379,7 +386,8 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   parsing, comment/blank handling, malformed-rule rejection, substring
   vs glob pattern semantics (`*`/`?`).
 - **lockfile importers** (`strand-import/tests/locks.rs`): all five
-  formats incl. npm nested `node_modules` resolution, poetry
+  formats incl. npm nested `node_modules` resolution and `name@version`
+  disambiguation when multiple versions are installed, poetry
   dev-dependencies, go.mod directive boundaries, pom parent inheritance,
   and format auto-detection.
 

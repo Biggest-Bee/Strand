@@ -445,6 +445,35 @@ fn package_lock_v2(
     }
 
     let root_name = root["name"].as_str().unwrap_or("(root)").to_string();
+
+    // Multiple installed versions of one package (nested node_modules)
+    // would collide under a bare name — disambiguate as `name@version`.
+    let mut name_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for path in pkgs.keys() {
+        if !path.is_empty() {
+            *name_counts.entry(pkg_name_from_path(path)).or_default() += 1;
+        }
+    }
+    let disp_name = |path: &str| -> String {
+        let base = pkg_name_from_path(path);
+        if name_counts.get(&base).copied().unwrap_or(0) > 1 {
+            // Link entries (workspace symlinks) carry no version; follow
+            // `resolved` to the real package for its version.
+            let ver = pkgs[path]["version"]
+                .as_str()
+                .or_else(|| {
+                    pkgs[path]["resolved"]
+                        .as_str()
+                        .and_then(|r| pkgs.get(r))
+                        .and_then(|m| m["version"].as_str())
+                })
+                .unwrap_or(path);
+            format!("{base}@{ver}")
+        } else {
+            base
+        }
+    };
+
     let mut edges = EdgeList::new();
     let mut seen = BTreeSet::new();
 
@@ -455,11 +484,11 @@ fn package_lock_v2(
         let src = if path.is_empty() {
             root_name.clone()
         } else {
-            pkg_name_from_path(path)
+            disp_name(path)
         };
         for dep in ds {
             if let Some(resolved) = resolve_npm_dep(pkgs, path, dep) {
-                let dst = pkg_name_from_path(&resolved);
+                let dst = disp_name(&resolved);
                 if seen.insert((src.clone(), dst.clone())) {
                     push_edge(&mut edges, &src, dst);
                 }

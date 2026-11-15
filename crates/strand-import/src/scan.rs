@@ -20,8 +20,24 @@ use strand_core::{Error, Result};
 
 use crate::EdgeList;
 
-/// Directories never descended into.
-const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules"];
+/// Directories never descended into: VCS internals, dependency dirs,
+/// and conventional build/tooling output (`.next`, `dist`, `out`,
+/// `coverage`, framework caches). `build` is deliberately absent —
+/// some projects keep real sources there.
+const SKIP_DIRS: &[&str] = &[
+    "target",
+    ".git",
+    "node_modules",
+    ".next",
+    "dist",
+    "out",
+    "coverage",
+    ".turbo",
+    ".cache",
+    ".vercel",
+    ".netlify",
+    ".firebase",
+];
 
 /// Output of a scan: edges plus every source file found (so files
 /// with no dependencies still become nodes in the graph).
@@ -829,29 +845,49 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
                     .collect();
+                // Absolute imports (`from x.y import`, level 0) resolve against
+                // every ancestor dir of this file, like Python's sys.path —
+                // the package root may be a subdirectory (e.g. `repo/pkg/pkg/`).
+                // Relative imports keep their computed base only.
+                let bases: Vec<String> = if level == 0 {
+                    ancestor_bases(rel)
+                } else {
+                    vec![base]
+                };
                 // Module file for `from X import ...`.
                 if !segs.is_empty() {
-                    if let Some(dep) = resolve_py(&names, &base, &segs) {
-                        if dep != *rel {
-                            deps.insert(dep);
+                    for b in &bases {
+                        if let Some(dep) = resolve_py(&names, b, &segs) {
+                            if dep != *rel {
+                                deps.insert(dep);
+                            }
+                            break;
                         }
                     }
                     // `from pkg import sub` may pull pkg/sub.py too.
                     for name in import_names(names_part) {
                         let mut ns = segs.clone();
                         ns.push(name);
-                        if let Some(dep) = resolve_py(&names, &base, &ns) {
-                            if dep != *rel {
-                                deps.insert(dep);
+                        for b in &bases {
+                            if let Some(dep) = resolve_py(&names, b, &ns) {
+                                if dep != *rel {
+                                    deps.insert(dep);
+                                }
+                                break;
                             }
                         }
                     }
                 } else {
                     // `from . import x, y` — names are modules under base.
                     for name in import_names(names_part) {
-                        if let Some(dep) = resolve_py(&names, &base, &[name]) {
-                            if dep != *rel {
-                                deps.insert(dep);
+                        for b in &bases {
+                            if let Some(dep) =
+                                resolve_py(&names, b, std::slice::from_ref(&name))
+                            {
+                                if dep != *rel {
+                                    deps.insert(dep);
+                                }
+                                break;
                             }
                         }
                     }
@@ -874,10 +910,14 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                     if segs.is_empty() {
                         continue;
                     }
-                    // `import a.b.c` needs the full path to resolve.
-                    if let Some(dep) = resolve_py_exact(&names, "", &segs) {
-                        if dep != *rel {
-                            deps.insert(dep);
+                    // `import a.b.c` needs the full path to resolve; try each
+                    // ancestor dir as a package root (sys.path heuristic).
+                    for b in ancestor_bases(rel) {
+                        if let Some(dep) = resolve_py_exact(&names, &b, &segs) {
+                            if dep != *rel {
+                                deps.insert(dep);
+                            }
+                            break;
                         }
                     }
                 }
@@ -907,6 +947,24 @@ fn import_names(s: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Ancestor directories of `rel` (root-relative file path), deepest
+/// first, ending with `""` (the scan root). Candidate package roots for
+/// absolute Python imports — mirrors how `sys.path` can contain any
+/// ancestor of the importing file (e.g. `repo/pkg/pkg/` layouts where
+/// the top-level package lives one level down).
+fn ancestor_bases(rel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut dir = parent_rel(rel).to_string();
+    loop {
+        out.push(dir.clone());
+        if dir.is_empty() {
+            break;
+        }
+        dir = parent_rel(&dir).to_string();
+    }
+    out
 }
 
 /// Resolve a dotted Python module path under `base` ("" = root), trying

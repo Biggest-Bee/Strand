@@ -130,6 +130,27 @@ fn scan_python_imports() {
 }
 
 #[test]
+fn scan_python_nested_package_root() {
+    // Layout like `repo/proj/proj/`: the top-level package lives one
+    // directory down, so absolute imports only resolve when ancestor
+    // dirs are tried as package roots (sys.path heuristic).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "proj/proj/__init__.py", "");
+    w(root, "proj/proj/core.py", "from proj import util\nimport proj.helpers\n");
+    w(root, "proj/proj/util.py", "");
+    w(root, "proj/proj/helpers.py", "");
+    w(root, "proj/run.py", "import proj.core\n");
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    assert!(has("proj/proj/core.py", "proj/proj/util.py")); // from proj import util
+    assert!(has("proj/proj/core.py", "proj/proj/helpers.py")); // import proj.helpers
+    assert!(has("proj/run.py", "proj/proj/core.py")); // import proj.core
+}
+
+#[test]
 fn scan_js_imports() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

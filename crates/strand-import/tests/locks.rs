@@ -146,12 +146,40 @@ fn package_lock_v3_nested_resolution() {
     "node_modules/a/node_modules/b": {"version": "2.0.0"}
   }
 }"#;
-    // a's dep b resolves to the nested v2 (nearest node_modules wins).
+    // a's dep b resolves to the nested v2 (nearest node_modules wins);
+    // two installed versions means both nodes are name@version.
     assert_eq!(
         edges(text, Format::NpmLock),
         vec![
-            ("a".to_string(), "b".to_string()),
+            ("a".to_string(), "b@2.0.0".to_string()),
             ("root".to_string(), "a".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn package_lock_duplicate_versions_disambiguated() {
+    // Same package installed at two versions (e.g. debug@2 nested under
+    // express + debug@4 at top level) must not collapse into one node.
+    let text = r#"{
+  "name": "root",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "root", "dependencies": {"express": "^4.0.0"}},
+    "node_modules/express": {"version": "4.0.0", "dependencies": {"debug": "^2.0.0"}},
+    "node_modules/express/node_modules/debug": {"version": "2.6.9"},
+    "node_modules/debug": {"version": "4.4.3", "dependencies": {"ms": "^2.1.0"}},
+    "node_modules/ms": {"version": "2.1.3"}
+  }
+}"#;
+    // ms is installed once so it keeps its bare name; the two debug
+    // installs become debug@2.6.9 / debug@4.4.3.
+    assert_eq!(
+        edges(text, Format::NpmLock),
+        vec![
+            ("debug@4.4.3".to_string(), "ms".to_string()),
+            ("express".to_string(), "debug@2.6.9".to_string()),
+            ("root".to_string(), "express".to_string()),
         ]
     );
 }
