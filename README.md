@@ -140,6 +140,9 @@ strand export deps.strand --format dot --why my-app serde_json
 #   forbid *.test -> src/    # * and ? globs also work
 strand check deps.strand            # reads ./strand.rules
 strand check deps.strand --rules ci.rules --json
+
+# Diff two graphs (e.g. rescan after changes, no git required):
+strand diff old.strand new.strand
 ```
 
 Every command accepts `--json` for CI use.
@@ -366,7 +369,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   layouts), `tsconfig`/`jsconfig`
   `paths` aliases + `baseUrl` + `extends` inheritance, JSONC comments/
   trailing commas, per-package configs in monorepos, `package.json`
-  `"imports"` (`#alias`), dedup,
+  `"imports"` (`#alias`), multiline/parenthesized imports, dedup,
   string-literal masking, char literals vs lifetimes, raw strings,
   non-ASCII, plus a dogfood test that scans Strand's own repo.
 - **store** (`strand-store/tests/store.rs`): transactions, persistence,
@@ -379,7 +382,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   threshold.
 - **CLI end-to-end** (`strand-cli/tests/cli.rs`): build (single and
   multi-input), info/nodes/deps/impact/why/cycles/top/order/roots/leaves/
-  common/scan/export/check, `--git-diff` seed resolution, `--max-impact`
+  common/scan/export/check/diff, `--git-diff` seed resolution, `--max-impact`
   gating, impact-count consistency, and missing-node errors via
   `CARGO_BIN_EXE_strand`.
 - **rule engine unit tests** (`strand-cli/src/check.rs`): rules-file

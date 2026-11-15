@@ -827,7 +827,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
         let mut deps: BTreeSet<String> = BTreeSet::new();
         let parent = parent_rel(rel);
 
-        for line in clean.lines() {
+        for line in logical_lines(&clean) {
             let line = line.trim();
             // `from <dots><mod> import <names>` (also `from x import (a,b)`).
             if let Some(rest) = line.strip_prefix("from ") {
@@ -991,6 +991,40 @@ fn resolve_py_exact(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Op
         }
     }
     None
+}
+
+/// Join physical lines into logical ones for import scanning: a
+/// `from x import (` … `)` list or a trailing `\` continuation is
+/// collapsed into a single line. Only lines *starting* with `from ` or
+/// `import ` trigger joining, so multi-line calls/defs are untouched.
+fn logical_lines(src: &str) -> Vec<String> {
+    let raw: Vec<&str> = src.lines().collect();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let mut l = raw[i].to_string();
+        let is_import = {
+            let t = l.trim_start();
+            t.starts_with("from ") || t.starts_with("import ")
+        };
+        let needs_more = |s: &str| {
+            let t = s.trim_end();
+            t.ends_with('\\') || t.matches('(').count() > t.matches(')').count()
+        };
+        while is_import && needs_more(&l) && i + 1 < raw.len() {
+            // Drop a trailing `\` continuation marker before joining.
+            let tlen = l.trim_end().len();
+            if tlen > 0 && l.as_bytes()[tlen - 1] == b'\\' {
+                l.truncate(tlen - 1);
+            }
+            i += 1;
+            l.push(' ');
+            l.push_str(raw[i].trim());
+        }
+        out.push(l);
+        i += 1;
+    }
+    out
 }
 
 /// Strip `#` line comments (naive: `#` inside strings is not understood).

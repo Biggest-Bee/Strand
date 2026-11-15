@@ -1,6 +1,6 @@
 //! `strand` — dependency and impact analysis on memory-mapped CSR graphs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -57,6 +57,8 @@ enum Commands {
     Export(ExportArgs),
     /// Enforce architecture rules (`forbid A -> B`) from strand.rules.
     Check(CheckArgs),
+    /// Diff two .strand graphs: nodes/edges added or removed.
+    Diff(DiffArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
@@ -135,6 +137,16 @@ struct InfoArgs {
 #[derive(Parser)]
 struct NodesArgs {
     file: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct DiffArgs {
+    /// Older graph (the "before" side).
+    old: PathBuf,
+    /// Newer graph (the "after" side).
+    new: PathBuf,
     #[arg(long)]
     json: bool,
 }
@@ -342,6 +354,7 @@ fn run(cmd: Commands) -> strand_core::Result<()> {
         Commands::Common(a) => cmd_common(a),
         Commands::Export(a) => cmd_export(a),
         Commands::Check(a) => cmd_check(a),
+        Commands::Diff(a) => cmd_diff(a),
     }
 }
 
@@ -464,6 +477,97 @@ fn cmd_nodes(a: NodesArgs) -> strand_core::Result<()> {
             println!("{}", g.node_name(i));
         }
     }
+    Ok(())
+}
+
+/// (node names, dependency edges as name pairs) for diffing.
+fn graph_snapshot(g: &Graph) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
+    let mut nodes = BTreeSet::new();
+    let mut edges = BTreeSet::new();
+    for i in 0..g.n_nodes() as u32 {
+        let src = g.node_name(i).to_string();
+        nodes.insert(src.clone());
+        for &t in g.out_targets(i) {
+            edges.insert((src.clone(), g.node_name(t).to_string()));
+        }
+    }
+    (nodes, edges)
+}
+
+fn cmd_diff(a: DiffArgs) -> strand_core::Result<()> {
+    let old = open_graph(&a.old)?;
+    let new = open_graph(&a.new)?;
+    let (on, oe) = graph_snapshot(&old);
+    let (nn, ne) = graph_snapshot(&new);
+
+    let added_nodes: Vec<&String> = nn.difference(&on).collect();
+    let removed_nodes: Vec<&String> = on.difference(&nn).collect();
+    let added_edges: Vec<&(String, String)> = ne.difference(&oe).collect();
+    let removed_edges: Vec<&(String, String)> = oe.difference(&ne).collect();
+
+    if a.json {
+        print_json(serde_json::json!({
+            "old": a.old.display().to_string(),
+            "new": a.new.display().to_string(),
+            "nodes_added": added_nodes,
+            "nodes_removed": removed_nodes,
+            "edges_added": added_edges,
+            "edges_removed": removed_edges,
+        }));
+        return Ok(());
+    }
+
+    println!(
+        "{} -> {}",
+        a.old.display(),
+        a.new.display()
+    );
+    println!(
+        "nodes: +{} added, -{} removed",
+        added_nodes.len(),
+        removed_nodes.len()
+    );
+    println!(
+        "edges: +{} added, -{} removed",
+        added_edges.len(),
+        removed_edges.len()
+    );
+
+    const CAP: usize = 100;
+    let show = |title: &str, items: &[String]| {
+        if items.is_empty() {
+            return;
+        }
+        println!("{title}:");
+        for it in items.iter().take(CAP) {
+            println!("  {it}");
+        }
+        if items.len() > CAP {
+            println!("  ... and {} more", items.len() - CAP);
+        }
+    };
+    show(
+        "added nodes",
+        &added_nodes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    );
+    show(
+        "removed nodes",
+        &removed_nodes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    );
+    show(
+        "added edges",
+        &added_edges
+            .iter()
+            .map(|(s, d)| format!("{s} -> {d}"))
+            .collect::<Vec<_>>(),
+    );
+    show(
+        "removed edges",
+        &removed_edges
+            .iter()
+            .map(|(s, d)| format!("{s} -> {d}"))
+            .collect::<Vec<_>>(),
+    );
     Ok(())
 }
 
@@ -956,10 +1060,19 @@ fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
             } else {
                 ""
             };
-            println!("  {:>12.4}{}  {}", scores[i as usize], exact_mark, g.node_name(i));
+            println!("  {:>12}{}  {}", fmt_score(scores[i as usize]), exact_mark, g.node_name(i));
         }
     }
     Ok(())
+}
+
+/// Whole-number scores print without decimals (`16`, not `16.0000`).
+fn fmt_score(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 9e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.4}")
+    }
 }
 
 fn cmd_order(a: OrderArgs) -> strand_core::Result<()> {

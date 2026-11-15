@@ -151,6 +151,28 @@ fn scan_python_nested_package_root() {
 }
 
 #[test]
+fn scan_python_multiline_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/util.py", "");
+    w(root, "pkg/helper.py", "");
+    w(root, "pkg/other.py", "");
+    // Parenthesized import list spanning lines + backslash continuation.
+    w(
+        root,
+        "pkg/mod.py",
+        "from pkg import (\n    util,\n    helper\n)\nfrom pkg \\\n    import other\n",
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |d: &str| edges.contains(&("pkg/mod.py".to_string(), d.to_string()));
+    assert!(has("pkg/util.py"));
+    assert!(has("pkg/helper.py"));
+    assert!(has("pkg/other.py"));
+}
+
+#[test]
 fn scan_js_imports() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

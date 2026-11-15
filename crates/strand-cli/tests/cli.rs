@@ -309,3 +309,46 @@ fn cli_missing_node_fails() {
         .unwrap();
     assert!(!o.status.success());
 }
+
+#[test]
+fn cli_diff_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = |name: &str, csv: &str| {
+        let p = dir.path().join(format!("{name}.csv"));
+        std::fs::write(&p, csv).unwrap();
+        let out = dir.path().join(format!("{name}.strand"));
+        let o = strand()
+            .args(["build", p.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        out
+    };
+    let old = g("old", "a,b\n");
+    let new = g("new", "a,b\nc,d\n");
+
+    let o = strand()
+        .args([
+            "diff",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert!(s.contains("+2 added"), "{s}");
+    assert!(s.contains("c -> d"), "{s}");
+
+    let j = strand()
+        .args([
+            "diff",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&j.stdout).unwrap();
+    assert_eq!(v["nodes_added"].as_array().unwrap().len(), 2);
+}

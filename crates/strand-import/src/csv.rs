@@ -3,14 +3,16 @@
 //! Format: one edge per line, `src,dst[,weight]`. Delimiter is auto-detected
 //! (tab if the first data line contains a tab, else comma). Blank lines and
 //! lines starting with `#` are ignored. A header row whose first cell is a
-//! common source-column name (`src`, `source`, `from`, `a`, `package`,
-//! `name`) is skipped. Fields may be wrapped in double quotes.
+//! common source-column name (`src`, `source`, `from`, `package`,
+//! `name`) is skipped — deliberately not `a`, which is a plausible node
+//! name and would silently drop a real `a -> b` edge. Fields may be
+//! wrapped in double quotes.
 
 use strand_core::Result;
 
 use crate::{err, EdgeList};
 
-const HEADER_NAMES: &[&str] = &["src", "source", "from", "a", "package", "name"];
+const HEADER_NAMES: &[&str] = &["src", "source", "from", "package", "name"];
 
 pub fn parse(text: &str) -> Result<EdgeList> {
     // Detect delimiter from the first data line.
