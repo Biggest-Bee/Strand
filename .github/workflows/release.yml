@@ -167,7 +167,9 @@ jobs:
           printf 'src,dst\napp,lib\nlib,core\n' > t.csv
           run_bin build t.csv -o t.strand
           run_bin info t.strand
-          run_bin nodes t.strand | grep -q app
+          # No `grep -q`: it exits on first match and closes the pipe,
+          # which panics Rust binaries on EPIPE. Plain grep reads EOF.
+          run_bin nodes t.strand | grep app
           run_bin impact t.strand lib
 
   release:

@@ -327,6 +327,13 @@ struct CommonArgs {
 }
 
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so `strand nodes big.strand | head` would
+    // panic on EPIPE (exit 101). Restore default disposition so piped
+    // output terminates silently like every other Unix tool.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
