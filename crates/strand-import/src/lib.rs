@@ -5,6 +5,7 @@
 
 pub mod cargo;
 pub mod csv;
+pub mod scan;
 
 use strand_core::{Error, Result};
 

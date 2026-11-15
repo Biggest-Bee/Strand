@@ -22,8 +22,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Build a .strand graph from a CSV/TSV edge list or cargo metadata JSON.
+    /// Build a .strand graph from CSV/TSV edge lists or cargo metadata JSON.
+    /// Accepts multiple input files; all edges are merged.
     Build(BuildArgs),
+    /// Scan a directory of Rust sources and build a file-level
+    /// dependency graph from `mod`/`use` statements.
+    Scan(ScanArgs),
     /// Show graph statistics.
     Info(InfoArgs),
     /// List direct and transitive dependencies of a node.
@@ -68,8 +72,10 @@ enum TopBy {
 
 #[derive(Parser)]
 struct BuildArgs {
-    /// Input file: CSV/TSV edge list or `cargo metadata` JSON.
-    input: PathBuf,
+    /// Input file(s): CSV/TSV edge lists or `cargo metadata` JSON.
+    /// Repeatable; all edges are merged into one graph.
+    #[arg(required = true)]
+    inputs: Vec<PathBuf>,
     /// Output .strand file.
     #[arg(short, long)]
     output: PathBuf,
@@ -79,6 +85,15 @@ struct BuildArgs {
     /// Duplicate-edge merge policy.
     #[arg(long, value_enum, default_value_t = MergeChoice::Sum)]
     merge: MergeChoice,
+}
+
+#[derive(Parser)]
+struct ScanArgs {
+    /// Project directory to scan for .rs files.
+    dir: PathBuf,
+    /// Output .strand file (default: <dir-name>.strand).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -196,6 +211,7 @@ fn main() -> ExitCode {
 fn run(cmd: Commands) -> strand_core::Result<()> {
     match cmd {
         Commands::Build(a) => cmd_build(a),
+        Commands::Scan(a) => cmd_scan(a),
         Commands::Info(a) => cmd_info(a),
         Commands::Deps(a) => cmd_deps(a),
         Commands::Impact(a) => cmd_impact(a),
@@ -232,19 +248,22 @@ fn print_json(v: serde_json::Value) {
 // ---------- commands ----------
 
 fn cmd_build(a: BuildArgs) -> strand_core::Result<()> {
-    let text = std::fs::read_to_string(&a.input)?;
-    let format = match a.format {
-        InFormat::Auto => strand_import::detect_format(&a.input, &text),
-        InFormat::Csv => Format::Csv,
-        InFormat::Cargo => Format::Cargo,
-    };
-    let edges = strand_import::parse(&text, format)?;
     let mut b = GraphBuilder::new();
     b.set_merge(match a.merge {
         MergeChoice::Sum => MergeOp::Sum,
         MergeChoice::Max => MergeOp::Max,
     });
-    strand_import::fill_builder(edges, &mut b)?;
+    for input in &a.inputs {
+        let text = std::fs::read_to_string(input)?;
+        let format = match a.format {
+            InFormat::Auto => strand_import::detect_format(input, &text),
+            InFormat::Csv => Format::Csv,
+            InFormat::Cargo => Format::Cargo,
+        };
+        let edges = strand_import::parse(&text, format)?;
+        eprintln!("{}: {} edges", input.display(), edges.len());
+        strand_import::fill_builder(edges, &mut b)?;
+    }
     let stats = b.build(&a.output)?;
     eprintln!(
         "built {}: {} nodes, {} edges, {} bytes",
@@ -252,6 +271,32 @@ fn cmd_build(a: BuildArgs) -> strand_core::Result<()> {
         stats.n_nodes,
         stats.n_edges,
         stats.bytes
+    );
+    Ok(())
+}
+
+fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
+    let out = a.output.unwrap_or_else(|| {
+        let name = a
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "scan".to_string());
+        PathBuf::from(format!("{name}.strand"))
+    });
+    let scan = strand_import::scan::scan_rust(&a.dir)?;
+    let mut b = GraphBuilder::new();
+    for n in &scan.nodes {
+        b.add_node(n.clone());
+    }
+    strand_import::fill_builder(scan.edges, &mut b)?;
+    let stats = b.build(&out)?;
+    eprintln!(
+        "scanned {}: {} nodes, {} edges -> {}",
+        a.dir.display(),
+        stats.n_nodes,
+        stats.n_edges,
+        stats.path.display()
     );
     Ok(())
 }

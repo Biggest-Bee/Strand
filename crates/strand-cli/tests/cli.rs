@@ -95,6 +95,70 @@ fn cli_impact_counts_consistent() {
 }
 
 #[test]
+fn cli_build_multiple_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.csv");
+    let b = dir.path().join("b.csv");
+    std::fs::write(&a, "app,liba\napp,libb\n").unwrap();
+    std::fs::write(&b, "liba,core\nlibb,core\ncore,util\n").unwrap();
+    let graph = dir.path().join("merged.strand");
+
+    let o = strand()
+        .args([
+            "build",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    // Edges from both files are in one graph.
+    let o = strand()
+        .args(["impact", graph.to_str().unwrap(), "core"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout);
+    // Dependents of core across both files: liba, libb, app.
+    assert!(out.contains("3 affected"), "{out}");
+    assert!(out.contains("liba") && out.contains("app"));
+}
+
+#[test]
+fn cli_scan_rust_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("proj");
+    std::fs::create_dir_all(root.join("src/bar")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
+    std::fs::write(root.join("src/lib.rs"), "mod foo;\nmod bar;\n").unwrap();
+    std::fs::write(root.join("src/foo.rs"), "use crate::bar::Thing;\npub struct X;\n").unwrap();
+    std::fs::write(
+        root.join("src/bar/mod.rs"),
+        "use super::foo::X;\nmod inner;\npub struct Thing;\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/bar/inner.rs"), "pub struct Y;\n").unwrap();
+
+    let graph = dir.path().join("scan.strand");
+    let o = strand()
+        .args(["scan", root.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let o = strand()
+        .args(["deps", graph.to_str().unwrap(), "src/foo.rs"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("src/bar/mod.rs"), "{out}");
+}
+
+#[test]
 fn cli_missing_node_fails() {
     let dir = tempfile::tempdir().unwrap();
     let csv = write_csv(&dir);

@@ -61,9 +61,16 @@ cargo install --path crates/strand-cli   # or: cargo build --release
 # From an edge list (src,dst[,weight]; "src depends on dst"):
 strand build deps.csv -o deps.strand
 
+# Multiple inputs merge into one graph (names must match across files):
+strand build frontend.csv backend.csv meta.json -o all.strand
+
 # From cargo metadata:
 cargo metadata --format-version 1 > meta.json
 strand build meta.json -o deps.strand
+
+# Scan a Rust project folder and build a file-level dependency graph
+# from `mod`/`use` statements (skips target/, .git/, node_modules/):
+strand scan ./my-project -o deps.strand
 
 # Analyze:
 strand info deps.strand
@@ -243,7 +250,9 @@ times are edge-count bound and should transfer to skewed graphs.
 
 Tests live next to the code: `crates/strand-core/tests/` (algorithms,
 proptest, roundtrip/corruption/determinism), `crates/strand-cli/tests/cli.rs`
-(end-to-end CLI incl. impact-count consistency), and
+(end-to-end CLI incl. impact-count consistency, multi-input build, and a
+`scan` fixture project), `crates/strand-import/tests/scan.rs` (scanner
+resolution rules), and
 `crates/strand-store/tests/store.rs` (model-based ops, WAL recovery,
 snapshots, compaction, crash harness).
 
@@ -271,6 +280,12 @@ cargo test
   simply never referenced (the builder writes-then-renames).
 - mmap assumes files aren't truncated while open (inherent SIGBUS risk);
   the write path always writes-then-renames.
+- `strand scan` is a pattern-matching scanner, not a Rust parser: it
+  handles `mod`/`use` with `crate::`/`self::`/`super::`/workspace-crate
+  resolution, but misses `#[path]` attributes, macro-generated modules,
+  `include!`, and non-Rust languages. Nodes are file paths, so it answers
+  "what breaks if I change `src/foo.rs`?" — package-level questions still
+  want `cargo metadata` input.
 
 ## License
 

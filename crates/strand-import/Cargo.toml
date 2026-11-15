@@ -9,3 +9,6 @@ license = "Apache-2.0"
 strand-core = { path = "../strand-core" }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
