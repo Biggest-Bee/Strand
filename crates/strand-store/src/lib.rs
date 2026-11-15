@@ -91,9 +91,10 @@ pub enum Error {
 pub struct Options {
     /// fsync the WAL on every commit (default: true).
     pub fsync_on_commit: bool,
-    /// Auto-compact when the in-memory delta reaches this many applied
-    /// ops (default: 1_000_000; 0 disables). Compaction is best-effort:
-    /// a failure never fails the commit that triggered it.
+    /// Auto-compact once the delta's applied-op count reaches this floor
+    /// AND exceeds ~10% of the base edge count (default: 1_000_000;
+    /// 0 disables). Compaction is best-effort: a failure never fails the
+    /// commit that triggered it, and is retried on later commits.
     pub compact_threshold_ops: usize,
 }
 
@@ -536,30 +537,45 @@ impl<'a> WriteTx<'a> {
             }
         }
 
-        // 2. Apply to in-memory delta (clone-on-write so snapshots pin their
-        //    own Arc).
-        let delta_ops = {
+        // 2. Apply to in-memory delta. `Arc::make_mut` copies only when a
+        //    live snapshot pins the old delta — steady-state commits on an
+        //    unread store mutate in place instead of cloning the delta.
+        let (delta_ops, base_edges) = {
             let mut st = self.store.state.lock().map_err(|_| Error::Poisoned)?;
-            let mut delta = (*st.delta).clone();
-            apply_ops_inner(&st.base, st.base_n, &self.ops, &mut delta)?;
+            let base = st.base.clone();
+            let base_n = st.base_n;
+            let delta = Arc::make_mut(&mut st.delta);
+            apply_ops_inner(&base, base_n, &self.ops, delta)?;
             let n = delta.op_count;
-            st.delta = Arc::new(delta);
+            let be = base.as_ref().map(|b| b.n_edges()).unwrap_or(0);
             st.seq += 1;
-            n
+            (n, be)
         };
 
         // 3. Auto-compaction: release the write guard first (compact()
         //    takes write_mutex itself), then fold the delta into a fresh
-        //    base. Best-effort — the commit above is already durable, so
-        //    a compaction failure must not fail it.
+        //    base. Threshold is the larger of the configured op count and
+        //    10% of base edges, so the delta stays proportional to the
+        //    graph it sits on. Best-effort — the commit above is already
+        //    durable, so a compaction failure must not fail it (it will
+        //    be retried on the next commit).
         let WriteTx {
             store,
             _guard,
             ops: _,
         } = self;
         drop(_guard);
-        if store.compact_threshold > 0 && delta_ops >= store.compact_threshold {
-            let _ = store.compact();
+        if store.compact_threshold > 0 {
+            // Delta ops vs base edges: compact once the delta is both
+            // over the configured floor and over ~10% of the base.
+            let eff = store
+                .compact_threshold
+                .max((base_edges / 10).min(usize::MAX as u64) as usize);
+            if delta_ops >= eff {
+                if let Err(e) = store.compact() {
+                    eprintln!("strand-store: auto-compaction failed: {e}");
+                }
+            }
         }
         Ok(())
     }
@@ -577,6 +593,12 @@ fn write_manifest(dir: &Path, m: &Manifest) -> Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, dir.join("manifest.json"))?;
+    // Best-effort directory fsync so the rename itself is durable.
+    // (File::open on a directory only works on Unix.)
+    #[cfg(unix)]
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 

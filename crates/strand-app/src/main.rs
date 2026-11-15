@@ -190,7 +190,14 @@ impl StrandApp {
         else {
             return;
         };
-        match Store::open(&dir) {
+        // Auto-compaction is disabled for GUI-opened stores: it runs
+        // synchronously inside commit() on the UI thread and would freeze
+        // the window on large deltas. Use the "Compact" button instead.
+        let opts = strand_store::Options {
+            compact_threshold_ops: 0,
+            ..Default::default()
+        };
+        match Store::open_with_options(&dir, opts) {
             Ok(s) => {
                 let writable = s.is_writable();
                 self.source_label = format!(
@@ -575,6 +582,23 @@ impl StrandApp {
         }
     }
 
+    /// Fold the delta into a fresh base. Runs on the UI thread — fine for
+    /// typical deltas; very large ones will pause the window briefly.
+    fn store_compact(&mut self) {
+        let res = match &self.backend {
+            Some(Backend::Store(s)) => s.compact(),
+            _ => return,
+        };
+        match res {
+            Ok(()) => {
+                self.status = "compacted".into();
+                self.collect_names();
+                self.viz_dirty = true;
+            }
+            Err(e) => self.status = format!("compact failed: {e}"),
+        }
+    }
+
     fn rebuild_viz(&mut self) {
         self.viz_dirty = false;
         self.pos.clear();
@@ -845,6 +869,9 @@ impl eframe::App for StrandApp {
                         }
                         if ui.button("Remove node A").clicked() {
                             self.store_edit(StoreOp::RemoveNode);
+                        }
+                        if ui.button("Compact").clicked() {
+                            self.store_compact();
                         }
                     });
                 }
