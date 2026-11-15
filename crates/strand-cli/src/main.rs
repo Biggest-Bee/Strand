@@ -15,7 +15,7 @@ mod export;
 #[derive(Parser)]
 #[command(
     name = "strand",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("STRAND_GIT_DESCRIBE"), ")"),
     about = "Dependency and impact analysis on memory-mapped CSR graphs"
 )]
 struct Cli {
