@@ -1,7 +1,7 @@
 //! `strand` — dependency and impact analysis on memory-mapped CSR graphs.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -131,6 +131,7 @@ struct DepsArgs {
 #[derive(Parser)]
 struct ImpactArgs {
     file: PathBuf,
+    /// Seed node names. Optional when --git-diff is given.
     nodes: Vec<String>,
     #[arg(long)]
     depth: Option<u32>,
@@ -140,6 +141,17 @@ struct ImpactArgs {
     /// Only report nodes with this node_meta kind.
     #[arg(long)]
     kind: Option<String>,
+    /// Seed from files changed vs a git ref: runs
+    /// `git diff --name-only <REF>` and maps changed paths onto graph
+    /// nodes (exact path, package/dir-name segment, or path suffix).
+    #[arg(long)]
+    git_diff: Option<String>,
+    /// Directory to run git in (default: current directory).
+    #[arg(long)]
+    git_dir: Option<PathBuf>,
+    /// Exit non-zero if the affected count exceeds N (CI gate).
+    #[arg(long)]
+    max_impact: Option<usize>,
     #[arg(long)]
     json: bool,
 }
@@ -390,14 +402,42 @@ fn cmd_deps(a: DepsArgs) -> strand_core::Result<()> {
 }
 
 fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
-    if a.nodes.is_empty() {
+    if a.nodes.is_empty() && a.git_diff.is_none() {
         return Err(strand_core::Error::Invalid(
-            "impact requires at least one node".into(),
+            "impact requires at least one node or --git-diff".into(),
         ));
     }
     let g = open_graph(&a.file)?;
-    let seeds: Vec<u32> = a
-        .nodes
+
+    // Seed names: positional nodes plus any resolved from --git-diff.
+    let mut seed_names: Vec<String> = a.nodes.clone();
+    if let Some(reference) = &a.git_diff {
+        let git_dir = a.git_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let (matched, unmatched) = git_diff_seeds(&g, &git_dir, reference)?;
+        let no_git_matches = matched.is_empty() && a.nodes.is_empty();
+        seed_names.extend(matched);
+        seed_names.sort();
+        seed_names.dedup();
+        if !unmatched.is_empty() {
+            eprintln!(
+                "warning: {} changed file(s) matched no graph node: {}",
+                unmatched.len(),
+                unmatched[..unmatched.len().min(10)].join(", ")
+            );
+        }
+        if no_git_matches {
+            return Err(strand_core::Error::Invalid(format!(
+                "no graph nodes matched files changed vs {reference}"
+            )));
+        }
+    }
+    if seed_names.is_empty() {
+        return Err(strand_core::Error::Invalid(
+            "impact requires at least one node or --git-diff".into(),
+        ));
+    }
+
+    let seeds: Vec<u32> = seed_names
         .iter()
         .map(|n| node_id(&g, n))
         .collect::<strand_core::Result<_>>()?;
@@ -432,7 +472,7 @@ fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
                 .collect()
         };
         print_json(serde_json::json!({
-            "seeds": a.nodes,
+            "seeds": seed_names,
             "total_affected": affected.len(),
             "direct": direct,
             "transitive": transitive,
@@ -441,7 +481,7 @@ fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
     } else {
         println!(
             "impact of [{}]: {} affected ({} direct, {} transitive)",
-            a.nodes.join(", "),
+            seed_names.join(", "),
             affected.len(),
             direct,
             transitive
@@ -474,7 +514,125 @@ fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
         }
         let _ = counts;
     }
+    if let Some(max) = a.max_impact {
+        if affected.len() > max {
+            return Err(strand_core::Error::Invalid(format!(
+                "impact of {} node(s) = {}; exceeds --max-impact {}",
+                seed_names.len(),
+                affected.len(),
+                max
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Map files changed vs a git ref onto graph node names.
+///
+/// Per changed file, tries in order:
+/// 1. exact path match (scan graphs rooted at the repo root),
+/// 2. directory-segment match (package graphs: `crates/foo/src/lib.rs`
+///    matches node `foo`),
+/// 3. path-suffix match (scan graphs rooted below the repo root:
+///    `crates/app/src/lib.rs` matches node `src/lib.rs`).
+///
+/// Returns (matched node names, unmatched file paths).
+fn git_diff_seeds(
+    g: &Graph,
+    git_dir: &Path,
+    reference: &str,
+) -> strand_core::Result<(Vec<String>, Vec<String>)> {
+    use std::process::Command;
+
+    let git = |dir: &Path, args: &[&str]| -> strand_core::Result<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()?;
+        if !out.status.success() {
+            return Err(strand_core::Error::Invalid(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    // Resolve the repo root so diff paths are repo-root-relative.
+    let root = PathBuf::from(git(git_dir, &["rev-parse", "--show-toplevel"])?.trim());
+    let diff = git(&root, &["diff", "--name-only", reference])?;
+    let files: Vec<String> = diff
+        .lines()
+        .map(|l| l.trim().replace('\\', "/"))
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // Index all node names for exact/segment lookup.
+    let mut by_name: std::collections::HashMap<&str, u32> =
+        std::collections::HashMap::with_capacity(g.n_nodes() as usize);
+    for id in 0..g.n_nodes() as u32 {
+        by_name.insert(g.node_name(id), id);
+    }
+    // Lazily built basename -> ids index for path-node suffix matching.
+    let mut by_base: Option<std::collections::HashMap<String, Vec<u32>>> = None;
+
+    let mut matched: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut unmatched: Vec<String> = Vec::new();
+
+    for file in &files {
+        let f = file.trim_start_matches("./");
+        let mut hits: Vec<u32> = Vec::new();
+
+        // 1. exact path match.
+        if let Some(&id) = by_name.get(f) {
+            hits.push(id);
+        }
+        // 2. directory-segment match (package/dir names).
+        if let Some((dirs, _)) = f.rsplit_once('/') {
+            for seg in dirs.split('/') {
+                if let Some(&id) = by_name.get(seg) {
+                    hits.push(id);
+                }
+            }
+        }
+        // 3. path-suffix match for nodes containing '/'.
+        if hits.is_empty() {
+            let base = f.rsplit('/').next().unwrap_or(f);
+            let idx = by_base.get_or_insert_with(|| {
+                let mut m: std::collections::HashMap<String, Vec<u32>> =
+                    std::collections::HashMap::new();
+                for id in 0..g.n_nodes() as u32 {
+                    let name = g.node_name(id);
+                    if name.contains('/') {
+                        let b = name.rsplit('/').next().unwrap_or(name);
+                        m.entry(b.to_string()).or_default().push(id);
+                    }
+                }
+                m
+            });
+            if let Some(ids) = idx.get(base) {
+                for &id in ids {
+                    let name = g.node_name(id);
+                    if f == name || f.ends_with(&format!("/{name}")) {
+                        hits.push(id);
+                    }
+                }
+            }
+        }
+
+        if hits.is_empty() {
+            unmatched.push(file.clone());
+        } else {
+            for id in hits {
+                matched.insert(g.node_name(id).to_string());
+            }
+        }
+    }
+
+    Ok((matched.into_iter().collect(), unmatched))
 }
 
 fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {

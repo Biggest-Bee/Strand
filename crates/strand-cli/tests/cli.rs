@@ -159,6 +159,59 @@ fn cli_scan_rust_project() {
 }
 
 #[test]
+fn cli_impact_git_diff() {
+    // --git-diff maps changed files onto graph nodes; --max-impact gates CI.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+
+    let git = |args: &[&str]| {
+        let o = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    std::fs::write(repo.join("app.rs"), "fn main() {}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    // Uncommitted change -> shows up in `git diff --name-only HEAD`.
+    std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\npub fn g() {}\n").unwrap();
+
+    // app.rs depends on src/lib.rs.
+    let csv = dir.path().join("deps.csv");
+    std::fs::write(&csv, "app.rs,src/lib.rs\n").unwrap();
+    let graph = dir.path().join("deps.strand");
+    strand()
+        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let g = graph.to_str().unwrap();
+    let rd = repo.to_str().unwrap();
+    let o = strand()
+        .args(["impact", g, "--git-diff", "HEAD", "--git-dir", rd])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("src/lib.rs"), "{out}");
+    assert!(out.contains("1 affected"), "{out}");
+    assert!(out.contains("app.rs"), "{out}");
+
+    // --max-impact turns the blast radius into a CI gate.
+    let o = strand()
+        .args(["impact", g, "--git-diff", "HEAD", "--git-dir", rd, "--max-impact", "0"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+}
+
+#[test]
 fn cli_missing_node_fails() {
     let dir = tempfile::tempdir().unwrap();
     let csv = write_csv(&dir);

@@ -93,10 +93,15 @@ strand order deps.strand --critical-path
 strand roots deps.strand
 strand leaves deps.strand
 strand common deps.strand deps a b
+
+# Impact of everything changed vs a git ref (CI use):
+# maps `git diff --name-only <ref>` paths onto graph nodes — exact path
+# for file-level scan graphs, directory/package segment for cargo graphs.
+strand impact deps.strand --git-diff origin/main --max-impact 25
+# exits non-zero when the blast radius exceeds --max-impact
 ```
 
-Every command accepts `--json` for CI use, e.g. fail a PR when the blast
-radius of a changed package exceeds a threshold.
+Every command accepts `--json` for CI use.
 
 ## The store (`strand-store`)
 
