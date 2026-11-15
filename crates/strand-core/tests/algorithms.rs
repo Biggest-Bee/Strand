@@ -84,24 +84,28 @@ fn shortest_path() {
 fn k_shortest_paths_counts() {
     let (_d, p) = diamond();
     let g = Graph::open(&p).unwrap();
-    let paths = algo::k_shortest_paths(
+    let res = algo::k_shortest_paths(
         &g,
         g.node_id("app").unwrap(),
         g.node_id("util").unwrap(),
         10,
     );
     // Exactly two shortest chains: via liba and via libb.
-    assert_eq!(paths.len(), 2);
-    for p in &paths {
+    assert_eq!(res.paths.len(), 2);
+    assert!(!res.truncated);
+    for p in &res.paths {
         assert_eq!(p.len(), 4);
     }
 
-    // k=1 gives one path
-    assert_eq!(
-        algo::k_shortest_paths(&g, g.node_id("app").unwrap(), g.node_id("util").unwrap(), 1)
-            .len(),
-        1
+    // k=1 gives one path, flagged truncated (more shortest chains exist)
+    let one = algo::k_shortest_paths(
+        &g,
+        g.node_id("app").unwrap(),
+        g.node_id("util").unwrap(),
+        1,
     );
+    assert_eq!(one.paths.len(), 1);
+    assert!(one.truncated);
 }
 
 #[test]
@@ -118,13 +122,22 @@ fn paths_within_depth_finds_nonshortest() {
     let g = Graph::open(&p).unwrap();
     let (from, to) = (g.node_id("a").unwrap(), g.node_id("d").unwrap());
 
-    assert_eq!(algo::paths_within_depth(&g, from, to, 1, 10).len(), 0);
-    assert_eq!(algo::paths_within_depth(&g, from, to, 2, 10).len(), 2);
-    assert_eq!(algo::paths_within_depth(&g, from, to, 3, 10).len(), 3);
-    // limit caps results
-    assert_eq!(algo::paths_within_depth(&g, from, to, 3, 2).len(), 2);
+    assert_eq!(
+        algo::paths_within_depth(&g, from, to, 1, 10).paths.len(),
+        0
+    );
+    let d2 = algo::paths_within_depth(&g, from, to, 2, 10);
+    assert_eq!(d2.paths.len(), 2);
+    assert!(!d2.truncated);
+    let d3 = algo::paths_within_depth(&g, from, to, 3, 10);
+    assert_eq!(d3.paths.len(), 3);
+    assert!(!d3.truncated);
+    // limit caps results and reports truncation
+    let capped = algo::paths_within_depth(&g, from, to, 3, 2);
+    assert_eq!(capped.paths.len(), 2);
+    assert!(capped.truncated);
     // every returned path is simple, starts at a, ends at d, within depth
-    for path in algo::paths_within_depth(&g, from, to, 3, 10) {
+    for path in &d3.paths {
         assert_eq!(*path.first().unwrap(), from);
         assert_eq!(*path.last().unwrap(), to);
         assert!(path.len() - 1 <= 3);
@@ -339,4 +352,30 @@ fn weighted_dijkstra() {
     .unwrap();
     assert_eq!(cost2, 2.0);
     assert_eq!(path2, path);
+}
+
+#[test]
+fn impact_sizes_blocked_bitsets() {
+    // 50k-node chain -> 50k singleton SCCs -> the bitset DP needs more
+    // than one column block (block_words < words), exercising the
+    // blocked path. Node i is depended on by exactly i nodes.
+    let dir = tempfile::tempdir().unwrap();
+    let n = 50_000usize;
+    let mut b = GraphBuilder::new();
+    for i in 0..n - 1 {
+        b.add_edge(&format!("n{i:05}"), &format!("n{:05}", i + 1));
+    }
+    let p = dir.path().join("g.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+    let sizes = algo::impact_sizes(&g);
+    assert_eq!(sizes.len(), n);
+    assert_eq!(sizes[0], 0);
+    assert_eq!(sizes[n - 1] as usize, n - 1);
+    assert_eq!(sizes[n / 2] as usize, n / 2);
+    // Cross-check a middle node against a real reverse BFS.
+    let mid = g.node_id(&format!("n{:05}", n / 2)).unwrap();
+    let d = algo::bfs(&g, &[mid], Dir::In, None);
+    let expect = d.iter().filter(|&&x| x != algo::UNVISITED).count() - 1;
+    assert_eq!(sizes[mid as usize] as usize, expect);
 }

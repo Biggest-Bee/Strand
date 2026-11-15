@@ -521,22 +521,29 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
     }
 
     if a.all_paths {
-        let paths = match a.max_depth {
+        let res = match a.max_depth {
             Some(d) => algo::paths_within_depth(&g, from, to, d, a.limit),
             None => algo::k_shortest_paths(&g, from, to, a.limit),
         };
+        let paths = &res.paths;
         if a.json {
             let ps: Vec<Vec<String>> = paths
                 .iter()
                 .map(|p| names_of(&g, p))
                 .collect();
-            print_json(serde_json::json!({"from": a.from, "to": a.to, "paths": ps}));
+            print_json(serde_json::json!({
+                "from": a.from, "to": a.to, "paths": ps,
+                "truncated": res.truncated,
+            }));
         } else if paths.is_empty() {
             println!("no dependency chain from {} to {}", a.from, a.to);
         } else {
             for (i, p) in paths.iter().enumerate() {
                 let names = names_of(&g, p);
                 println!("path {}: {}", i + 1, names.join(" -> "));
+            }
+            if res.truncated {
+                println!("(truncated: more chains exist; raise --limit or --max-depth)");
             }
         }
         return Ok(());

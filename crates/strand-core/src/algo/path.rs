@@ -7,6 +7,17 @@ use std::collections::BinaryHeap;
 use crate::algo::{bfs, Dir, UNVISITED};
 use crate::view::GraphView;
 
+/// Result of a bounded path enumeration.
+#[derive(Clone, Debug)]
+pub struct PathList {
+    /// The enumerated paths, in deterministic discovery order.
+    pub paths: Vec<Vec<u32>>,
+    /// True when enumeration stopped before exhausting the search space
+    /// (hit `k`/`limit` or the internal step budget) — more paths may
+    /// exist that were not returned.
+    pub truncated: bool,
+}
+
 /// One shortest dependency chain `from -> ... -> to` (forward edges).
 /// Returns `None` if `to` is not reachable from `from`.
 pub fn shortest_path<G: GraphView>(graph: &G, from: u32, to: u32) -> Option<Vec<u32>> {
@@ -53,16 +64,26 @@ pub fn shortest_path<G: GraphView>(graph: &G, from: u32, to: u32) -> Option<Vec<
 /// through that subgraph with an iterative DFS. Deterministic: neighbors are
 /// visited in the order the view yields them. Bounded by `k` results and an
 /// internal step budget so adversarial graphs cannot hang the caller.
-pub fn k_shortest_paths<G: GraphView>(graph: &G, from: u32, to: u32, k: usize) -> Vec<Vec<u32>> {
+pub fn k_shortest_paths<G: GraphView>(graph: &G, from: u32, to: u32, k: usize) -> PathList {
     if k == 0 {
-        return Vec::new();
+        return PathList {
+            paths: Vec::new(),
+            truncated: false,
+        };
     }
     if from == to {
-        return vec![vec![from]];
+        // The only simple chain is the trivial one — enumeration is exact.
+        return PathList {
+            paths: vec![vec![from]],
+            truncated: false,
+        };
     }
     let d_from = bfs(graph, &[from], Dir::Out, None);
     if d_from[to as usize] == UNVISITED {
-        return Vec::new();
+        return PathList {
+            paths: Vec::new(),
+            truncated: false,
+        };
     }
     let d_to = bfs(graph, &[to], Dir::In, None);
     let total = d_from[to as usize];
@@ -129,7 +150,10 @@ pub fn k_shortest_paths<G: GraphView>(graph: &G, from: u32, to: u32, k: usize) -
         let nb = neighbors_of(w);
         stack.push((w, nb, 0));
     }
-    paths
+    PathList {
+        truncated: !stack.is_empty(),
+        paths,
+    }
 }
 
 /// Up to `limit` distinct *simple* dependency chains from `from` to `to`
@@ -147,14 +171,30 @@ pub fn paths_within_depth<G: GraphView>(
     to: u32,
     max_depth: u32,
     limit: usize,
-) -> Vec<Vec<u32>> {
+) -> PathList {
     if limit == 0 {
-        return Vec::new();
+        return PathList {
+            paths: Vec::new(),
+            truncated: false,
+        };
     }
     if from == to {
-        return vec![vec![from]];
+        return PathList {
+            paths: vec![vec![from]],
+            truncated: false,
+        };
     }
     let n = graph.n_nodes();
+    // dist[v] = hops from v to `to` (reverse BFS). Any partial path that
+    // can't reach `to` within the remaining depth budget is pruned, which
+    // keeps the step budget from being wasted on dead ends.
+    let dist = bfs(graph, &[to], Dir::In, None);
+    if dist[from as usize] == UNVISITED || dist[from as usize] > max_depth {
+        return PathList {
+            paths: Vec::new(),
+            truncated: false,
+        };
+    }
     let neighbors_of = |v: u32| -> Vec<u32> {
         let mut out = Vec::new();
         graph.out_edges(v, &mut |w| {
@@ -164,14 +204,16 @@ pub fn paths_within_depth<G: GraphView>(
         });
         out
     };
-
+    // Precompute each node's allowed out-neighbors once: neighbors that
+    // can still reach `to` within the depth bound from *some* position —
+    // the tight per-position check happens during DFS.
     let mut paths: Vec<Vec<u32>> = Vec::new();
     let mut path: Vec<u32> = vec![from];
     let mut on_path = vec![false; n];
     on_path[from as usize] = true;
-    // (node, neighbors, next neighbor index, depth of node in `path`)
-    let mut stack: Vec<(u32, Vec<u32>, usize)> = vec![(from, neighbors_of(from), 0)];
-    let mut depths: Vec<u32> = vec![0]; // parallel to `path`
+    // (node, neighbors, next neighbor index, node depth in `path`)
+    let mut stack: Vec<(u32, Vec<u32>, usize, u32)> =
+        vec![(from, neighbors_of(from), 0, 0)];
     let mut steps = 0usize;
     let step_budget = 4_000_000usize;
 
@@ -179,19 +221,9 @@ pub fn paths_within_depth<G: GraphView>(
         if paths.len() >= limit || steps > step_budget {
             break;
         }
-        let depth = *depths.last().unwrap();
-        if depth >= max_depth {
-            // Can't extend further; pop this frame.
-            let (v, _, _) = stack.pop().unwrap();
-            depths.pop();
-            on_path[v as usize] = false;
-            path.pop();
-            continue;
-        }
-        let nbrs_len = top.1.len();
-        if top.2 >= nbrs_len {
-            let (v, _, _) = stack.pop().unwrap();
-            depths.pop();
+        let depth = top.3;
+        if top.2 >= top.1.len() {
+            let (v, _, _, _) = stack.pop().unwrap();
             on_path[v as usize] = false;
             path.pop();
             continue;
@@ -204,18 +236,27 @@ pub fn paths_within_depth<G: GraphView>(
             continue;
         }
         if w == to {
-            let mut p = path.clone();
-            p.push(to);
-            paths.push(p);
+            if depth + 1 <= max_depth {
+                let mut p = path.clone();
+                p.push(to);
+                paths.push(p);
+            }
+            continue;
+        }
+        // Prune: w must reach `to` within the hops left after taking w.
+        let dw = dist[wi];
+        if dw == UNVISITED || depth + 1 + dw > max_depth {
             continue;
         }
         on_path[wi] = true;
         path.push(w);
-        depths.push(depth + 1);
         let nb = neighbors_of(w);
-        stack.push((w, nb, 0));
+        stack.push((w, nb, 0, depth + 1));
     }
-    paths
+    PathList {
+        truncated: !stack.is_empty(),
+        paths,
+    }
 }
 
 /// Weighted shortest path (Dijkstra) over forward edges.
