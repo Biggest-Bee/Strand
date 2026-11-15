@@ -2,11 +2,14 @@
 name = "strand-import"
 version = "0.1.0"
 edition = "2021"
-description = "Importers for strand graph files (CSV/TSV edge lists, cargo metadata)"
+description = "Importers for strand graphs: cargo metadata, CSV/TSV, lockfiles (Cargo.lock, package-lock, poetry.lock, go.mod, pom.xml), and source scanners (Rust/Python/JS)"
 license = "Apache-2.0"
+repository = "https://github.com/Biggest-Bee/Strand"
+keywords = ["import", "parsers", "dependency-graph", "lockfile"]
+categories = ["parser-implementations"]
 
 [dependencies]
-strand-core = { path = "../strand-core" }
+strand-core = { path = "../strand-core", version = "0.1.0" }
 serde_json.workspace = true
 thiserror.workspace = true
 

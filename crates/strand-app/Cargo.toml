@@ -4,10 +4,13 @@ version = "0.2.0"
 edition = "2021"
 description = "Desktop GUI for Strand dependency/impact analysis (eframe/egui)"
 license = "Apache-2.0"
+repository = "https://github.com/Biggest-Bee/Strand"
+keywords = ["gui", "visualization", "dependency-graph"]
+categories = ["visualization"]
 
 [dependencies]
-strand-core = { path = "../strand-core" }
-strand-store = { path = "../strand-store" }
+strand-core = { path = "../strand-core", version = "0.1.0" }
+strand-store = { path = "../strand-store", version = "0.2.0" }
 eframe = "0.35"
 rfd = "0.15"
 egui = "0.35"
