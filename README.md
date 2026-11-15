@@ -99,6 +99,10 @@ strand common deps.strand deps a b
 # for file-level scan graphs, directory/package segment for cargo graphs.
 strand impact deps.strand --git-diff origin/main --max-impact 25
 # exits non-zero when the blast radius exceeds --max-impact
+
+# Export diagrams for docs/PRs (Graphviz DOT or Mermaid):
+strand export deps.strand --format mermaid --impact serde_json --depth 2
+strand export deps.strand --format dot --why my-app serde_json
 ```
 
 Every command accepts `--json` for CI use.

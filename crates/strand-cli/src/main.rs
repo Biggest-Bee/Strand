@@ -9,6 +9,8 @@ use strand_core::algo::{self, Dir};
 use strand_core::{Graph, GraphBuilder, MergeOp};
 use strand_import::{self, Format};
 
+mod export;
+
 #[derive(Parser)]
 #[command(
     name = "strand",
@@ -48,6 +50,8 @@ enum Commands {
     Leaves(LeavesArgs),
     /// Nodes shared between two nodes: common deps or common impact.
     Common(CommonArgs),
+    /// Export an impact set or dependency path as a DOT/Mermaid diagram.
+    Export(ExportArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
@@ -222,6 +226,40 @@ struct LeavesArgs {
     json: bool,
 }
 
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+enum DiagramFmt {
+    /// Graphviz DOT.
+    Dot,
+    /// Mermaid flowchart.
+    Mermaid,
+}
+
+#[derive(Parser)]
+struct ExportArgs {
+    file: PathBuf,
+    /// Diagram syntax.
+    #[arg(long, value_enum)]
+    format: DiagramFmt,
+    /// Seed nodes: export everything that depends on them (repeatable).
+    #[arg(long)]
+    impact: Vec<String>,
+    /// Export the shortest chain FROM -> TO instead of an impact set.
+    #[arg(long, num_args = 2, value_names = ["FROM", "TO"])]
+    why: Option<Vec<String>>,
+    /// Use edge weights for --why (Dijkstra).
+    #[arg(long)]
+    weighted: bool,
+    /// Max hops for --impact (default: unlimited).
+    #[arg(long)]
+    depth: Option<u32>,
+    /// Max edges drawn (default 1000).
+    #[arg(long, default_value_t = 1000)]
+    max_edges: usize,
+    /// Write to file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
 #[derive(Parser)]
 struct CommonArgs {
     file: PathBuf,
@@ -258,6 +296,7 @@ fn run(cmd: Commands) -> strand_core::Result<()> {
         Commands::Roots(a) => cmd_roots(a),
         Commands::Leaves(a) => cmd_leaves(a),
         Commands::Common(a) => cmd_common(a),
+        Commands::Export(a) => cmd_export(a),
     }
 }
 
@@ -901,6 +940,68 @@ fn cmd_common(a: CommonArgs) -> strand_core::Result<()> {
         for n in names {
             println!("  {n}");
         }
+    }
+    Ok(())
+}
+
+fn cmd_export(a: ExportArgs) -> strand_core::Result<()> {
+    if a.impact.is_empty() && a.why.is_none() {
+        return Err(strand_core::Error::Invalid(
+            "export requires --impact or --why".into(),
+        ));
+    }
+    if !a.impact.is_empty() && a.why.is_some() {
+        return Err(strand_core::Error::Invalid(
+            "--impact and --why are mutually exclusive".into(),
+        ));
+    }
+    let g = open_graph(&a.file)?;
+    let fmt = match a.format {
+        DiagramFmt::Dot => export::Diagram::Dot,
+        DiagramFmt::Mermaid => export::Diagram::Mermaid,
+    };
+
+    let (nodes, edges, truncated) = if let Some(w) = &a.why {
+        let from = node_id(&g, &w[0])?;
+        let to = node_id(&g, &w[1])?;
+        let path = if a.weighted {
+            algo::shortest_path_weighted_csr(&g, from, to).map(|(p, _)| p)
+        } else {
+            algo::shortest_path(&g, from, to)
+        };
+        let Some(path) = path else {
+            return Err(strand_core::Error::Invalid(format!(
+                "no dependency chain from {} to {}",
+                w[0], w[1]
+            )));
+        };
+        let nodes: std::collections::BTreeSet<u32> = path.iter().copied().collect();
+        let edges: Vec<(u32, u32)> = path.windows(2).map(|w| (w[0], w[1])).collect();
+        (nodes, edges, false)
+    } else {
+        let seeds: Vec<u32> = a
+            .impact
+            .iter()
+            .map(|n| node_id(&g, n))
+            .collect::<strand_core::Result<_>>()?;
+        let depths = algo::bfs(&g, &seeds, Dir::In, a.depth);
+        let nodes: std::collections::BTreeSet<u32> = depths
+            .iter()
+            .enumerate()
+            .filter(|&(_, &d)| d != algo::UNVISITED)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let (edges, truncated) = export::edges_within(&g, &nodes, a.max_edges);
+        (nodes, edges, truncated)
+    };
+
+    let text = export::render(&g, fmt, &nodes, &edges, truncated);
+    match &a.output {
+        Some(p) => {
+            std::fs::write(p, &text)?;
+            eprintln!("wrote {}", p.display());
+        }
+        None => print!("{text}"),
     }
     Ok(())
 }

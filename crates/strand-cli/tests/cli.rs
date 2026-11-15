@@ -212,6 +212,38 @@ fn cli_impact_git_diff() {
 }
 
 #[test]
+fn cli_export_diagrams() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = write_csv(&dir);
+    let graph = dir.path().join("deps.strand");
+    strand()
+        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let g = graph.to_str().unwrap();
+
+    let o = strand()
+        .args(["export", g, "--format", "dot", "--why", "app", "util"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let dot = String::from_utf8_lossy(&o.stdout);
+    assert!(dot.contains("digraph strand"), "{dot}");
+    assert!(dot.contains("label=\"app\""), "{dot}");
+    assert!(dot.contains("->"), "{dot}");
+
+    let o = strand()
+        .args(["export", g, "--format", "mermaid", "--impact", "core", "--depth", "1"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let mm = String::from_utf8_lossy(&o.stdout);
+    assert!(mm.contains("graph LR"), "{mm}");
+    assert!(mm.contains("liba"), "{mm}");
+    assert!(mm.contains("-->"), "{mm}");
+}
+
+#[test]
 fn cli_missing_node_fails() {
     let dir = tempfile::tempdir().unwrap();
     let csv = write_csv(&dir);
