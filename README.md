@@ -308,7 +308,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
 
 ## Testing
 
-`cargo test` runs ~64 tests across the workspace:
+`cargo test` runs ~68 tests across the workspace:
 
 - **core algorithms** (`strand-core/tests/algorithms.rs`): BFS/depths,
   shortest & k-shortest paths, non-shortest `paths_within_depth`,
@@ -341,13 +341,17 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   common/scan/export/check, `--git-diff` seed resolution, `--max-impact`
   gating, impact-count consistency, and missing-node errors via
   `CARGO_BIN_EXE_strand`.
+- **rule engine unit tests** (`strand-cli/src/check.rs`): rules-file
+  parsing, comment/blank handling, malformed-rule rejection, substring
+  vs glob pattern semantics (`*`/`?`).
 - **lockfile importers** (`strand-import/tests/locks.rs`): all five
   formats incl. npm nested `node_modules` resolution, poetry
   dev-dependencies, go.mod directive boundaries, pom parent inheritance,
   and format auto-detection.
 
 Tests live next to the code: `crates/strand-core/tests/` (algorithms,
-proptest, roundtrip/corruption/determinism), `crates/strand-cli/tests/cli.rs`,
+proptest, roundtrip/corruption/determinism), `crates/strand-cli/`
+(`tests/cli.rs` end-to-end plus `src/check.rs` unit tests),
 `crates/strand-import/tests/` (`scan.rs`, `locks.rs`), and
 `crates/strand-store/tests/store.rs`.
 

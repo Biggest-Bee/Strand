@@ -185,3 +185,50 @@ pub fn load_rules(path: Option<&Path>, dir: &Path) -> Result<Vec<Rule>> {
     })?;
     parse_rules(&text)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rules_parse_and_comments() {
+        let text = "# comment\n\nforbid ui/ -> db/   # trailing\nforbid *.test -> src/\n";
+        let rules = parse_rules(text).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].forbid, "ui/");
+        assert_eq!(rules[0].ban, "db/");
+        assert_eq!(rules[1].forbid, "*.test");
+    }
+
+    #[test]
+    fn rules_reject_malformed() {
+        assert!(parse_rules("ui/ -> db/").is_err()); // missing forbid
+        assert!(parse_rules("forbid ui/").is_err()); // missing ->
+        assert!(parse_rules("forbid  -> db/").is_err()); // empty pattern
+        assert!(parse_rules("forbid ui/ -> ").is_err());
+    }
+
+    #[test]
+    fn substring_patterns() {
+        assert!(pattern_matches("ui/", "crates/ui/app.rs"));
+        assert!(pattern_matches("ui/", "ui/app.rs"));
+        assert!(!pattern_matches("ui/", "crates/build/ui.rs")); // "ui/" needs the slash
+        assert!(pattern_matches("serde", "my-serde-wrapper"));
+        assert!(!pattern_matches("ui/", "crates/uiv2/app.rs"));
+    }
+
+    #[test]
+    fn glob_patterns() {
+        assert!(pattern_matches("*.test", "foo.test"));
+        assert!(pattern_matches("*.test", "src/deep/foo.test"));
+        assert!(!pattern_matches("*.test", "foo.test.rs"));
+        assert!(pattern_matches("src/*/lib.rs", "src/core/lib.rs"));
+        // `*` is char-level, not path-segment aware: it crosses `/`.
+        assert!(pattern_matches("src/*/lib.rs", "src/core/deep/lib.rs"));
+        assert!(!pattern_matches("src/*/lib.rs", "src/core/mod.rs"));
+        assert!(pattern_matches("a?c", "abc"));
+        assert!(!pattern_matches("a?c", "ac"));
+        assert!(pattern_matches("*", "anything/at/all"));
+        assert!(pattern_matches("ui/*", "ui/")); // trailing * matches empty
+    }
+}
