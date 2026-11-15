@@ -217,6 +217,44 @@ fn impact_sizes_match_bfs() {
 }
 
 #[test]
+fn impact_sizes_match_bfs_on_cycles() {
+    // Cyclic graph: a<->b, b->c, d->a, e isolated-ish (e->d).
+    // Exercises the condensation-DAG path in impact_sizes.
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    for (s, d) in [
+        ("a", "b"),
+        ("b", "a"),
+        ("b", "c"),
+        ("d", "a"),
+        ("e", "d"),
+    ] {
+        b.add_edge(s, d);
+    }
+    let p = dir.path().join("g.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+
+    let sizes = algo::impact_sizes(&g);
+    // Reference: per-node reverse BFS count, excluding the node itself.
+    for v in 0..g.n_nodes() as u32 {
+        let d = algo::bfs(&g, &[v], Dir::In, None);
+        let expect = d
+            .iter()
+            .enumerate()
+            .filter(|(i, &x)| *i != v as usize && x != algo::UNVISITED)
+            .count() as u32;
+        assert_eq!(sizes[v as usize], expect, "node {}", g.node_name(v));
+    }
+    // Spot checks: c is depended on by a,b (SCC) + d + e = 4.
+    let c = g.node_id("c").unwrap() as usize;
+    assert_eq!(sizes[c], 4);
+    // a's dependents: b (cycle), d, e = 3 (a itself excluded).
+    let a = g.node_id("a").unwrap() as usize;
+    assert_eq!(sizes[a], 3);
+}
+
+#[test]
 fn common_sets() {
     let (_d, p) = diamond();
     let g = Graph::open(&p).unwrap();
@@ -262,4 +300,14 @@ fn weighted_dijkstra() {
     assert_eq!(cost, 2.0);
     let names: Vec<&str> = path.iter().map(|&i| g.node_name(i)).collect();
     assert_eq!(names, vec!["a", "c", "b"]);
+
+    // CSR-specialized variant agrees.
+    let (path2, cost2) = algo::shortest_path_weighted_csr(
+        &g,
+        g.node_id("a").unwrap(),
+        g.node_id("b").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cost2, 2.0);
+    assert_eq!(path2, path);
 }

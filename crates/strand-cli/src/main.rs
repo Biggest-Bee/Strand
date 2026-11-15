@@ -137,6 +137,10 @@ struct WhyArgs {
     /// Enumerate alternative shortest chains.
     #[arg(long)]
     all_paths: bool,
+    /// Use edge weights (Dijkstra) instead of hop count. Requires a
+    /// weighted graph; unweighted graphs count every edge as 1.0.
+    #[arg(long)]
+    weighted: bool,
     /// Max number of paths when --all-paths.
     #[arg(long, default_value_t = 5)]
     limit: usize,
@@ -450,6 +454,39 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
     let from = node_id(&g, &a.from)?;
     let to = node_id(&g, &a.to)?;
+
+    if a.all_paths && a.weighted {
+        return Err(strand_core::Error::Invalid(
+            "--all-paths and --weighted cannot be combined".into(),
+        ));
+    }
+
+    if a.weighted {
+        return match algo::shortest_path_weighted_csr(&g, from, to) {
+            Some((path, cost)) => {
+                let names = names_of(&g, &path);
+                if a.json {
+                    print_json(serde_json::json!({
+                        "from": a.from, "to": a.to, "path": names,
+                        "cost": cost, "hops": path.len() - 1,
+                    }));
+                } else {
+                    println!("{} (cost {:.4})", names.join(" -> "), cost);
+                }
+                Ok(())
+            }
+            None => {
+                if a.json {
+                    print_json(serde_json::json!({
+                        "from": a.from, "to": a.to, "path": null,
+                    }));
+                } else {
+                    println!("no dependency chain from {} to {}", a.from, a.to);
+                }
+                Ok(())
+            }
+        };
+    }
 
     if a.all_paths {
         let paths = algo::k_shortest_paths(&g, from, to, a.limit);

@@ -193,6 +193,66 @@ where
     Some((path, dist[to as usize]))
 }
 
+/// Weighted shortest path (Dijkstra) specialized for [`crate::Graph`]:
+/// zips `out_targets` with `out_weights` directly — O(E log V), no
+/// per-edge weight lookups. Returns `None` if `to` is unreachable.
+/// Unweighted graphs are treated as all-ones weights.
+pub fn shortest_path_weighted_csr(
+    graph: &crate::Graph,
+    from: u32,
+    to: u32,
+) -> Option<(Vec<u32>, f64)> {
+    if from == to {
+        return Some((vec![from], 0.0));
+    }
+    let n = graph.n_nodes() as usize;
+    let mut dist = vec![f64::INFINITY; n];
+    let mut parent = vec![UNVISITED; n];
+    let mut heap = BinaryHeap::new();
+    dist[from as usize] = 0.0;
+    heap.push(State {
+        cost: 0.0,
+        node: from,
+    });
+    while let Some(State { cost, node }) = heap.pop() {
+        if cost > dist[node as usize] {
+            continue;
+        }
+        if node == to {
+            break;
+        }
+        let targets = graph.out_targets(node);
+        let weights = graph.out_weights(node);
+        for (i, &w) in targets.iter().enumerate() {
+            let wi = w as usize;
+            if wi >= n {
+                continue;
+            }
+            let weight = weights.map(|ws| ws[i] as f64).unwrap_or(1.0);
+            if weight < 0.0 {
+                continue;
+            }
+            let nd = cost + weight;
+            if nd < dist[wi] {
+                dist[wi] = nd;
+                parent[wi] = node;
+                heap.push(State { cost: nd, node: w });
+            }
+        }
+    }
+    if !dist[to as usize].is_finite() {
+        return None;
+    }
+    let mut path = vec![to];
+    let mut cur = to;
+    while cur != from {
+        cur = parent[cur as usize];
+        path.push(cur);
+    }
+    path.reverse();
+    Some((path, dist[to as usize]))
+}
+
 #[derive(Clone, Copy)]
 struct State {
     cost: f64,

@@ -265,12 +265,13 @@ cargo test
 - No query language — Rust API + CLI + desktop GUI.
 - The GUI (`strand-app`) is read-only and caps its canvas at 4k nodes /
   60k edges; huge graphs are better served by the CLI.
-- `impact --by impact` ranking is O(V·E); huge graphs want the planned
-  condensation-DAG version.
+- `top --by impact` uses SCC condensation + bitset ancestor sets
+  (`O(E·C/64)`); graphs with more than ~32k components fall back to the
+  naive per-node BFS.
 - `why --all-paths` enumerates *shortest* chains only, with a step budget.
-- Weighted edges exist in the format but the CLI doesn't yet expose
-  weighted-path queries (`strand-core` has `shortest_path_weighted`, and the
-  store preserves weights through compaction).
+- Weighted edges: `why --weighted` runs Dijkstra over edge weights
+  (unweighted graphs count every edge as 1.0). The store preserves
+  weights through compaction.
 - The store is single-writer per directory (one process holds the write
   lock); scale-out means one store per shard.
 - Store delta is in-memory: a very large un-compacted delta costs RAM, and
