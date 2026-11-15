@@ -53,17 +53,30 @@ testdata/           sample graphs used by tests and docs
 
 Tests live in each crate's `tests/` directory (see [Testing](#testing)).
 
+## Install
+
+**Prebuilt binaries** — grab the archive for your platform from
+[Releases](https://github.com/Biggest-Bee/Strand/releases) and verify it
+against `SHA256SUMS.txt`. Each archive contains `strand` (CLI) and
+`strand-app` (desktop GUI).
+
+> The binaries are **unsigned**: Windows SmartScreen ("Windows protected
+> your PC") and macOS Gatekeeper ("cannot be opened because the
+> developer cannot be verified") will warn on first run. That's expected
+> — right-click → Open (macOS) or *More info → Run anyway* (Windows),
+> or build from source below.
+
+**From source** (needs a Rust toolchain):
+
+```console
+cargo install --path crates/strand-cli   # the `strand` CLI
+cargo install --path crates/strand-app   # the desktop GUI
+# (once published to crates.io: `cargo install strand`)
+```
+
 ## Quick start
 
 ```console
-cargo install --path crates/strand-cli   # or: cargo build --release
-# (once published to crates.io: `cargo install strand`)
-
-# Prebuilt binaries for Windows/Linux/macOS are on the
-# [Releases](https://github.com/Biggest-Bee/Strand/releases) page.
-# They are unsigned: Windows SmartScreen and macOS Gatekeeper will
-# warn on first run — that's expected for unsigned binaries.
-
 # From an edge list (src,dst[,weight]; "src depends on dst"):
 strand build deps.csv -o deps.strand
 
@@ -170,7 +183,11 @@ db.compact()?;   // fold delta into a fresh base-<epoch>.strand, atomic manifest
   only where the delta has ops).
 - **Compaction**: rebuilds a new immutable base, fsyncs, atomically swaps
   `manifest.json`, reclaims old epoch files lazily. Live snapshots keep
-  their pinned `Arc`s, so readers are never blocked.
+  their pinned `Arc`s, so readers are never blocked. Measured on a
+  50M-edge base with a 1k-op delta: ~3 min and ~1.2 GB peak — it
+  rebuilds the whole file, so keep GUI auto-compaction off (it is, by
+  default) and let the ratio threshold keep it rare. A streaming
+  merge is the planned fix.
 - **Node removal**: `remove_node` tombstones the id; re-adding the name
   creates a fresh id, so stale incident edges never resurrect.
 
