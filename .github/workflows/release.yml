@@ -96,8 +96,66 @@ jobs:
           name: strand-${{ matrix.target }}
           path: dist/*
 
-  release:
+  # Download each archive back and actually run the binary — proves the
+  # artifact launches on its target OS, not just that it compiled.
+  # strand-app is a GUI and can't run headless; the CLI covers the
+  # shared strand-core/strand-import code paths.
+  smoke:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: strand-x86_64-pc-windows-msvc
+            archive: strand-x86_64-pc-windows-msvc.zip
+            binary: strand.exe
+          - os: ubuntu-latest
+            artifact: strand-x86_64-unknown-linux-gnu
+            archive: strand-x86_64-unknown-linux-gnu.tar.gz
+            binary: strand
+          # macos-latest is arm64; macos-13 is Intel — each runs its
+          # own archive natively (no Rosetta dependence).
+          - os: macos-latest
+            artifact: strand-aarch64-apple-darwin
+            archive: strand-aarch64-apple-darwin.tar.gz
+            binary: strand
+          - os: macos-13
+            artifact: strand-aarch64-apple-darwin
+            archive: strand-x86_64-apple-darwin.tar.gz
+            binary: strand
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Extract archive
+        shell: bash
+        run: |
+          set -e
+          cd dist
+          case "${{ matrix.archive }}" in
+            *.zip) unzip -o "${{ matrix.archive }}" ;;
+            *) tar -xzf "${{ matrix.archive }}" ;;
+          esac
+          chmod +x "${{ matrix.binary }}" 2>/dev/null || true
+
+      - name: Smoke test binary
+        shell: bash
+        run: |
+          set -e
+          cd dist
+          ./"${{ matrix.binary }}" --version
+          printf 'src,dst\napp,lib\nlib,core\n' > t.csv
+          ./"${{ matrix.binary }}" build t.csv -o t.strand
+          ./"${{ matrix.binary }}" info t.strand
+          ./"${{ matrix.binary }}" nodes t.strand | grep -q app
+          ./"${{ matrix.binary }}" impact t.strand lib
+
+  release:
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
