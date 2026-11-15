@@ -258,26 +258,43 @@ times are edge-count bound and should transfer to skewed graphs.
 
 ## Testing
 
-- Unit tests per algorithm on hand-checked graphs.
-- `proptest`: random graphs built, re-opened, and compared against an
-  independent in-memory reference (adjacency, reachability, path validity).
-- Corruption tests: truncations and byte flips must produce clean errors.
-- Determinism test: same graph from different input order → identical bytes.
-- CLI end-to-end tests via `CARGO_BIN_EXE_strand`.
-- Store: model-based randomized op test vs an in-memory graph; WAL torn-tail
-  and bit-flip recovery; snapshot isolation across commits and compaction;
-  read-only fallback when another writer holds the lock; a crash-consistency
-  harness that corrupts the WAL at random points and verifies the store
-  always equals exactly some prefix of committed transactions (500 cases in
-  CI, 10,000 available via `cargo test -p strand-store -- --ignored`).
+`cargo test` runs ~60 tests across the workspace:
+
+- **core algorithms** (`strand-core/tests/algorithms.rs`): BFS/depths,
+  shortest & k-shortest paths, non-shortest `paths_within_depth`,
+  Tarjan SCC + self-loops, critical path, weighted Dijkstra,
+  PageRank sanity, common sets.
+- **impact ranking verified against brute force**:
+  `impact_sizes_match_bfs` and `impact_sizes_match_bfs_on_cycles` check
+  every node's count against a naive per-node reverse BFS, acyclic and
+  cyclic; `impact_sizes_blocked_bitsets` exercises the multi-block
+  (50k-component chain) path.
+- **proptest** (`proptests.rs`): random graphs built, re-opened, and
+  compared against an independent in-memory reference.
+- **roundtrip/corruption/determinism** (`roundtrip.rs`): byte-identical
+  output regardless of input order, duplicate-edge merging, node kinds,
+  truncations and bit flips produce clean errors (never panics).
+- **scanner** (`strand-import/tests/scan.rs`): Rust `mod`/`use`/
+  `#[path]`/`include!`, Python and JS/TS imports, dedup, string-literal
+  masking, char literals vs lifetimes, raw strings, non-ASCII, plus a
+  dogfood test that scans Strand's own repo.
+- **store** (`strand-store/tests/store.rs`): transactions, persistence,
+  snapshots, compaction (incl. weighted edges), read-only rejection,
+  WAL torn-tail/bit-flip recovery, a model-based randomized op test, and
+  a crash-consistency harness that corrupts the WAL at random points and
+  verifies the store always equals exactly some prefix of committed
+  transactions (500 cases in CI, 10,000 via
+  `cargo test -p strand-store -- --ignored`), plus the auto-compaction
+  threshold.
+- **CLI end-to-end** (`strand-cli/tests/cli.rs`): build (single and
+  multi-input), info/deps/impact/why/cycles/top/order/roots/leaves/
+  common/scan, impact-count consistency, and missing-node errors via
+  `CARGO_BIN_EXE_strand`.
 
 Tests live next to the code: `crates/strand-core/tests/` (algorithms,
-proptest, roundtrip/corruption/determinism), `crates/strand-cli/tests/cli.rs`
-(end-to-end CLI incl. impact-count consistency, multi-input build, and a
-`scan` fixture project), `crates/strand-import/tests/scan.rs` (scanner
-resolution rules), and
-`crates/strand-store/tests/store.rs` (model-based ops, WAL recovery,
-snapshots, compaction, crash harness).
+proptest, roundtrip/corruption/determinism), `crates/strand-cli/tests/cli.rs`,
+`crates/strand-import/tests/scan.rs`, and
+`crates/strand-store/tests/store.rs`.
 
 ```console
 cargo test
