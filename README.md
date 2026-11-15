@@ -57,6 +57,7 @@ Tests live in each crate's `tests/` directory (see [Testing](#testing)).
 
 ```console
 cargo install --path crates/strand-cli   # or: cargo build --release
+# (once published to crates.io: `cargo install strand`)
 
 # Prebuilt binaries for Windows/Linux/macOS are on the
 # [Releases](https://github.com/Biggest-Bee/Strand/releases) page.
