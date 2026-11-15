@@ -158,9 +158,16 @@ cargo run -p strand-app        # or: cargo build --release -p strand-app
   dependent, then re-run Impact).
 - The canvas draws the graph (ring layout by BFS depth after an
   impact/deps run, golden-angle scatter otherwise), highlighting the
-  affected set. Capped at 4k nodes / 60k edges for interactive frame rates.
+  affected set. It handles up to 100k nodes / 300k edges: past 8k nodes
+  it switches to cheap square markers, and past 150k edges it only draws
+  edges touching the highlighted set.
+- With a writable store open, the **Edit store** panel commits real
+  transactions: **Add/Remove edge A->B** and **Add/Remove node A** (names
+  come from the A/B boxes; edges auto-create missing nodes). Edits are
+  WAL-durable immediately and show up in subsequent analyses.
 
-The GUI is read-only; writes go through the `strand-store` API.
+`.strand` files stay strictly read-only; store edits go through
+`strand-store` transactions (fsync'd WAL + atomic delta apply).
 
 ## File format
 
@@ -268,8 +275,9 @@ cargo test
 ## Limitations (honest list)
 
 - No query language — Rust API + CLI + desktop GUI.
-- The GUI (`strand-app`) is read-only and caps its canvas at 4k nodes /
-  60k edges; huge graphs are better served by the CLI.
+- The GUI canvas caps at 100k nodes / 300k edges with level-of-detail
+  rendering; beyond that use the CLI. Store edits are limited to
+  node/edge add/remove — no batch import or schema changes from the GUI.
 - `top --by impact` uses SCC condensation + bitset ancestor sets
   (`O(E·C/64)`); graphs with more than ~32k components fall back to the
   naive per-node BFS.

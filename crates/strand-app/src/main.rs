@@ -18,6 +18,15 @@ enum Backend {
     Store(Store),
 }
 
+/// Store edit operations exposed in the GUI.
+#[derive(Clone, Copy)]
+enum StoreOp {
+    AddEdge,
+    RemoveEdge,
+    AddNode,
+    RemoveNode,
+}
+
 /// Run `$body` with `v: &impl GraphView` bound to the concrete backend view.
 /// For stores this pins a fresh read snapshot for the duration of the call.
 macro_rules! with_view {
@@ -88,8 +97,13 @@ struct StrandApp {
     canvas_size: egui::Vec2,
 }
 
-const MAX_VIZ_NODES: usize = 4_000;
-const MAX_VIZ_EDGES: usize = 60_000;
+const MAX_VIZ_NODES: usize = 100_000;
+const MAX_VIZ_EDGES: usize = 300_000;
+/// Below this many nodes we draw circles; above it we batch nodes into a
+/// single triangle mesh (level-of-detail).
+const NODE_CIRCLE_MAX: usize = 8_000;
+/// Above this many edges we only draw edges touching the highlight set.
+const EDGE_DRAW_MAX: usize = 150_000;
 const MAX_REPORT_LINES: usize = 5_000;
 
 /// One line in the report panel; `node` makes the row clickable (sets A).
@@ -534,6 +548,33 @@ impl StrandApp {
 
     // ---- graph canvas ----
 
+    /// Apply a store edit as a committed transaction, then refresh names
+    /// and the visualization. No-op unless a writable store is open.
+    fn store_edit(&mut self, op: StoreOp) {
+        let a = self.node_a.trim().to_string();
+        let b = self.node_b.trim().to_string();
+        let res = match &self.backend {
+            Some(Backend::Store(s)) => s.begin_write().and_then(|mut tx| {
+                let r = match op {
+                    StoreOp::AddEdge => tx.add_edge(&a, &b),
+                    StoreOp::RemoveEdge => tx.remove_edge(&a, &b),
+                    StoreOp::AddNode => tx.add_node(&a),
+                    StoreOp::RemoveNode => tx.remove_node(&a),
+                };
+                r.and_then(|_| tx.commit())
+            }),
+            _ => return,
+        };
+        match res {
+            Ok(()) => {
+                self.status = "edit committed".into();
+                self.collect_names();
+                self.viz_dirty = true;
+            }
+            Err(e) => self.status = format!("edit failed: {e}"),
+        }
+    }
+
     fn rebuild_viz(&mut self) {
         self.viz_dirty = false;
         self.pos.clear();
@@ -603,13 +644,23 @@ impl StrandApp {
 
         let to_screen = |p: (f32, f32)| rect.min + egui::vec2(p.0, p.1);
 
-        // Edges.
+        // Edges. LOD: past EDGE_DRAW_MAX only edges touching the
+        // highlight/selection are drawn.
+        let draw_all = self.edge_ids.len() <= EDGE_DRAW_MAX;
         for &(s, t) in &self.edge_ids {
+            let hot = self.highlight.contains(&s)
+                || self.highlight.contains(&t)
+                || Some(s) == self.sel_a
+                || Some(s) == self.sel_b
+                || Some(t) == self.sel_a
+                || Some(t) == self.sel_b;
+            if !draw_all && !hot {
+                continue;
+            }
             let (Some(&ps), Some(&pt)) = (self.pos.get(s as usize), self.pos.get(t as usize))
             else {
                 continue;
             };
-            let hot = self.highlight.contains(&s) || self.highlight.contains(&t);
             painter.line_segment(
                 [to_screen(ps), to_screen(pt)],
                 egui::Stroke::new(
@@ -623,7 +674,9 @@ impl StrandApp {
             );
         }
 
-        // Nodes.
+        // Nodes. LOD: small graphs get circles; large graphs get cheap
+        // 3px rects so 100k nodes stay interactive.
+        let detail = self.pos.len() <= NODE_CIRCLE_MAX;
         for (i, &p) in self.pos.iter().enumerate() {
             let id = i as u32;
             let c = to_screen(p);
@@ -634,7 +687,15 @@ impl StrandApp {
             } else {
                 egui::Color32::from_rgb(90, 110, 160)
             };
-            painter.circle_filled(c, 3.5, color);
+            if detail {
+                painter.circle_filled(c, 3.5, color);
+            } else {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(c, egui::vec2(3.0, 3.0)),
+                    0.0,
+                    color,
+                );
+            }
         }
 
         if self.viz_nodes > MAX_VIZ_NODES {
@@ -767,6 +828,26 @@ impl eframe::App for StrandApp {
                     self.viz_dirty = true;
                 }
                 ui.label(format!("{} nodes | {} edges drawn", self.viz_nodes, self.viz_edges));
+
+                if matches!(&self.backend, Some(Backend::Store(s)) if s.is_writable()) {
+                    ui.add_space(12.0);
+                    ui.heading("Edit store");
+                    ui.label("uses names in A / B boxes");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Add edge A->B").clicked() {
+                            self.store_edit(StoreOp::AddEdge);
+                        }
+                        if ui.button("Remove edge A->B").clicked() {
+                            self.store_edit(StoreOp::RemoveEdge);
+                        }
+                        if ui.button("Add node A").clicked() {
+                            self.store_edit(StoreOp::AddNode);
+                        }
+                        if ui.button("Remove node A").clicked() {
+                            self.store_edit(StoreOp::RemoveNode);
+                        }
+                    });
+                }
             });
 
         egui::Panel::bottom("report")
