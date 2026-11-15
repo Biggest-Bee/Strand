@@ -87,13 +87,28 @@ struct BuildArgs {
     merge: MergeChoice,
 }
 
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+enum ScanLang {
+    /// Rust sources (.rs): mod/use/#[path]/include! resolution.
+    Rust,
+    /// Python sources (.py): import/from resolution.
+    Python,
+    /// JavaScript/TypeScript (.ts/.tsx/.js/.jsx/.mjs/.cjs).
+    Js,
+    /// All supported languages merged (default).
+    All,
+}
+
 #[derive(Parser)]
 struct ScanArgs {
-    /// Project directory to scan for .rs files.
+    /// Project directory to scan for source files.
     dir: PathBuf,
     /// Output .strand file (default: <dir-name>.strand).
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Language(s) to scan (default: all).
+    #[arg(long, value_enum, default_value_t = ScanLang::All)]
+    lang: ScanLang,
 }
 
 #[derive(Parser)]
@@ -288,7 +303,14 @@ fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
             .unwrap_or_else(|| "scan".to_string());
         PathBuf::from(format!("{name}.strand"))
     });
-    let scan = strand_import::scan::scan_rust(&a.dir)?;
+    use strand_import::scan::Lang;
+    let langs: Vec<Lang> = match a.lang {
+        ScanLang::Rust => vec![Lang::Rust],
+        ScanLang::Python => vec![Lang::Python],
+        ScanLang::Js => vec![Lang::Js],
+        ScanLang::All => vec![Lang::Rust, Lang::Python, Lang::Js],
+    };
+    let scan = strand_import::scan::scan_project(&a.dir, &langs)?;
     let mut b = GraphBuilder::new();
     for n in &scan.nodes {
         b.add_node(n.clone());

@@ -23,18 +23,55 @@ use crate::EdgeList;
 /// Directories never descended into.
 const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules"];
 
-/// Output of [`scan_rust`]: edges plus every `.rs` file found (so files
+/// Output of a scan: edges plus every source file found (so files
 /// with no dependencies still become nodes in the graph).
 pub struct ScanOutput {
     pub edges: EdgeList,
-    /// All discovered `.rs` files as root-relative `/` paths, sorted.
+    /// All discovered source files as root-relative `/` paths, sorted.
     pub nodes: Vec<String>,
+}
+
+/// Languages the scanner supports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lang {
+    Rust,
+    Python,
+    Js,
 }
 
 /// Scan `root` for Rust sources and resolve intra-project dependencies.
 pub fn scan_rust(root: &Path) -> Result<ScanOutput> {
+    scan_lang(root, Lang::Rust)
+}
+
+/// Dispatch to the per-language scanner.
+pub fn scan_lang(root: &Path, lang: Lang) -> Result<ScanOutput> {
+    match lang {
+        Lang::Rust => scan_rust_impl(root),
+        Lang::Python => scan_python_impl(root),
+        Lang::Js => scan_js_impl(root),
+    }
+}
+
+/// Scan `root` for all supported languages and merge the results.
+/// Edges only form within a language (a `.rs` file can't depend on a
+/// `.py` file), but node sets are unioned.
+pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
+    let mut edges = EdgeList::new();
+    let mut nodes = Vec::new();
+    for &lang in langs {
+        let out = scan_lang(root, lang)?;
+        edges.extend(out.edges);
+        nodes.extend(out.nodes);
+    }
+    nodes.sort();
+    nodes.dedup();
+    Ok(ScanOutput { edges, nodes })
+}
+
+fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
     let mut files: Vec<(String, PathBuf)> = Vec::new();
-    walk(root, root, &mut files)?;
+    walk_ext(root, root, &["rs"], &mut files)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
@@ -48,10 +85,40 @@ pub fn scan_rust(root: &Path) -> Result<ScanOutput> {
         let mut deps: BTreeSet<String> = BTreeSet::new();
 
         // `mod foo;` declarations -> foo.rs or foo/mod.rs under this
-        // file's module directory.
+        // file's module directory. A preceding `#[path = "..."]`
+        // attribute overrides the location.
         let mdir = module_dir_rel(rel);
-        for seg in mod_decls(&clean) {
-            if let Some(dep) = resolve(&names, &mdir, std::slice::from_ref(&seg)) {
+        let attrs = path_attrs(&clean);
+        for (idx, seg) in mod_decls(&clean) {
+            // The attribute applies only if nothing item-like sits
+            // between it and this `mod` (no `;`, `{`, `}`).
+            let custom = attrs
+                .iter()
+                .rev()
+                .find(|(_, ae, _)| {
+                    *ae < idx
+                        && !clean
+                            .chars()
+                            .skip(*ae)
+                            .take(idx - ae)
+                            .any(|c| matches!(c, ';' | '{' | '}'))
+                })
+                .map(|(_, _, p)| p.as_str());
+            let dep = match custom {
+                Some(p) => normalize_rel(&mdir, p).filter(|c| names.contains(c)),
+                None => resolve(&names, &mdir, std::slice::from_ref(&seg)),
+            };
+            if let Some(dep) = dep {
+                if dep != *rel {
+                    deps.insert(dep);
+                }
+            }
+        }
+
+        // `include!("file.rs")` pulls the file's contents into this one.
+        let parent = parent_rel(rel);
+        for inc in include_paths(&clean) {
+            if let Some(dep) = normalize_rel(parent, &inc).filter(|c| names.contains(c)) {
                 if dep != *rel {
                     deps.insert(dep);
                 }
@@ -102,7 +169,12 @@ pub fn scan_rust(root: &Path) -> Result<ScanOutput> {
 
 // ---------- filesystem walk ----------
 
-fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+fn walk_ext(
+    dir: &Path,
+    root: &Path,
+    exts: &[&str],
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -112,8 +184,13 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()>
             if SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
                 continue;
             }
-            walk(&path, root, out)?;
-        } else if ft.is_file() && path.extension().is_some_and(|e| e == "rs") {
+            walk_ext(&path, root, exts, out)?;
+        } else if ft.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| exts.contains(&e))
+        {
             let rel = path
                 .strip_prefix(root)
                 .unwrap()
@@ -354,8 +431,9 @@ fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// All `mod name;` declarations (skips inline `mod name { ... }`).
-fn mod_decls(src: &str) -> Vec<String> {
+/// All `mod name;` declarations as `(char_index, name)` pairs
+/// (skips inline `mod name { ... }`).
+fn mod_decls(src: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let b: Vec<char> = src.chars().collect();
     let n = b.len();
@@ -382,7 +460,7 @@ fn mod_decls(src: &str) -> Vec<String> {
                     k += 1;
                 }
                 if k < n && b[k] == ';' {
-                    out.push(b[start..j].iter().collect());
+                    out.push((i, b[start..j].iter().collect()));
                 }
             }
             i = j.max(i + 1);
@@ -431,5 +509,363 @@ fn use_paths(src: &str) -> Vec<Vec<String>> {
         }
     }
     out
+}
+
+
+/// `#[path = "..."]` attributes as `(start, end, path)` triples; `end` is
+/// the char index just past the closing quote.
+fn path_attrs(src: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let b: Vec<char> = src.chars().collect();
+    let n = b.len();
+    let mut i = 0;
+    while i + 6 < n {
+        if b[i] == '#' && b[i + 1] == '[' {
+            // Look for `path` then `=` then a quoted string before `]`.
+            let mut j = i + 2;
+            while j < n && b[j].is_whitespace() {
+                j += 1;
+            }
+            if j + 4 <= n && b[j..j + 4].iter().collect::<String>() == "path" {
+                j += 4;
+                while j < n && (b[j].is_whitespace() || b[j] == '=') {
+                    j += 1;
+                }
+                if j < n && (b[j] == '"' || b[j] == '\'') {
+                    let q = b[j];
+                    let start = j + 1;
+                    let mut k = start;
+                    while k < n && b[k] != q {
+                        k += 1;
+                    }
+                    if k < n {
+                        out.push((i, k + 1, b[start..k].iter().collect()));
+                        i = k;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Paths inside `include!("...")` macro calls.
+fn include_paths(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b: Vec<char> = src.chars().collect();
+    let n = b.len();
+    let needle = ['i', 'n', 'c', 'l', 'u', 'd', 'e', '!'];
+    let mut i = 0;
+    while i + needle.len() < n {
+        if (i == 0 || !is_ident(b[i - 1]))
+            && b[i..i + needle.len()] == needle
+            && (i + needle.len() >= n || !is_ident(b[i + needle.len()]))
+        {
+            let mut j = i + needle.len();
+            while j < n && b[j].is_whitespace() {
+                j += 1;
+            }
+            if j < n && b[j] == '(' {
+                j += 1;
+                while j < n && b[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < n && (b[j] == '"' || b[j] == '\'') {
+                    let q = b[j];
+                    let start = j + 1;
+                    let mut k = start;
+                    while k < n && b[k] != q {
+                        k += 1;
+                    }
+                    if k < n {
+                        out.push(b[start..k].iter().collect());
+                        i = k;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Join `base` (a `/`-separated rel dir) with `p`, resolving `.` and `..`.
+/// Returns `None` if the result escapes the scan root.
+fn normalize_rel(base: &str, p: &str) -> Option<String> {
+    let mut segs: Vec<&str> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split('/').collect()
+    };
+    for s in p.split('/') {
+        match s {
+            "" | "." => {}
+            ".." => {
+                segs.pop()?;
+            }
+            x => segs.push(x),
+        }
+    }
+    Some(segs.join("/"))
+}
+
+// ---------- Python scanner ----------
+
+const PY_EXTS: &[&str] = &["py"];
+
+fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    walk_ext(root, root, PY_EXTS, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    let mut edges: EdgeList = Vec::new();
+
+    for (rel, abs) in &files {
+        let text = fs::read_to_string(abs)
+            .map_err(|e| Error::Invalid(format!("{}: {e}", abs.display())))?;
+        let clean = strip_hash_comments(&text);
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let parent = parent_rel(rel);
+
+        for line in clean.lines() {
+            let line = line.trim();
+            // `from <dots><mod> import <names>` (also `from x import (a,b)`).
+            if let Some(rest) = line.strip_prefix("from ") {
+                let Some((mod_part, names_part)) = rest.split_once(" import") else {
+                    continue;
+                };
+                let level = mod_part.chars().take_while(|&c| c == '.').count();
+                let dotted = mod_part[level..].trim();
+                let mut base = parent.to_string();
+                for _ in 1..level {
+                    base = parent_rel(&base).to_string();
+                }
+                let segs: Vec<String> = dotted
+                    .split('.')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                // Module file for `from X import ...`.
+                if !segs.is_empty() {
+                    if let Some(dep) = resolve_py(&names, &base, &segs) {
+                        if dep != *rel {
+                            deps.insert(dep);
+                        }
+                    }
+                    // `from pkg import sub` may pull pkg/sub.py too.
+                    for name in import_names(names_part) {
+                        let mut ns = segs.clone();
+                        ns.push(name);
+                        if let Some(dep) = resolve_py(&names, &base, &ns) {
+                            if dep != *rel {
+                                deps.insert(dep);
+                            }
+                        }
+                    }
+                } else {
+                    // `from . import x, y` — names are modules under base.
+                    for name in import_names(names_part) {
+                        if let Some(dep) = resolve_py(&names, &base, &[name]) {
+                            if dep != *rel {
+                                deps.insert(dep);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            // `import a.b.c` (possibly comma-separated list).
+            if let Some(rest) = line.strip_prefix("import ") {
+                for item in rest.split(',') {
+                    let item = item.trim();
+                    let dotted = item.split(" as ").next().unwrap_or(item).trim();
+                    if dotted.is_empty() || dotted.starts_with('.') {
+                        continue; // relative `import .x` is invalid syntax anyway
+                    }
+                    let segs: Vec<String> = dotted
+                        .split('.')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+                    if segs.is_empty() {
+                        continue;
+                    }
+                    // `import a.b.c` needs the full path to resolve.
+                    if let Some(dep) = resolve_py_exact(&names, "", &segs) {
+                        if dep != *rel {
+                            deps.insert(dep);
+                        }
+                    }
+                }
+            }
+        }
+
+        for dep in deps {
+            edges.push((rel.clone(), dep, None));
+        }
+    }
+    let nodes = names.into_iter().collect();
+    Ok(ScanOutput { edges, nodes })
+}
+
+/// Names in a `from X import ...` clause: `a, b as c, (d, e)`.
+fn import_names(s: &str) -> Vec<String> {
+    s.trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .filter_map(|part| {
+            let name = part.split(" as ").next().unwrap_or(part).trim();
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Resolve a dotted Python module path under `base` ("" = root), trying
+/// the longest prefix first: `a/b/c.py`, `a/b/c/__init__.py`, then
+/// shorter prefixes ending at a `.py` or `__init__.py`.
+fn resolve_py(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Option<String> {
+    for k in (1..=segs.len()).rev() {
+        let p = join_rel(base, &segs[..k]);
+        for cand in [format!("{p}.py"), format!("{p}/__init__.py")] {
+            if names.contains(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Exact full-path resolution for `import a.b.c` statements.
+fn resolve_py_exact(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Option<String> {
+    let p = join_rel(base, segs);
+    for cand in [format!("{p}.py"), format!("{p}/__init__.py")] {
+        if names.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Strip `#` line comments (naive: `#` inside strings is not understood).
+fn strip_hash_comments(src: &str) -> String {
+    src.lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ---------- JS/TS scanner ----------
+
+const JS_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+
+fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    walk_ext(root, root, JS_EXTS, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    let mut edges: EdgeList = Vec::new();
+
+    for (rel, abs) in &files {
+        let text = fs::read_to_string(abs)
+            .map_err(|e| Error::Invalid(format!("{}: {e}", abs.display())))?;
+        let clean = strip_comments(&text);
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let parent = parent_rel(rel);
+
+        for spec in js_import_specs(&clean) {
+            // Only relative specs ('./x', '../x') are intra-project;
+            // bare specifiers resolve to node_modules.
+            if !spec.starts_with(".") {
+                continue;
+            }
+            let Some(norm) = normalize_rel(parent, &spec) else {
+                continue;
+            };
+            if let Some(dep) = resolve_js(&names, &norm) {
+                if dep != *rel {
+                    deps.insert(dep);
+                }
+            }
+        }
+
+        for dep in deps {
+            edges.push((rel.clone(), dep, None));
+        }
+    }
+    let nodes = names.into_iter().collect();
+    Ok(ScanOutput { edges, nodes })
+}
+
+/// All module specifiers in `import ... from 'x'`, `import 'x'`,
+/// `import('x')`, `export ... from 'x'`, and `require('x')`.
+fn js_import_specs(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b: Vec<char> = src.chars().collect();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        for kw in ["from", "import", "require"] {
+            let klen = kw.len();
+            if i + klen > n
+                || (i > 0 && is_ident(b[i - 1]))
+                || b[i..i + klen].iter().collect::<String>() != kw
+                || (i + klen < n && is_ident(b[i + klen]))
+            {
+                continue;
+            }
+            let mut j = i + klen;
+            while j < n && b[j].is_whitespace() {
+                j += 1;
+            }
+            // Skip an optional `(` (dynamic import / require call).
+            if j < n && b[j] == '(' {
+                j += 1;
+                while j < n && b[j].is_whitespace() {
+                    j += 1;
+                }
+            }
+            if j < n && (b[j] == '\'' || b[j] == '"') {
+                let q = b[j];
+                let start = j + 1;
+                let mut k = start;
+                while k < n && b[k] != q && b[k] != '\n' {
+                    k += 1;
+                }
+                if k < n && b[k] == q {
+                    out.push(b[start..k].iter().collect());
+                    i = k;
+                }
+            }
+            break; // matched a keyword; move on regardless
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Resolve a normalized relative JS spec to a file: exact, +ext, /index+ext.
+fn resolve_js(names: &BTreeSet<String>, norm: &str) -> Option<String> {
+    if names.contains(norm) {
+        return Some(norm.to_string());
+    }
+    for ext in JS_EXTS {
+        let cand = format!("{norm}.{ext}");
+        if names.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    for ext in JS_EXTS {
+        let cand = format!("{norm}/index.{ext}");
+        if names.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    None
 }
 
