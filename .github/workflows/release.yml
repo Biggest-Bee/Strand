@@ -117,18 +117,23 @@ jobs:
             artifact: strand-x86_64-unknown-linux-gnu
             archive: strand-x86_64-unknown-linux-gnu.tar.gz
             binary: strand
-          # macos-latest is arm64; macos-13 is Intel — each runs its
-          # own archive natively (no Rosetta dependence).
+          # macOS x86_64 runs under Rosetta on the ARM runner — avoids
+          # the tiny/slow Intel runner pool (macos-13 queues for ages).
           - os: macos-latest
             artifact: strand-aarch64-apple-darwin
             archive: strand-aarch64-apple-darwin.tar.gz
             binary: strand
-          - os: macos-13
+          - os: macos-latest
             artifact: strand-aarch64-apple-darwin
             archive: strand-x86_64-apple-darwin.tar.gz
             binary: strand
+            rosetta: true
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Install Rosetta
+        if: matrix.rosetta
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
       - uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -150,12 +155,20 @@ jobs:
         run: |
           set -e
           cd dist
-          ./"${{ matrix.binary }}" --version
+          # matrix.rosetta -> run the x86_64 binary via Rosetta 2
+          run_bin() {
+            if [ "${{ matrix.rosetta }}" = "true" ]; then
+              arch -x86_64 ./"${{ matrix.binary }}" "$@"
+            else
+              ./"${{ matrix.binary }}" "$@"
+            fi
+          }
+          run_bin --version
           printf 'src,dst\napp,lib\nlib,core\n' > t.csv
-          ./"${{ matrix.binary }}" build t.csv -o t.strand
-          ./"${{ matrix.binary }}" info t.strand
-          ./"${{ matrix.binary }}" nodes t.strand | grep -q app
-          ./"${{ matrix.binary }}" impact t.strand lib
+          run_bin build t.csv -o t.strand
+          run_bin info t.strand
+          run_bin nodes t.strand | grep -q app
+          run_bin impact t.strand lib
 
   release:
     needs: [build, smoke]
