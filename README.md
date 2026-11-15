@@ -281,7 +281,9 @@ cargo test
 - `top --by impact` uses SCC condensation + bitset ancestor sets
   (`O(E·C/64)`); graphs with more than ~32k components fall back to the
   naive per-node BFS.
-- `why --all-paths` enumerates *shortest* chains only, with a step budget.
+- `why --all-paths` enumerates alternative *shortest* chains (cap via
+  `--limit`); add `--max-depth N` to enumerate every simple chain of at
+  most N hops. Both are step-budgeted so dense graphs can't hang.
 - Weighted edges: `why --weighted` runs Dijkstra over edge weights
   (unweighted graphs count every edge as 1.0). The store preserves
   weights through compaction.

@@ -19,7 +19,8 @@ pub use bfs::{bfs, Dir};
 pub use order::{analyze, BuildOrder};
 pub use pagerank::pagerank;
 pub use path::{
-    k_shortest_paths, shortest_path, shortest_path_weighted, shortest_path_weighted_csr,
+    k_shortest_paths, paths_within_depth, shortest_path, shortest_path_weighted,
+    shortest_path_weighted_csr,
 };
 pub use scc::{condensation, strongly_connected, Condensation};
 pub use sets::{common, reachable_set};

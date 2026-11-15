@@ -105,6 +105,35 @@ fn k_shortest_paths_counts() {
 }
 
 #[test]
+fn paths_within_depth_finds_nonshortest() {
+    // a->b, a->c, b->d, c->d, b->c gives three simple a->d chains:
+    // a-b-d and a-c-d (2 hops), a-b-c-d (3 hops).
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    for (s, d) in [("a", "b"), ("a", "c"), ("b", "d"), ("c", "d"), ("b", "c")] {
+        b.add_edge(s, d);
+    }
+    let p = dir.path().join("g.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+    let (from, to) = (g.node_id("a").unwrap(), g.node_id("d").unwrap());
+
+    assert_eq!(algo::paths_within_depth(&g, from, to, 1, 10).len(), 0);
+    assert_eq!(algo::paths_within_depth(&g, from, to, 2, 10).len(), 2);
+    assert_eq!(algo::paths_within_depth(&g, from, to, 3, 10).len(), 3);
+    // limit caps results
+    assert_eq!(algo::paths_within_depth(&g, from, to, 3, 2).len(), 2);
+    // every returned path is simple, starts at a, ends at d, within depth
+    for path in algo::paths_within_depth(&g, from, to, 3, 10) {
+        assert_eq!(*path.first().unwrap(), from);
+        assert_eq!(*path.last().unwrap(), to);
+        assert!(path.len() - 1 <= 3);
+        let mut seen = std::collections::HashSet::new();
+        assert!(path.iter().all(|&id| seen.insert(id)));
+    }
+}
+
+#[test]
 fn scc_and_cycles() {
     // a->b->c->a cycle, c->d, d->e, e->d second cycle, f isolated dep
     let dir = tempfile::tempdir().unwrap();

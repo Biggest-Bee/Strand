@@ -149,7 +149,8 @@ struct WhyArgs {
     file: PathBuf,
     from: String,
     to: String,
-    /// Enumerate alternative shortest chains.
+    /// Enumerate dependency chains: up to --limit alternative *shortest*
+    /// chains, or every simple chain up to --max-depth hops when given.
     #[arg(long)]
     all_paths: bool,
     /// Use edge weights (Dijkstra) instead of hop count. Requires a
@@ -159,6 +160,10 @@ struct WhyArgs {
     /// Max number of paths when --all-paths.
     #[arg(long, default_value_t = 5)]
     limit: usize,
+    /// With --all-paths: enumerate every simple chain of at most this
+    /// many hops instead of only shortest chains.
+    #[arg(long)]
+    max_depth: Option<u32>,
     #[arg(long)]
     json: bool,
 }
@@ -482,6 +487,11 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
             "--all-paths and --weighted cannot be combined".into(),
         ));
     }
+    if a.max_depth.is_some() && !a.all_paths {
+        return Err(strand_core::Error::Invalid(
+            "--max-depth requires --all-paths".into(),
+        ));
+    }
 
     if a.weighted {
         return match algo::shortest_path_weighted_csr(&g, from, to) {
@@ -511,7 +521,10 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
     }
 
     if a.all_paths {
-        let paths = algo::k_shortest_paths(&g, from, to, a.limit);
+        let paths = match a.max_depth {
+            Some(d) => algo::paths_within_depth(&g, from, to, d, a.limit),
+            None => algo::k_shortest_paths(&g, from, to, a.limit),
+        };
         if a.json {
             let ps: Vec<Vec<String>> = paths
                 .iter()

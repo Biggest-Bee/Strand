@@ -132,6 +132,92 @@ pub fn k_shortest_paths<G: GraphView>(graph: &G, from: u32, to: u32, k: usize) -
     paths
 }
 
+/// Up to `limit` distinct *simple* dependency chains from `from` to `to`
+/// whose hop count is at most `max_depth`.
+///
+/// Unlike [`k_shortest_paths`] this is not restricted to shortest chains —
+/// it enumerates every simple path within the depth bound via iterative
+/// DFS. Deterministic: neighbors are visited in view order. Bounded by
+/// `limit` results and an internal step budget so dense graphs cannot
+/// hang the caller; when the budget trips, results are a deterministic
+/// prefix of the full enumeration.
+pub fn paths_within_depth<G: GraphView>(
+    graph: &G,
+    from: u32,
+    to: u32,
+    max_depth: u32,
+    limit: usize,
+) -> Vec<Vec<u32>> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if from == to {
+        return vec![vec![from]];
+    }
+    let n = graph.n_nodes();
+    let neighbors_of = |v: u32| -> Vec<u32> {
+        let mut out = Vec::new();
+        graph.out_edges(v, &mut |w| {
+            if (w as usize) < n {
+                out.push(w);
+            }
+        });
+        out
+    };
+
+    let mut paths: Vec<Vec<u32>> = Vec::new();
+    let mut path: Vec<u32> = vec![from];
+    let mut on_path = vec![false; n];
+    on_path[from as usize] = true;
+    // (node, neighbors, next neighbor index, depth of node in `path`)
+    let mut stack: Vec<(u32, Vec<u32>, usize)> = vec![(from, neighbors_of(from), 0)];
+    let mut depths: Vec<u32> = vec![0]; // parallel to `path`
+    let mut steps = 0usize;
+    let step_budget = 4_000_000usize;
+
+    while let Some(top) = stack.last_mut() {
+        if paths.len() >= limit || steps > step_budget {
+            break;
+        }
+        let depth = *depths.last().unwrap();
+        if depth >= max_depth {
+            // Can't extend further; pop this frame.
+            let (v, _, _) = stack.pop().unwrap();
+            depths.pop();
+            on_path[v as usize] = false;
+            path.pop();
+            continue;
+        }
+        let nbrs_len = top.1.len();
+        if top.2 >= nbrs_len {
+            let (v, _, _) = stack.pop().unwrap();
+            depths.pop();
+            on_path[v as usize] = false;
+            path.pop();
+            continue;
+        }
+        let w = top.1[top.2];
+        top.2 += 1;
+        steps += 1;
+        let wi = w as usize;
+        if wi >= n || on_path[wi] {
+            continue;
+        }
+        if w == to {
+            let mut p = path.clone();
+            p.push(to);
+            paths.push(p);
+            continue;
+        }
+        on_path[wi] = true;
+        path.push(w);
+        depths.push(depth + 1);
+        let nb = neighbors_of(w);
+        stack.push((w, nb, 0));
+    }
+    paths
+}
+
 /// Weighted shortest path (Dijkstra) over forward edges.
 /// `weight_of(from, to)` supplies the edge weight; return `None` for "no
 /// edge". Returns node ids plus total cost.
