@@ -280,9 +280,34 @@ out-edges), so PageRank converges unusually fast. Real dependency graphs
 are skewed with a few hub nodes; expect more iterations there. BFS and SCC
 times are edge-count bound and should transfer to skewed graphs.
 
+### Real-world graph (npm lockfiles)
+
+Merged the committed `package-lock.json` files from three public repos —
+[axios](https://github.com/axios/axios), [lodash](https://github.com/lodash/lodash),
+[microsoft/TypeScript](https://github.com/microsoft/TypeScript) — into one
+graph (1,778 nodes / 3,790 edges / 105KB):
+
+```console
+strand build axios-lock.json lodash-lock.json ts-lock.json -o web.strand
+strand top web.strand --by impact -n 5
+```
+
+```
+top 5 by Impact:
+      209.0000  safe-buffer
+      208.0000  isarray
+      198.0000  yallist
+      194.0000  inherits
+      188.0000  pseudomap
+```
+
+`top --by impact` completes in ~0.13s and correctly surfaces the classic
+npm hub packages. `impact semver` reports 182 affected packages — the
+kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
+
 ## Testing
 
-`cargo test` runs ~60 tests across the workspace:
+`cargo test` runs ~64 tests across the workspace:
 
 - **core algorithms** (`strand-core/tests/algorithms.rs`): BFS/depths,
   shortest & k-shortest paths, non-shortest `paths_within_depth`,
@@ -312,12 +337,17 @@ times are edge-count bound and should transfer to skewed graphs.
   threshold.
 - **CLI end-to-end** (`strand-cli/tests/cli.rs`): build (single and
   multi-input), info/deps/impact/why/cycles/top/order/roots/leaves/
-  common/scan, impact-count consistency, and missing-node errors via
+  common/scan/export/check, `--git-diff` seed resolution, `--max-impact`
+  gating, impact-count consistency, and missing-node errors via
   `CARGO_BIN_EXE_strand`.
+- **lockfile importers** (`strand-import/tests/locks.rs`): all five
+  formats incl. npm nested `node_modules` resolution, poetry
+  dev-dependencies, go.mod directive boundaries, pom parent inheritance,
+  and format auto-detection.
 
 Tests live next to the code: `crates/strand-core/tests/` (algorithms,
 proptest, roundtrip/corruption/determinism), `crates/strand-cli/tests/cli.rs`,
-`crates/strand-import/tests/scan.rs`, and
+`crates/strand-import/tests/` (`scan.rs`, `locks.rs`), and
 `crates/strand-store/tests/store.rs`.
 
 ```console
