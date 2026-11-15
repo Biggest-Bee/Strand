@@ -59,6 +59,11 @@ enum InFormat {
     Auto,
     Csv,
     Cargo,
+    CargoLock,
+    NpmLock,
+    PoetryLock,
+    GoMod,
+    Pom,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
@@ -334,6 +339,11 @@ fn cmd_build(a: BuildArgs) -> strand_core::Result<()> {
             InFormat::Auto => strand_import::detect_format(input, &text),
             InFormat::Csv => Format::Csv,
             InFormat::Cargo => Format::Cargo,
+            InFormat::CargoLock => Format::CargoLock,
+            InFormat::NpmLock => Format::NpmLock,
+            InFormat::PoetryLock => Format::PoetryLock,
+            InFormat::GoMod => Format::GoMod,
+            InFormat::Pom => Format::Pom,
         };
         let edges = strand_import::parse(&text, format)?;
         eprintln!("{}: {} edges", input.display(), edges.len());

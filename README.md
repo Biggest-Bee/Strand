@@ -73,6 +73,14 @@ strand build frontend.csv backend.csv meta.json -o all.strand
 cargo metadata --format-version 1 > meta.json
 strand build meta.json -o deps.strand
 
+# Or straight from lockfiles/manifests (auto-detected by filename):
+strand build Cargo.lock -o deps.strand      # Rust
+strand build package-lock.json -o deps.strand  # npm
+strand build poetry.lock -o deps.strand    # Python/poetry
+strand build go.mod -o deps.strand         # Go
+strand build pom.xml -o deps.strand        # Maven
+# (--format cargo-lock|npm-lock|poetry-lock|go-mod|pom overrides)
+
 # Scan a project folder and build a source-level dependency graph
 # (skips target/, .git/, node_modules/):
 strand scan ./my-project -o deps.strand
