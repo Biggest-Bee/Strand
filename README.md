@@ -99,7 +99,8 @@ strand why deps.strand my-app serde_json
 strand cycles deps.strand
 strand top deps.strand --by impact -n 20
 # huge DAGs: landmark-sampling estimate, top rows reranked exactly;
-# tune with --samples N, force exact (slow!) with --exact
+# tune with --samples N, force sampling with --approx (benchmarking),
+# force exact (slow!) with --exact
 strand order deps.strand --critical-path
 strand roots deps.strand
 strand leaves deps.strand
@@ -386,9 +387,11 @@ cargo test
   top candidates with exact per-node BFS (boundary ties included,
   budget-capped), prints the landmark count, marks approximate rows
   with `~`, and reports per-node `exact` flags in `--json`.
-  `--samples N` overrides the landmark count; `--exact` forces the
-  exact algorithm even over budget (per-node BFS fallback — can be
-  very slow on huge DAGs). `impact_sizes()` itself still falls back to
+  `--samples N` overrides the landmark count; `--approx` forces
+  sampling even when exact is affordable (benchmarking/validation);
+  `--exact` forces the exact algorithm even over budget (per-node BFS
+  fallback — can be very slow on huge DAGs). Estimates are clamped to
+  `n-1`. `impact_sizes()` itself still falls back to
   per-node BFS for small graphs that exceed the bitset budget.
 - `why --all-paths` enumerates alternative *shortest* chains (cap via
   `--limit`), or every simple chain up to `--max-depth N` hops. Both are

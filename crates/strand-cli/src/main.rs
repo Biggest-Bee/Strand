@@ -215,6 +215,10 @@ struct TopArgs {
     /// huge mostly-acyclic graphs).
     #[arg(long)]
     exact: bool,
+    /// For --by impact: force the landmark-sampling approximation even
+    /// on graphs where exact is affordable (for benchmarking).
+    #[arg(long)]
+    approx: bool,
     #[arg(long)]
     json: bool,
 }
@@ -851,6 +855,11 @@ fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
         TopBy::Impact => {
             if a.exact {
                 scores_from_exact(&g)
+            } else if a.approx {
+                let (v, k) = algo::impact_sizes_force_approx(&g, a.samples);
+                impact_approx = true;
+                impact_samples = k;
+                v
             } else {
                 let (v, m, k) = algo::impact_sizes_auto_with(&g, a.samples);
                 impact_approx = m == algo::ImpactMethod::Approx;

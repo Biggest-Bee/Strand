@@ -152,6 +152,17 @@ pub fn rerank_impact_exact<G: GraphView>(
     idx[..end].to_vec()
 }
 
+/// Force the landmark-sampling path regardless of graph size (for
+/// benchmarking/validation on graphs where the exact path is cheap).
+/// Returns estimates plus the landmark count used.
+pub fn impact_sizes_force_approx<G: GraphView>(
+    graph: &G,
+    samples: Option<usize>,
+) -> (Vec<f64>, usize) {
+    let k = samples.unwrap_or_else(|| default_approx_samples(graph));
+    impact_sizes_approx_detail(graph, k)
+}
+
 /// Landmark count for [`impact_sizes_auto`]: ~2G edge visits total,
 /// clamped to [16, 512].
 fn default_approx_samples<G: GraphView>(graph: &G) -> usize {
@@ -266,10 +277,13 @@ fn impact_sizes_sampled<G: GraphView>(
     );
 
     let scale = n as f64 / k as f64;
+    // An estimate can't exceed n-1 (a node affects at most every other
+    // node); clamp sampling overshoot.
+    let cap = (n as f64 - 1.0).max(0.0);
     (0..n as u32)
         .map(|i| {
             let c = counters[i as usize].load(Ordering::Relaxed) as u64;
-            c.saturating_sub(self_ids.contains(&i) as u64) as f64 * scale
+            (c.saturating_sub(self_ids.contains(&i) as u64) as f64 * scale).min(cap)
         })
         .collect()
 }

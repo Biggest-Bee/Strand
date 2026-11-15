@@ -59,10 +59,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          cargo build --release --locked -p strand-cli -p strand-app --target ${{ matrix.target }}
+          cargo build --release --locked -p strand -p strand-app --target ${{ matrix.target }}
           for t in $EXTRA_TARGETS; do
             [ -z "$t" ] && continue
-            cargo build --release --locked -p strand-cli -p strand-app --target "$t"
+            cargo build --release --locked -p strand -p strand-app --target "$t"
           done
 
       - name: Package

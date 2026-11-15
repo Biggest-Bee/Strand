@@ -416,6 +416,11 @@ fn impact_sizes_approx_tracks_exact() {
     assert!(a1[hub] > 200.0, "hub estimate {} too low", a1[hub]);
     assert!(a1[hub] < 900.0, "hub estimate {} too high", a1[hub]);
 
+    // Estimates can never exceed n-1 (a node affects at most every
+    // other node) — sampling overshoot is clamped.
+    let n = g.n_nodes() as f64;
+    assert!(a1.iter().all(|&v| v <= n - 1.0 + f64::EPSILON));
+
     // auto() takes the exact path on small graphs.
     let (v, m) = algo::impact_sizes_auto(&g);
     assert_eq!(m, algo::ImpactMethod::Exact);
