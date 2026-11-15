@@ -421,3 +421,112 @@ fn impact_sizes_approx_tracks_exact() {
     assert_eq!(m, algo::ImpactMethod::Exact);
     assert_eq!(v[hub] as u32, exact[hub]);
 }
+
+/// Deterministic pseudo-random DAG: `n` nodes, ~3 forward deps each,
+/// plus `hubs` sink nodes each depended on by ~150 random sources.
+/// Returns the tempdir guard alongside the graph (the file must
+/// outlive the mmap).
+fn random_dag(n: usize, hubs: usize) -> (tempfile::TempDir, Graph) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    let mut s = 0x9E3779B97F4A7C15u64;
+    let mut rnd = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    for i in 0..n {
+        for _ in 0..3 {
+            if i + 1 >= n {
+                break;
+            }
+            let j = i + 1 + (rnd() % (n - i - 1) as u64) as usize;
+            b.add_edge(format!("n{i:04}"), format!("n{j:04}"));
+        }
+    }
+    for h in 0..hubs {
+        for _ in 0..150 {
+            let i = (rnd() % n as u64) as usize;
+            b.add_edge(format!("n{i:04}"), format!("hub{h:02}"));
+        }
+    }
+    let p = dir.path().join("g.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+    (dir, g)
+}
+
+fn top_k(scores: &[f64], k: usize) -> Vec<u32> {
+    let mut idx: Vec<u32> = (0..scores.len() as u32).collect();
+    idx.sort_by(|&a, &b| {
+        scores[b as usize]
+            .partial_cmp(&scores[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    idx.truncate(k);
+    idx
+}
+
+#[test]
+fn impact_approx_tracks_exact_on_random_dag() {
+    let (_dir, g) = random_dag(2000, 20);
+    let n = g.n_nodes();
+    let exact: Vec<f64> = algo::impact_sizes(&g)
+        .into_iter()
+        .map(|x| x as f64)
+        .collect();
+    let approx = algo::impact_sizes_approx(&g, 256);
+
+    // Top-20 overlap between approximate and exact rankings.
+    let e20: std::collections::BTreeSet<u32> = top_k(&exact, 20).into_iter().collect();
+    let a20: std::collections::BTreeSet<u32> = top_k(&approx, 20).into_iter().collect();
+    let overlap = e20.intersection(&a20).count();
+    assert!(
+        overlap >= 14,
+        "top-20 overlap {overlap}/20 too low"
+    );
+
+    // Spearman rank correlation over the exact top-200 (the region
+    // that matters for `top` output).
+    let e200 = top_k(&exact, 200);
+    let rank = |scores: &[f64], ids: &[u32]| -> Vec<f64> {
+        let mut order: Vec<u32> = ids.to_vec();
+        order.sort_by(|&a, &b| {
+            scores[a as usize]
+                .partial_cmp(&scores[b as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        let mut r = vec![0.0; n as usize];
+        for (pos, id) in order.iter().enumerate() {
+            r[*id as usize] = pos as f64;
+        }
+        r
+    };
+    let re = rank(&exact, &e200);
+    let ra = rank(&approx, &e200);
+    let pairs: Vec<(f64, f64)> = e200.iter().map(|&i| (re[i as usize], ra[i as usize])).collect();
+    let m = pairs.len() as f64;
+    let (mx, my) = (
+        pairs.iter().map(|p| p.0).sum::<f64>() / m,
+        pairs.iter().map(|p| p.1).sum::<f64>() / m,
+    );
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (x, y) in &pairs {
+        sxy += (x - mx) * (y - my);
+        sxx += (x - mx) * (x - mx);
+        syy += (y - my) * (y - my);
+    }
+    let rho = sxy / (sxx * syy).sqrt();
+    assert!(rho > 0.9, "rank correlation {rho:.3} too low");
+
+    // rerank_impact_exact: top candidates get exact counts, so the
+    // reranked top-20 must match the exact top-20 set closely.
+    let mut reranked = approx.clone();
+    algo::rerank_impact_exact(&g, &mut reranked, 64, 512);
+    let r20: std::collections::BTreeSet<u32> = top_k(&reranked, 20).into_iter().collect();
+    let roverlap = e20.intersection(&r20).count();
+    assert!(roverlap >= 17, "reranked top-20 overlap {roverlap}/20");
+}

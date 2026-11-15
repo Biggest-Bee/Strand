@@ -98,6 +98,8 @@ strand impact deps.strand serde --by-depth
 strand why deps.strand my-app serde_json
 strand cycles deps.strand
 strand top deps.strand --by impact -n 20
+# huge DAGs: landmark-sampling estimate, top rows reranked exactly;
+# tune with --samples N, force exact (slow!) with --exact
 strand order deps.strand --critical-path
 strand roots deps.strand
 strand leaves deps.strand
@@ -308,7 +310,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
 
 ## Testing
 
-`cargo test` runs ~71 tests across the workspace:
+`cargo test` runs ~74 tests across the workspace:
 
 - **core algorithms** (`strand-core/tests/algorithms.rs`): BFS/depths,
   shortest & k-shortest paths, non-shortest `paths_within_depth`,
@@ -320,7 +322,10 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   cyclic; `impact_sizes_blocked_bitsets` exercises the multi-block
   (50k-component chain) path;
   `impact_sizes_approx_tracks_exact` checks the landmark-sampling
-  estimate is deterministic and tracks exact counts on a test graph.
+  estimate is deterministic and tracks exact counts on a test graph;
+  `impact_approx_tracks_exact_on_random_dag` compares sampled vs exact
+  on a 2k-node random DAG (top-20 overlap, Spearman rank correlation,
+  and exact reranking of top candidates).
 - **proptest** (`proptests.rs`): random graphs built, re-opened, and
   compared against an independent in-memory reference.
 - **roundtrip/corruption/determinism** (`roundtrip.rs`): byte-identical
@@ -328,7 +333,9 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   truncations and bit flips produce clean errors (never panics).
 - **scanner** (`strand-import/tests/scan.rs`): Rust `mod`/`use`/
   `#[path]`/`include!`, Python and JS/TS imports, `tsconfig`/`jsconfig`
-  `paths` aliases + `baseUrl` + `extends` inheritance, dedup,
+  `paths` aliases + `baseUrl` + `extends` inheritance, JSONC comments/
+  trailing commas, per-package configs in monorepos, `package.json`
+  `"imports"` (`#alias`), dedup,
   string-literal masking, char literals vs lifetimes, raw strings,
   non-ASCII, plus a dogfood test that scans Strand's own repo.
 - **store** (`strand-store/tests/store.rs`): transactions, persistence,
@@ -372,9 +379,16 @@ cargo test
   (`O(E·C/64)` word-ops, processed in ~256MB column blocks) when the op
   count fits the budget. On huge mostly-acyclic graphs (`C` ≈ V) it
   switches to a deterministic landmark-sampling estimate
-  (`impact_sizes_approx`, ~2G edge visits, output labeled
-  "approximate") — unbiased with ~`1/sqrt(k)` relative error, fine for
-  ranking but not exact counts. `impact_sizes()` still falls back to
+  (`impact_sizes_approx`, ~2G edge visits). The estimate is unbiased
+  but *not* uniform-accuracy: high-impact nodes (the top of the
+  ranking) are accurate, low-impact nodes are noisy and often estimate
+  as 0 — fine for ranking, near-ties can misorder. The CLI reranks the
+  top candidates with exact per-node BFS (boundary ties included,
+  budget-capped), prints the landmark count, marks approximate rows
+  with `~`, and reports per-node `exact` flags in `--json`.
+  `--samples N` overrides the landmark count; `--exact` forces the
+  exact algorithm even over budget (per-node BFS fallback — can be
+  very slow on huge DAGs). `impact_sizes()` itself still falls back to
   per-node BFS for small graphs that exceed the bitset budget.
 - `why --all-paths` enumerates alternative *shortest* chains (cap via
   `--limit`), or every simple chain up to `--max-depth N` hops. Both are
@@ -399,7 +413,9 @@ cargo test
   handles `mod`/`use`/`#[path]`/`include!` (Rust), `import`/`from`
   incl. relative imports (Python), and `import`/`export-from`/`require`
   (JS/TS), including `tsconfig`/`jsconfig` `paths` aliases and
-  `baseUrl` (with `extends` chains followed). It misses
+  `baseUrl` (JSONC-tolerant, `extends` chains followed, nearest config
+  per file for monorepos) and `package.json` `"imports"` (`#alias`).
+  It misses
   macro-generated modules (a real parser can't see
   them either without expanding macros — `cargo expand` output is a
   workaround for inspection, not for scanning), `include_str!` payloads,

@@ -5,7 +5,7 @@
 //! which keeps builds deterministic: the same input always produces a
 //! byte-identical file.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -51,6 +51,12 @@ pub struct GraphBuilder {
     kinds: BTreeMap<String, String>,
     /// isolated nodes to preserve (no edges)
     extra_nodes: BTreeSet<String>,
+    /// Interned node names for the id-based edge API. Each name is
+    /// stored once; `idx_edges` reference these by index, so building
+    /// large graphs from ids avoids a `String` per edge endpoint.
+    arena: Vec<String>,
+    arena_ids: HashMap<String, u32>,
+    idx_edges: Vec<(u32, u32, f32)>,
     weighted: bool,
 }
 
@@ -67,6 +73,9 @@ impl GraphBuilder {
             merge: MergeOp::default(),
             kinds: BTreeMap::new(),
             extra_nodes: BTreeSet::new(),
+            arena: Vec::new(),
+            arena_ids: HashMap::new(),
+            idx_edges: Vec::new(),
             weighted: false,
         }
     }
@@ -107,6 +116,32 @@ impl GraphBuilder {
         self.extra_nodes.insert(name.into());
     }
 
+    /// Intern a node name and return its stable index for
+    /// [`add_edge_idx`](Self::add_edge_idx). Each distinct name is stored
+    /// once; interned names are always preserved as nodes (like
+    /// [`add_node`](Self::add_node)).
+    pub fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&i) = self.arena_ids.get(name) {
+            return i;
+        }
+        let i = self.arena.len() as u32;
+        self.arena.push(name.to_string());
+        self.arena_ids.insert(name.to_string(), i);
+        i
+    }
+
+    /// Add an edge between two previously [`intern`](Self::intern)ed
+    /// indices — no per-edge `String` allocation.
+    pub fn add_edge_idx(&mut self, src: u32, dst: u32) {
+        self.idx_edges.push((src, dst, 1.0));
+    }
+
+    /// Weighted variant of [`add_edge_idx`](Self::add_edge_idx).
+    pub fn add_edge_idx_weighted(&mut self, src: u32, dst: u32, weight: f32) {
+        self.weighted = true;
+        self.idx_edges.push((src, dst, weight));
+    }
+
     /// Assign a "kind" tag to a node (e.g. `"crate"`, `"service"`). Written
     /// into the optional `node_meta` section.
     pub fn set_kind(&mut self, node: impl Into<String>, kind: impl Into<String>) {
@@ -114,11 +149,11 @@ impl GraphBuilder {
     }
 
     pub fn len(&self) -> usize {
-        self.edges.len()
+        self.edges.len() + self.idx_edges.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.edges.is_empty()
+        self.edges.is_empty() && self.idx_edges.is_empty()
     }
 
     /// Encode the graph into an in-memory `.strand` file image.
@@ -135,6 +170,9 @@ impl GraphBuilder {
         for n in &self.extra_nodes {
             name_set.insert(n.as_str());
         }
+        for n in &self.arena {
+            name_set.insert(n.as_str());
+        }
         let names: Vec<&str> = name_set.into_iter().collect();
         let n_nodes = names.len() as u64;
         let name_to_id: BTreeMap<&str, u32> = names
@@ -144,17 +182,23 @@ impl GraphBuilder {
             .collect();
 
         // 2. Resolve edges to id pairs and sort/dedupe.
-        let mut resolved: Vec<(u32, u32, f32)> = self
-            .edges
-            .iter()
-            .map(|e| {
-                (
-                    name_to_id[e.src.as_str()],
-                    name_to_id[e.dst.as_str()],
-                    e.weight,
-                )
-            })
-            .collect();
+        let mut resolved: Vec<(u32, u32, f32)> = Vec::with_capacity(
+            self.edges.len() + self.idx_edges.len(),
+        );
+        for e in &self.edges {
+            resolved.push((
+                name_to_id[e.src.as_str()],
+                name_to_id[e.dst.as_str()],
+                e.weight,
+            ));
+        }
+        for &(s, d, w) in &self.idx_edges {
+            resolved.push((
+                name_to_id[self.arena[s as usize].as_str()],
+                name_to_id[self.arena[d as usize].as_str()],
+                w,
+            ));
+        }
         resolved.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
         let mut deduped: Vec<(u32, u32, f32)> = Vec::with_capacity(resolved.len());

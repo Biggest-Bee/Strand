@@ -324,24 +324,38 @@ impl Store {
         let n_nodes = base_n as usize + delta.added_names.len();
         let view = View::new(base.as_deref(), base_n, delta.as_ref(), n_nodes);
 
-        // Collect merged edges. Every live node is registered via add_node
-        // so isolated nodes survive compaction.
+        // Collect merged edges. Every live node is interned once so
+        // isolated nodes survive compaction; edges reference interned
+        // ids, avoiding a `String` alloc per edge endpoint.
         let weighted =
             base.as_ref().map(|b| b.has_weights()).unwrap_or(false) || delta.weighted;
         let mut builder = strand_core::GraphBuilder::new();
+        let mut idx_of = vec![u32::MAX; n_nodes];
         for id in 0..n_nodes as u32 {
             if delta.removed.contains(&id) {
                 continue;
             }
-            let name = view.node_name(id);
-            builder.add_node(name.clone());
-            for (t, w) in view.merged_out(id) {
-                let tname = view.node_name(t);
-                if weighted {
-                    builder.add_edge_weighted(name.clone(), tname, w);
-                } else {
-                    builder.add_edge(name.clone(), tname);
+            idx_of[id as usize] = builder.intern(&view.node_name(id));
+        }
+        for id in 0..n_nodes as u32 {
+            let ai = idx_of[id as usize];
+            if ai == u32::MAX {
+                continue;
+            }
+            if weighted {
+                for (t, w) in view.merged_out(id) {
+                    let ti = idx_of.get(t as usize).copied().unwrap_or(u32::MAX);
+                    if ti != u32::MAX {
+                        builder.add_edge_idx_weighted(ai, ti, w);
+                    }
                 }
+            } else {
+                view.out_edges(id, &mut |t| {
+                    let ti = idx_of.get(t as usize).copied().unwrap_or(u32::MAX);
+                    if ti != u32::MAX {
+                        builder.add_edge_idx(ai, ti);
+                    }
+                });
             }
         }
 

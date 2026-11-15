@@ -206,6 +206,15 @@ struct TopArgs {
     by: TopBy,
     #[arg(short = 'n', long, default_value_t = 20)]
     count: usize,
+    /// For --by impact on huge graphs: landmark count for the
+    /// approximate ranking (default: auto ~2G edge visits).
+    #[arg(long)]
+    samples: Option<usize>,
+    /// For --by impact: force the exact algorithm even when it exceeds
+    /// the bitset budget (per-node BFS fallback — can be very slow on
+    /// huge mostly-acyclic graphs).
+    #[arg(long)]
+    exact: bool,
     #[arg(long)]
     json: bool,
 }
@@ -826,21 +835,44 @@ fn cmd_cycles(a: CyclesArgs) -> strand_core::Result<()> {
     Ok(())
 }
 
+/// Exact impact scores as `f64` (`--exact` path; may be very slow on
+/// huge mostly-acyclic graphs).
+fn scores_from_exact(g: &strand_core::Graph) -> Vec<f64> {
+    algo::impact_sizes(g).into_iter().map(|x| x as f64).collect()
+}
+
 fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
     let n = g.n_nodes() as usize;
     let mut impact_approx = false;
-    let scores: Vec<f64> = match a.by {
+    let mut impact_samples = 0usize;
+    let mut scores: Vec<f64> = match a.by {
         TopBy::InDegree => (0..n as u32).map(|i| g.in_degree(i) as f64).collect(),
         TopBy::Impact => {
-            let (v, m) = algo::impact_sizes_auto(&g);
-            impact_approx = m == algo::ImpactMethod::Approx;
-            v
+            if a.exact {
+                scores_from_exact(&g)
+            } else {
+                let (v, m, k) = algo::impact_sizes_auto_with(&g, a.samples);
+                impact_approx = m == algo::ImpactMethod::Approx;
+                impact_samples = k;
+                v
+            }
         }
         // PageRank on the dependency graph: rank flows dependent ->
         // dependency, so heavily-depended-upon nodes score highest.
         TopBy::Pagerank => algo::pagerank(&g, false, 1e-8, 100),
     };
+    // Approximate impact: rerank the top candidates exactly so printed
+    // numbers are exact counts, not estimates. The rerank budget scales
+    // with graph size (~2G edge visits, same as sampling).
+    let mut reranked_ids: Vec<u32> = Vec::new();
+    if impact_approx {
+        let want = (a.count.saturating_mul(4)).clamp(32, 512).min(n);
+        let e = g.n_edges().max(1) as u64;
+        let cap = ((2_000_000_000u64 / e) as usize).clamp(want, 8192).min(n);
+        reranked_ids = algo::rerank_impact_exact(&g, &mut scores, want, cap);
+    }
+    let reranked = reranked_ids.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by(|&x, &y| {
         scores[y as usize]
@@ -850,34 +882,49 @@ fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
     });
     order.truncate(a.count);
 
+    let reranked_set: std::collections::BTreeSet<u32> =
+        reranked_ids.iter().copied().collect();
     if a.json {
         let rows: Vec<serde_json::Value> = order
             .iter()
             .map(|&i| {
-                serde_json::json!({
+                let mut row = serde_json::json!({
                     "name": g.node_name(i),
                     "value": scores[i as usize],
-                })
+                });
+                if impact_approx {
+                    row["exact"] = serde_json::json!(reranked_set.contains(&i));
+                }
+                row
             })
             .collect();
-        print_json(serde_json::json!({
+        let mut obj = serde_json::json!({
             "by": format!("{:?}", a.by).to_lowercase(),
             "method": if impact_approx { "approx" } else { "exact" },
             "nodes": rows,
-        }));
+        });
+        if impact_approx {
+            obj["samples"] = serde_json::json!(impact_samples);
+            obj["reranked_exact"] = serde_json::json!(reranked);
+        }
+        print_json(obj);
     } else {
-        println!(
-            "top {} by {:?}{}:",
-            a.count,
-            a.by,
-            if impact_approx {
-                " (approximate: landmark sampling)"
+        let label = if impact_approx {
+            format!(
+                " (approximate: {} landmarks; top {} reranked exactly)",
+                impact_samples, reranked
+            )
+        } else {
+            String::new()
+        };
+        println!("top {} by {:?}{}:", a.count, a.by, label);
+        for &i in &order {
+            let exact_mark = if impact_approx && !reranked_set.contains(&i) {
+                " ~"
             } else {
                 ""
-            }
-        );
-        for &i in &order {
-            println!("  {:>12.4}  {}", scores[i as usize], g.node_name(i));
+            };
+            println!("  {:>12.4}{}  {}", scores[i as usize], exact_mark, g.node_name(i));
         }
     }
     Ok(())

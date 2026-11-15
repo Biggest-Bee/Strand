@@ -212,6 +212,84 @@ fn scan_js_tsconfig_extends() {
 }
 
 #[test]
+fn scan_js_tsconfig_jsonc_and_monorepo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // JSONC: comments + trailing commas must be tolerated.
+    w(
+        root,
+        "tsconfig.json",
+        r#"{
+            // root config
+            "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                    "@root/*": ["shared/*"], // trailing comment
+                },
+            }
+        }"#,
+    );
+    // Two packages, each with its own tsconfig (monorepo): the
+    // nearest ancestor config governs each file.
+    w(
+        root,
+        "packages/app/tsconfig.json",
+        r#"{ "compilerOptions": { "baseUrl": "src", "paths": { "@app/*": ["*"] } } }"#,
+    );
+    w(
+        root,
+        "packages/lib/tsconfig.json",
+        r#"{ "compilerOptions": { "baseUrl": "src", "paths": { "@lib/*": ["*"] } } }"#,
+    );
+    w(root, "shared/util.ts", "export const u = 1;\n");
+    w(root, "top.ts", "import { u } from '@root/util';\n");
+    w(root, "packages/app/src/index.ts", "import { l } from '@app/lib/local';\n");
+    w(root, "packages/app/src/lib/local.ts", "export const l = 1;\n");
+    w(root, "packages/lib/src/index.ts", "import { l } from '@lib/thing';\n");
+    w(root, "packages/lib/src/thing.ts", "export const l = 2;\n");
+    let out = scan_lang(root, Lang::Js).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    assert!(has("top.ts", "shared/util.ts")); // root tsconfig, JSONC parsed
+    assert!(has("packages/app/src/index.ts", "packages/app/src/lib/local.ts"));
+    assert!(has("packages/lib/src/index.ts", "packages/lib/src/thing.ts"));
+    // packages/lib sees only its own config: exactly one edge, to thing.ts.
+    let lib_edges: Vec<_> = edges
+        .iter()
+        .filter(|(s, _)| s == "packages/lib/src/index.ts")
+        .collect();
+    assert_eq!(lib_edges.len(), 1);
+    assert_eq!(lib_edges[0].1, "packages/lib/src/thing.ts");
+}
+
+#[test]
+fn scan_js_package_json_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(
+        root,
+        "package.json",
+        r##"{
+            "name": "pkg",
+            "imports": {
+                "#util": "./src/util.ts",
+                "#feat/*": { "import": "./src/feat/*.ts", "default": "./src/fallback/*.ts" }
+            }
+        }"##,
+    );
+    w(root, "src/main.ts", "import { u } from '#util';\nimport { f } from '#feat/x';\n");
+    w(root, "src/util.ts", "export const u = 1;\n");
+    w(root, "src/feat/x.ts", "export const f = 1;\n");
+    let out = scan_lang(root, Lang::Js).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    assert!(has("src/main.ts", "src/util.ts"));
+    assert!(has("src/main.ts", "src/feat/x.ts"));
+}
+
+#[test]
 fn scan_ignores_use_inside_strings() {
     let dir = tempfile::tempdir().unwrap();
     w(dir.path(), "Cargo.toml", "[package]\nname = \"p\"\n");

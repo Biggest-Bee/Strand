@@ -76,16 +76,80 @@ pub enum ImpactMethod {
 /// deterministic landmark-sampling approximation. Returns the per-node
 /// estimates (exact counts as `f64`) plus the method used.
 pub fn impact_sizes_auto<G: GraphView>(graph: &G) -> (Vec<f64>, ImpactMethod) {
+    let (v, m, _) = impact_sizes_auto_with(graph, None);
+    (v, m)
+}
+
+/// [`impact_sizes_auto`] with an explicit landmark count for the
+/// approximate path (`None` = [`default_approx_samples`]). Also returns
+/// the number of landmarks used (0 when exact).
+pub fn impact_sizes_auto_with<G: GraphView>(
+    graph: &G,
+    samples: Option<usize>,
+) -> (Vec<f64>, ImpactMethod, usize) {
     match impact_sizes_inner(graph) {
         Ok(v) => (
             v.into_iter().map(|x| x as f64).collect(),
             ImpactMethod::Exact,
+            0,
         ),
-        Err(()) => (
-            impact_sizes_approx(graph, default_approx_samples(graph)),
-            ImpactMethod::Approx,
-        ),
+        Err(()) => {
+            let k = samples.unwrap_or_else(|| default_approx_samples(graph));
+            let (v, used) = impact_sizes_approx_detail(graph, k);
+            (v, ImpactMethod::Approx, used)
+        }
     }
+}
+
+/// Exact impact count of a single node: number of distinct dependents
+/// (reverse-reachable nodes) excluding the node itself. One BFS — cheap
+/// enough to rerank a few hundred top candidates on huge graphs.
+pub fn impact_size_exact<G: GraphView>(graph: &G, node: u32) -> u32 {
+    let depths = bfs(graph, &[node], Dir::In, None);
+    depths.iter().filter(|&&d| d != UNVISITED).count() as u32 - 1
+}
+
+/// Replace the highest-scoring entries of `scores` with exact impact
+/// counts (parallel BFS per candidate). At least `m` candidates are
+/// reranked; ties at the boundary score are *all* included (up to
+/// `cap`) so saturated estimates can't leak approximate values into
+/// printed output. Ties break by lower node id, keeping the selection
+/// deterministic. `cap` bounds total candidates — pass a value scaled
+/// to the edge budget on huge graphs. Returns the reranked node ids
+/// (sorted); `scores` outside that set keeps its estimates.
+pub fn rerank_impact_exact<G: GraphView>(
+    graph: &G,
+    scores: &mut [f64],
+    m: usize,
+    cap: usize,
+) -> Vec<u32> {
+    use rayon::prelude::*;
+    let n = scores.len();
+    if n == 0 || m == 0 {
+        return Vec::new();
+    }
+    let want = m.min(n).min(cap);
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    idx.sort_by(|&a, &b| {
+        scores[b as usize]
+            .partial_cmp(&scores[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    // Extend past `want` while scores tie the boundary value.
+    let boundary = scores[idx[want - 1] as usize];
+    let mut end = want;
+    while end < n && end < cap && scores[idx[end] as usize] == boundary {
+        end += 1;
+    }
+    let exact: Vec<f64> = idx[..end]
+        .par_iter()
+        .map(|&i| impact_size_exact(graph, i) as f64)
+        .collect();
+    for (k, &i) in idx[..end].iter().enumerate() {
+        scores[i as usize] = exact[k];
+    }
+    idx[..end].to_vec()
 }
 
 /// Landmark count for [`impact_sizes_auto`]: ~2G edge visits total,
@@ -101,16 +165,31 @@ fn default_approx_samples<G: GraphView>(graph: &G) -> usize {
 /// xxh64-threshold selection, no RNG state), computes each one's
 /// dependency closure with a forward BFS, and counts how many sampled
 /// dependents reach every node. `estimate(X) ≈ n/k × count(X)` is an
-/// unbiased estimator of the true impact size; relative error is
-/// ~`1/sqrt(k)` for typical graphs. Self-hits from landmark nodes are
-/// subtracted so estimates exclude the node itself like the exact path.
+/// unbiased estimator of the true impact size. Error is *not* uniform:
+/// nodes reached by many landmarks (high-impact nodes — the ones that
+/// matter for ranking) have small relative error, while low-impact
+/// nodes are noisy and often estimate as 0. Near-ties, especially in
+/// the middle of the ranking, can be misordered — use
+/// [`rerank_impact_exact`] for the printed top rows. Self-hits from
+/// landmark nodes are subtracted so estimates exclude the node itself
+/// like the exact path.
 ///
 /// Cost: `O(samples × (V + E))` edge visits, parallelized with rayon;
 /// memory is one bitset + queue per worker plus a shared counter array.
 pub fn impact_sizes_approx<G: GraphView>(graph: &G, samples: usize) -> Vec<f64> {
+    impact_sizes_approx_detail(graph, samples).0
+}
+
+/// [`impact_sizes_approx`] plus the number of landmarks actually used
+/// (may differ from `samples` when the hash threshold selects a
+/// different count, or the strided fallback kicks in).
+pub fn impact_sizes_approx_detail<G: GraphView>(
+    graph: &G,
+    samples: usize,
+) -> (Vec<f64>, usize) {
     let n = graph.n_nodes();
     if n == 0 || samples == 0 {
-        return vec![0.0; n];
+        return (vec![0.0; n], 0);
     }
 
     // Deterministic landmark set: ids whose xxh64 hash falls below the
@@ -128,11 +207,13 @@ pub fn impact_sizes_approx<G: GraphView>(graph: &G, samples: usize) -> Vec<f64> 
         // Pathological threshold miss: fall back to a strided sample.
         let step = (n / samples.min(n)).max(1);
         let ids: Vec<u32> = (0..n as u32).step_by(step).collect();
+        let k = ids.len();
         let set: std::collections::BTreeSet<u32> = ids.iter().copied().collect();
-        return impact_sizes_sampled(graph, &ids, &set);
+        return (impact_sizes_sampled(graph, &ids, &set), k);
     }
+    let k = landmarks.len();
     let self_set: std::collections::BTreeSet<u32> = landmarks.iter().copied().collect();
-    impact_sizes_sampled(graph, &landmarks, &self_set)
+    (impact_sizes_sampled(graph, &landmarks, &self_set), k)
 }
 
 /// Shared worker for [`impact_sizes_approx`]: forward-BFS the

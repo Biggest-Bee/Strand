@@ -388,15 +388,16 @@ fn crate_src_rel(abs: &Path, root: &Path) -> Option<String> {
 
 // ---------- source scanning ----------
 
-/// Remove `//` line comments and `/* */` block comments (string literals
-/// are not understood — a known limitation of the pattern approach).
+/// Remove `//` line comments and `/* */` block comments. Char-based so
+/// non-ASCII source survives intact; string literals are not understood
+/// — a known limitation of the pattern approach.
 fn strip_comments(src: &str) -> String {
-    let b = src.as_bytes();
+    let b: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
     let mut in_str = false;
     while i < b.len() {
-        let c = b[i] as char;
+        let c = b[i];
         if in_str {
             out.push(c);
             if c == '"' {
@@ -411,15 +412,15 @@ fn strip_comments(src: &str) -> String {
             i += 1;
             continue;
         }
-        if c == '/' && i + 1 < b.len() && b[i + 1] == b'/' {
-            while i < b.len() && b[i] != b'\n' {
+        if c == '/' && i + 1 < b.len() && b[i + 1] == '/' {
+            while i < b.len() && b[i] != '\n' {
                 i += 1;
             }
             continue;
         }
-        if c == '/' && i + 1 < b.len() && b[i + 1] == b'*' {
+        if c == '/' && i + 1 < b.len() && b[i + 1] == '*' {
             i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+            while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
                 i += 1;
             }
             i = (i + 2).min(b.len());
@@ -952,7 +953,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
     let mut edges: EdgeList = Vec::new();
-    let aliases = load_js_aliases(root);
+    let mut alias_cache = JsAliasCache::new(root);
 
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
@@ -960,6 +961,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
         let clean = strip_comments(&text);
         let mut deps: BTreeSet<String> = BTreeSet::new();
         let parent = parent_rel(rel);
+        let resolver = alias_cache.for_dir(parent);
 
         for spec in js_import_specs(&clean) {
             // Relative specs ('./x', '../x') are always intra-project.
@@ -974,9 +976,10 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
                 }
                 continue;
             }
-            // Bare specifiers: tsconfig `paths` aliases and `baseUrl`
-            // resolve intra-project; anything else is node_modules.
-            if let Some(dep) = resolve_js_alias(&aliases, &names, &spec) {
+            // Bare specifiers: package.json `imports`, tsconfig `paths`
+            // aliases and `baseUrl` resolve intra-project; anything
+            // else is node_modules.
+            if let Some(dep) = resolve_js_alias(&resolver, &names, &spec) {
                 if dep != *rel {
                     deps.insert(dep);
                 }
@@ -1059,49 +1062,203 @@ fn resolve_js(names: &BTreeSet<String>, norm: &str) -> Option<String> {
 }
 
 
-// ---------- tsconfig/jsconfig path aliases ----------
 
-/// Effective `compilerOptions.paths` + `baseUrl` resolved from
-/// `tsconfig.json` or `jsconfig.json` at the scan root, following
-/// `extends` chains (relative paths and `node_modules` lookups).
-struct JsAliases {
+// ---------- JS/TS alias resolution ----------
+//
+// Bare import specifiers (`@/foo`, `#alias`) resolve intra-project via
+// `tsconfig.json`/`jsconfig.json` `compilerOptions.paths` + `baseUrl`
+// and `package.json` `"imports"`. Configs are looked up per file: the
+// nearest ancestor directory wins (monorepo support), `extends` chains
+// are followed, and tsconfig's JSONC syntax (comments, trailing
+// commas) is tolerated.
+
+/// One `paths`/`imports` pattern: literal `prefix` + optional `*` +
+/// literal `suffix`. `star = false` means exact-match only.
+#[derive(Clone)]
+struct PathPattern {
+    prefix: String,
+    suffix: String,
+    star: bool,
+    targets: Vec<String>,
+}
+
+/// If `spec` matches `pat`, return the text captured by `*`
+/// (empty string for exact patterns).
+fn pattern_star_text(pat: &PathPattern, spec: &str) -> Option<String> {
+    if pat.star {
+        if !spec.starts_with(&pat.prefix) || !spec.ends_with(&pat.suffix) {
+            return None;
+        }
+        let end = spec.len() - pat.suffix.len();
+        if end < pat.prefix.len() {
+            return None;
+        }
+        Some(spec[pat.prefix.len()..end].to_string())
+    } else if spec == pat.prefix {
+        Some(String::new())
+    } else {
+        None
+    }
+}
+
+/// Effective tsconfig/jsconfig aliases for one directory scope.
+#[derive(Clone, Default)]
+struct TsAliases {
     /// Root-relative dir that `paths` targets and `baseUrl`-relative
     /// bare specifiers resolve against.
     base: String,
     /// `baseUrl` was explicitly set — unmatched bare specifiers fall
     /// back to `base/spec` (classic baseUrl resolution).
     has_base_url: bool,
-    /// `(prefix, suffix, targets)` wildcard patterns in `paths` order.
-    /// `prefix`/`suffix` are the literal parts around `*` (suffix may
-    /// be empty); a pattern without `*` is stored with empty suffix
-    /// and matches only the exact spec — handled via `exact` flag.
     patterns: Vec<PathPattern>,
 }
 
-struct PathPattern {
-    prefix: String,
-    suffix: String,
-    /// `Some(star)` when the key contains `*`; `None` = exact match.
-    star: bool,
-    targets: Vec<String>,
+/// `package.json` `"imports"` aliases; targets resolve against `base`
+/// (the package.json's directory).
+#[derive(Clone, Default)]
+struct PkgImports {
+    base: String,
+    patterns: Vec<PathPattern>,
 }
 
-/// Load alias config from `root/tsconfig.json` or `root/jsconfig.json`.
-fn load_js_aliases(root: &Path) -> Option<JsAliases> {
-    for name in ["tsconfig.json", "jsconfig.json"] {
-        let cfg = root.join(name);
-        if cfg.is_file() {
-            let mut seen = BTreeSet::new();
-            let merged = read_tsconfig(root, &cfg, "", 0, &mut seen)?;
-            return merged.into_aliases();
+/// Per-directory resolver: nearest tsconfig aliases + nearest
+/// package.json imports, found by walking up to the scan root.
+#[derive(Clone, Default)]
+struct JsResolver {
+    ts: Option<TsAliases>,
+    pkg: Option<PkgImports>,
+}
+
+/// Cache of resolvers keyed by root-relative directory ("" = root).
+struct JsAliasCache<'a> {
+    root: &'a Path,
+    map: std::collections::HashMap<String, std::rc::Rc<JsResolver>>,
+}
+
+impl<'a> JsAliasCache<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            map: std::collections::HashMap::new(),
         }
     }
-    None
+
+    /// Resolver for a file living in root-relative dir `dir`.
+    fn for_dir(&mut self, dir: &str) -> std::rc::Rc<JsResolver> {
+        if let Some(r) = self.map.get(dir) {
+            return r.clone();
+        }
+        let r = std::rc::Rc::new(self.resolve_for(dir));
+        self.map.insert(dir.to_string(), r.clone());
+        r
+    }
+
+    fn resolve_for(&self, dir: &str) -> JsResolver {
+        let mut ts = None;
+        let mut pkg = None;
+        for anc in ancestors(dir) {
+            if ts.is_none() {
+                ts = self.load_tsconfig(&anc);
+            }
+            if pkg.is_none() {
+                pkg = self.load_pkg_imports(&anc);
+            }
+            if ts.is_some() && pkg.is_some() {
+                break;
+            }
+        }
+        JsResolver { ts, pkg }
+    }
+
+    /// Nearest `tsconfig.json`/`jsconfig.json` at or above `dir`.
+    fn load_tsconfig(&self, dir: &str) -> Option<TsAliases> {
+        for name in ["tsconfig.json", "jsconfig.json"] {
+            let p = self.root.join(dir).join(name);
+            if p.is_file() {
+                let mut seen = BTreeSet::new();
+                let merged = read_tsconfig(self.root, &p, dir, 0, &mut seen)?;
+                return merged.into_aliases();
+            }
+        }
+        None
+    }
+
+    /// Nearest `package.json` with an `"imports"` field at or above `dir`.
+    fn load_pkg_imports(&self, dir: &str) -> Option<PkgImports> {
+        let p = self.root.join(dir).join("package.json");
+        if !p.is_file() {
+            return None;
+        }
+        let text = fs::read_to_string(&p).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&jsonc(&text)).ok()?;
+        let imports = json.get("imports")?.as_object()?;
+        if imports.is_empty() {
+            return None;
+        }
+        let mut patterns = Vec::new();
+        for (key, val) in imports {
+            let target = pkg_import_target(val)?;
+            patterns.push(path_pattern(key.clone(), vec![target]));
+        }
+        Some(PkgImports {
+            base: dir.to_string(),
+            patterns,
+        })
+    }
 }
 
-/// One level of a tsconfig `extends` chain, already merged leaf-over-
-/// parent. `dir` is the root-relative dir containing the file that
-/// contributed the *effective* `baseUrl`/`paths` values.
+/// `dir` and each ancestor up to "" (inclusive), nearest first.
+fn ancestors(dir: &str) -> Vec<&str> {
+    let mut out = vec![dir];
+    let mut cur = dir;
+    while let Some((parent, _)) = cur.rsplit_once('/') {
+        out.push(parent);
+        cur = parent;
+    }
+    if !dir.is_empty() {
+        out.push("");
+    }
+    out
+}
+
+/// Extract the resolution target from a package.json `imports` value:
+/// a plain string, or a conditions object (`import`/`require`/`node`/
+/// `default` preferred, then any string value, one nesting level deep).
+fn pkg_import_target(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => {
+            for key in ["import", "require", "node", "default"] {
+                if let Some(t) = map.get(key).and_then(pkg_import_target) {
+                    return Some(t);
+                }
+            }
+            map.values().find_map(pkg_import_target)
+        }
+        _ => None,
+    }
+}
+
+/// Build a [`PathPattern`] from a `paths`/`imports` key and targets.
+fn path_pattern(key: String, targets: Vec<String>) -> PathPattern {
+    if let Some(star) = key.find('*') {
+        PathPattern {
+            prefix: key[..star].to_string(),
+            suffix: key[star + 1..].to_string(),
+            star: true,
+            targets,
+        }
+    } else {
+        PathPattern {
+            prefix: key,
+            suffix: String::new(),
+            star: false,
+            targets,
+        }
+    }
+}
+
+/// One level of a tsconfig `extends` chain.
 struct TsConfig {
     base_url: Option<(String, String)>, // (declaring dir, value)
     paths: Option<(String, Vec<(String, Vec<String>)>)>, // (declaring dir, entries)
@@ -1118,7 +1275,7 @@ fn read_tsconfig(
         return None;
     }
     let text = fs::read_to_string(abs).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&jsonc(&text)).ok()?;
     let empty = serde_json::Value::Null;
     let opts = json.get("compilerOptions").unwrap_or(&empty);
 
@@ -1176,7 +1333,6 @@ fn resolve_extends(
 ) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if ext.starts_with('.') {
-        // Relative to the config file's directory.
         let base = cfg_abs.parent()?;
         for suffix in ["", ".json", "/tsconfig.json"] {
             candidates.push(base.join(format!("{ext}{suffix}")));
@@ -1191,7 +1347,7 @@ fn resolve_extends(
 }
 
 impl TsConfig {
-    fn into_aliases(self) -> Option<JsAliases> {
+    fn into_aliases(self) -> Option<TsAliases> {
         // Effective base dir: declaring config's dir + its baseUrl
         // (baseUrl defaults to the declaring config's dir when only
         // `paths` is set, per TS >= 4.1).
@@ -1210,27 +1366,11 @@ impl TsConfig {
             .map(|(_, entries)| {
                 entries
                     .into_iter()
-                    .map(|(key, targets)| {
-                        if let Some(star) = key.find('*') {
-                            PathPattern {
-                                prefix: key[..star].to_string(),
-                                suffix: key[star + 1..].to_string(),
-                                star: true,
-                                targets,
-                            }
-                        } else {
-                            PathPattern {
-                                prefix: key.clone(),
-                                suffix: String::new(),
-                                star: false,
-                                targets,
-                            }
-                        }
-                    })
+                    .map(|(key, targets)| path_pattern(key, targets))
                     .collect()
             })
             .unwrap_or_default();
-        Some(JsAliases {
+        Some(TsAliases {
             base,
             has_base_url,
             patterns,
@@ -1238,31 +1378,48 @@ impl TsConfig {
     }
 }
 
-/// Resolve a bare (non-relative) import specifier through tsconfig
-/// aliases: `paths` patterns first (first match wins, targets tried in
-/// order), then `baseUrl` fallback for unmatched specifiers.
+/// Resolve a bare (non-relative) specifier: package.json `"imports"`
+/// for `#`-prefixed specs first, then tsconfig `paths` (longest
+/// matching prefix wins, TypeScript semantics), then `baseUrl`
+/// fallback for unmatched specifiers.
 fn resolve_js_alias(
-    aliases: &Option<JsAliases>,
+    resolver: &JsResolver,
     names: &BTreeSet<String>,
     spec: &str,
 ) -> Option<String> {
-    let a = aliases.as_ref()?;
-    // TypeScript picks the pattern with the longest matching prefix
-    // (exact keys beat wildcards); ties keep `paths` order.
+    if spec.starts_with('#') {
+        if let Some(pkg) = &resolver.pkg {
+            if let Some(dep) = resolve_patterns(&pkg.patterns, &pkg.base, names, spec) {
+                return Some(dep);
+            }
+        }
+    }
+    if let Some(ts) = &resolver.ts {
+        if let Some(dep) = resolve_patterns(&ts.patterns, &ts.base, names, spec) {
+            return Some(dep);
+        }
+        // baseUrl fallback applies only to specifiers no pattern matched.
+        let matched = ts.patterns.iter().any(|p| pattern_star_text(p, spec).is_some());
+        if ts.has_base_url && !matched {
+            if let Some(norm) = normalize_rel(&ts.base, spec.trim_start_matches('/')) {
+                return resolve_js(names, &norm);
+            }
+        }
+    }
+    None
+}
+
+/// Try patterns by longest matching prefix (TS semantics): collect all
+/// matches, pick the longest prefix, try its targets in order.
+fn resolve_patterns(
+    patterns: &[PathPattern],
+    base: &str,
+    names: &BTreeSet<String>,
+    spec: &str,
+) -> Option<String> {
     let mut best: Option<(&PathPattern, String)> = None;
-    for pat in &a.patterns {
-        let star_text = if pat.star {
-            if !spec.starts_with(&pat.prefix) || !spec.ends_with(&pat.suffix) {
-                continue;
-            }
-            let end = spec.len() - pat.suffix.len();
-            if end < pat.prefix.len() {
-                continue;
-            }
-            spec[pat.prefix.len()..end].to_string()
-        } else if spec == pat.prefix {
-            String::new()
-        } else {
+    for pat in patterns {
+        let Some(star_text) = pattern_star_text(pat, spec) else {
             continue;
         };
         let better = match &best {
@@ -1273,27 +1430,99 @@ fn resolve_js_alias(
             best = Some((pat, star_text));
         }
     }
-    if let Some((pat, star_text)) = best {
-        for target in &pat.targets {
-            let t = if pat.star {
-                target.replacen('*', &star_text, 1)
-            } else {
-                target.clone()
-            };
-            let t = t.trim_start_matches('/');
-            if let Some(norm) = normalize_rel(&a.base, t) {
-                if let Some(dep) = resolve_js(names, &norm) {
-                    return Some(dep);
-                }
+    let (pat, star_text) = best?;
+    for target in &pat.targets {
+        let t = if pat.star {
+            target.replacen('*', &star_text, 1)
+        } else {
+            target.clone()
+        };
+        let t = t.trim_start_matches('/');
+        if let Some(norm) = normalize_rel(base, t) {
+            if let Some(dep) = resolve_js(names, &norm) {
+                return Some(dep);
             }
-        }
-        return None; // matched pattern but no target resolved
-    }
-    // No pattern matched: classic baseUrl resolution.
-    if a.has_base_url {
-        if let Some(norm) = normalize_rel(&a.base, spec.trim_start_matches('/')) {
-            return resolve_js(names, &norm);
         }
     }
     None
+}
+
+/// Strip JSONC-only syntax (line/block comments, trailing commas)
+/// outside string literals so `serde_json` can parse tsconfig files.
+fn jsonc(text: &str) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c);
+            if c == '\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                out.push(c);
+                i += 1;
+            }
+            '/' if i + 1 < b.len() && b[i + 1] == '/' => {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < b.len() && b[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            ',' => {
+                // Drop the comma if the next significant token is } or ]
+                // (skipping whitespace and comments).
+                let mut j = i + 1;
+                loop {
+                    while j < b.len() && b[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if j + 1 < b.len() && b[j] == '/' && b[j + 1] == '/' {
+                        while j < b.len() && b[j] != '\n' {
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    if j + 1 < b.len() && b[j] == '/' && b[j + 1] == '*' {
+                        j += 2;
+                        while j + 1 < b.len() && !(b[j] == '*' && b[j + 1] == '/') {
+                            j += 1;
+                        }
+                        j = (j + 2).min(b.len());
+                        continue;
+                    }
+                    break;
+                }
+                if j < b.len() && (b[j] == '}' || b[j] == ']') {
+                    i += 1;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }

@@ -36,6 +36,10 @@ pub fn analyze<G: GraphView>(graph: &G) -> BuildOrder {
         let mut best_succ = usize::MAX;
         for &s in &dag.adj[c] {
             let sv = s as usize;
+            debug_assert!(
+                sv < c,
+                "condensation successor must precede its dependent"
+            );
             if dp[sv] > best {
                 best = dp[sv];
                 best_succ = sv;
