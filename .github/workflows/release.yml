@@ -52,10 +52,12 @@ jobs:
             cp "target/${{ matrix.target }}/release/strand.exe" dist/
             cp "target/${{ matrix.target }}/release/strand-app.exe" dist/
             (cd dist && 7z a "strand-${{ matrix.target }}.zip" strand.exe strand-app.exe)
+            rm dist/strand.exe dist/strand-app.exe
           else
             cp "target/${{ matrix.target }}/release/strand" dist/
             cp "target/${{ matrix.target }}/release/strand-app" dist/
             tar -czf "dist/strand-${{ matrix.target }}.tar.gz" -C dist strand strand-app
+            rm dist/strand dist/strand-app
           fi
           ls -la dist
 
