@@ -154,6 +154,12 @@ db.compact()?;   // fold delta into a fresh base-<epoch>.strand, atomic manifest
 
 // Or let it manage itself: commits auto-compact once the delta passes
 // Options::compact_threshold_ops (default 1M ops; best-effort).
+//
+// Heads-up on delta RAM: each applied op costs ~100+ bytes in the
+// in-memory delta maps, so 1M ops ≈ ~120MB. The effective threshold is
+// max(compact_threshold_ops, base_edges/10) — on a 50M-edge base the
+// delta can reach ~5M ops (~580MB) before auto-compaction kicks in.
+// Lower compact_threshold_ops if that spike matters.
 ```
 
 - **Durability**: each commit is one WAL record `[len][crc][ops]`, fsynced
