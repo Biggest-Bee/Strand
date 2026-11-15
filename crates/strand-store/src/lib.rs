@@ -91,12 +91,17 @@ pub enum Error {
 pub struct Options {
     /// fsync the WAL on every commit (default: true).
     pub fsync_on_commit: bool,
+    /// Auto-compact when the in-memory delta reaches this many applied
+    /// ops (default: 1_000_000; 0 disables). Compaction is best-effort:
+    /// a failure never fails the commit that triggered it.
+    pub compact_threshold_ops: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             fsync_on_commit: true,
+            compact_threshold_ops: 1_000_000,
         }
     }
 }
@@ -125,6 +130,7 @@ pub struct Store {
     dir: PathBuf,
     writable: bool,
     fsync: bool,
+    compact_threshold: usize,
     state: Mutex<State>,
     write_mutex: Mutex<()>,
     wal_file: Mutex<Option<File>>,
@@ -240,6 +246,7 @@ impl Store {
             dir,
             writable,
             fsync: opts.fsync_on_commit,
+            compact_threshold: opts.compact_threshold_ops,
             state: Mutex::new(state),
             write_mutex: Mutex::new(()),
             wal_file: Mutex::new(wal_file),
@@ -256,6 +263,15 @@ impl Store {
     /// Whether this handle may write.
     pub fn is_writable(&self) -> bool {
         self.writable
+    }
+
+    /// Ops applied to the live delta since it was last reset. Useful for
+    /// sizing the delta before compaction.
+    pub fn delta_op_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|st| st.delta.op_count)
+            .unwrap_or(0)
     }
 
     /// Begin a write transaction. Only one may be open at a time; it holds
@@ -522,12 +538,28 @@ impl<'a> WriteTx<'a> {
 
         // 2. Apply to in-memory delta (clone-on-write so snapshots pin their
         //    own Arc).
-        {
+        let delta_ops = {
             let mut st = self.store.state.lock().map_err(|_| Error::Poisoned)?;
             let mut delta = (*st.delta).clone();
             apply_ops_inner(&st.base, st.base_n, &self.ops, &mut delta)?;
+            let n = delta.op_count;
             st.delta = Arc::new(delta);
             st.seq += 1;
+            n
+        };
+
+        // 3. Auto-compaction: release the write guard first (compact()
+        //    takes write_mutex itself), then fold the delta into a fresh
+        //    base. Best-effort — the commit above is already durable, so
+        //    a compaction failure must not fail it.
+        let WriteTx {
+            store,
+            _guard,
+            ops: _,
+        } = self;
+        drop(_guard);
+        if store.compact_threshold > 0 && delta_ops >= store.compact_threshold {
+            let _ = store.compact();
         }
         Ok(())
     }
@@ -567,6 +599,7 @@ fn apply_ops_inner(
     delta: &mut Delta,
 ) -> Result<()> {
     for op in ops {
+        delta.op_count += 1;
         match op {
             Op::AddEdge { src, dst } => {
                 let s = get_or_create(base, delta, base_n, src);

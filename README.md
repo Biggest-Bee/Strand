@@ -118,6 +118,9 @@ let view = snap.view();                  // implements strand_core::view::GraphV
 let depths = strand_core::algo::bfs(&view, &[core_id], Dir::In, None);
 
 db.compact()?;   // fold delta into a fresh base-<epoch>.strand, atomic manifest swap
+
+// Or let it manage itself: commits auto-compact once the delta passes
+// Options::compact_threshold_ops (default 1M ops; best-effort).
 ```
 
 - **Durability**: each commit is one WAL record `[len][crc][ops]`, fsynced
@@ -289,8 +292,10 @@ cargo test
   weights through compaction.
 - The store is single-writer per directory (one process holds the write
   lock); scale-out means one store per shard.
-- Store delta is in-memory: a very large un-compacted delta costs RAM, and
-  readers pin their snapshot's delta — compact periodically.
+- Store delta is in-memory, but commits auto-compact once it passes
+  `Options::compact_threshold_ops` (default 1M ops, 0 disables) — the
+  delta can still spike RAM between compactions, and readers pin their
+  snapshot's delta until they drop it.
 - Crash safety covers WAL commits and manifest swaps; a crash *during*
   base-file writing leaves an orphan `base-*.strand.tmp`-style file that is
   simply never referenced (the builder writes-then-renames).

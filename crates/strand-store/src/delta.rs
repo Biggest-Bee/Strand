@@ -33,6 +33,9 @@ pub struct Delta {
     pub removed: BTreeSet<u32>,
     /// whether any weighted edge was added (drives compaction format)
     pub weighted: bool,
+    /// cumulative ops applied since the delta was last reset (by
+    /// compaction or store open). Drives auto-compaction.
+    pub op_count: usize,
 }
 
 impl Delta {

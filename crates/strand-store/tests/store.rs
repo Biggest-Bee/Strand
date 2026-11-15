@@ -509,3 +509,36 @@ fn crash_consistency(iters: usize) {
         }
     }
 }
+
+#[test]
+fn auto_compact_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = strand_store::Options {
+        compact_threshold_ops: 2,
+        ..Default::default()
+    };
+    let store = Store::open_with_options(dir.path().join("s.strandb"), opts).unwrap();
+
+    commit(&store, |tx| {
+        tx.add_edge("a", "b").unwrap();
+    });
+    assert_eq!(store.delta_op_count(), 1);
+
+    // Second op hits the threshold -> delta folds into a fresh base.
+    commit(&store, |tx| {
+        tx.add_edge("b", "c").unwrap();
+    });
+    assert_eq!(store.delta_op_count(), 0);
+
+    // Delta starts counting again after compaction.
+    commit(&store, |tx| {
+        tx.add_edge("c", "d").unwrap();
+    });
+    assert_eq!(store.delta_op_count(), 1);
+
+    // State survived the auto-compactions.
+    let adj = adj_of(&store.begin_read().unwrap());
+    assert_eq!(adj["a"], BTreeSet::from(["b".to_string()]));
+    assert_eq!(adj["b"], BTreeSet::from(["c".to_string()]));
+    assert_eq!(adj["c"], BTreeSet::from(["d".to_string()]));
+}
