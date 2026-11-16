@@ -236,6 +236,22 @@ cargo run -p strand-app        # or: cargo build --release -p strand-app
 `.strand` files stay strictly read-only; store edits go through
 `strand-store` transactions (fsync'd WAL + atomic delta apply).
 
+### Opening `.strand` files by double-click
+
+`.strand` is a binary memory-mapped format, so editors/IDEs can't
+render it — the GUI is the viewer. To make double-clicking a `.strand`
+file open Strand:
+
+- **Windows**: right-click the file → *Open with* → *Choose another
+  app* → select `strand-app.exe` → tick *Always use this app*.
+- **macOS**: right-click → *Get Info* → *Open with* → select
+  `strand-app` → *Change All*.
+- **Linux**: create a `~/.local/share/applications/strand.desktop`
+  entry with `Exec=/path/to/strand-app %f` and `MimeType=` for the
+  extension, then set it as default for `.strand` files.
+
+Alternatively use **Open .strand…** inside the app.
+
 ## File format
 
 See [`docs/FORMAT.md`](docs/FORMAT.md). Highlights:
