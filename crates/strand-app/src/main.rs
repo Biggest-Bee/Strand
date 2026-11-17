@@ -27,6 +27,12 @@ enum StoreOp {
     RemoveNode,
 }
 
+/// Assign through a pointer so `unused_assignments` can't prove the store
+/// dead — callers may legitimately overwrite `status` right after.
+fn set_status(status: &mut String, msg: String) {
+    *status = msg;
+}
+
 /// Run `$body` with `v: &impl GraphView` bound to the concrete backend view.
 /// For stores this pins a fresh read snapshot for the duration of the call.
 macro_rules! with_view {
@@ -42,12 +48,12 @@ macro_rules! with_view {
                     $body
                 }
                 Err(e) => {
-                    $app.status = format!("read snapshot failed: {e}");
+                    set_status(&mut $app.status, format!("read snapshot failed: {e}"));
                     Default::default()
                 }
             },
             None => {
-                $app.status = "no graph open".to_string();
+                set_status(&mut $app.status, "no graph open".to_string());
                 Default::default()
             }
         }
