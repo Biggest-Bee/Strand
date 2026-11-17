@@ -72,6 +72,8 @@ struct StrandApp {
     sel_a: Option<u32>,
     sel_b: Option<u32>,
     depth_limit: String,
+    /// Filter text for the "Browse nodes" picker.
+    node_filter: String,
     top_metric: TopMetric,
     top_n: String,
 
@@ -95,6 +97,9 @@ struct StrandApp {
     depths: Vec<u32>,
     viz_dirty: bool,
     canvas_size: egui::Vec2,
+    /// View transform: world->screen is `rect.min + pan + world * zoom`.
+    zoom: f32,
+    pan: egui::Vec2,
 }
 
 const MAX_VIZ_NODES: usize = 100_000;
@@ -148,6 +153,7 @@ impl StrandApp {
             sel_a: None,
             sel_b: None,
             depth_limit: String::new(),
+            node_filter: String::new(),
             top_metric: TopMetric::InDegree,
             top_n: "20".to_string(),
             report_title: String::new(),
@@ -161,6 +167,8 @@ impl StrandApp {
             depths: Vec::new(),
             viz_dirty: true,
             canvas_size: egui::Vec2::ZERO,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
         }
     }
 
@@ -663,10 +671,78 @@ impl StrandApp {
         if self.viz_dirty {
             self.rebuild_viz();
         }
+        let response = ui.interact(
+            rect,
+            ui.id().with("graph_canvas"),
+            egui::Sense::click_and_drag(),
+        );
+
+        // Scroll zooms toward the cursor; drag pans; double-click resets.
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        let hover = ui.input(|i| i.pointer.hover_pos());
+        if scroll != 0.0 && hover.is_some_and(|p| rect.contains(p)) {
+            let cursor = hover.unwrap();
+            let factor = if scroll > 0.0 { 1.15 } else { 1.0 / 1.15 };
+            let new_zoom = (self.zoom * factor).clamp(0.05, 40.0);
+            // Keep the world point under the cursor stationary.
+            let world = (cursor - rect.min - self.pan) / self.zoom;
+            self.pan = cursor - rect.min - world * new_zoom;
+            self.zoom = new_zoom;
+        }
+        if response.dragged() {
+            self.pan += response.drag_delta();
+        }
+        // Trackpad pinch / ctrl+scroll zooms around the viewport center.
+        let zd = ui.input(|i| i.zoom_delta());
+        if (zd - 1.0).abs() > 0.001 {
+            let new_zoom = (self.zoom * zd).clamp(0.05, 40.0);
+            let center = rect.center();
+            let world = (center - rect.min - self.pan) / self.zoom;
+            self.pan = center - rect.min - world * new_zoom;
+            self.zoom = new_zoom;
+        }
+        if response.double_clicked() {
+            self.zoom = 1.0;
+            self.pan = egui::Vec2::ZERO;
+        }
+        // Nearest node within 10px of a screen point (canvas coords -> px).
+        let nearest = |pt: egui::Pos2| -> Option<u32> {
+            let mut best: Option<(u32, f32)> = None;
+            for (i, &p) in self.pos.iter().enumerate() {
+                let sp = rect.min
+                    + self.pan
+                    + egui::vec2(p.0 * self.zoom, p.1 * self.zoom);
+                let d = sp.distance(pt);
+                if d <= 10.0 && best.map_or(true, |(_, bd)| d < bd) {
+                    best = Some((i as u32, d));
+                }
+            }
+            best.map(|(id, _)| id)
+        };
+        // Click a node to select it: click = A, shift+click = B.
+        if response.clicked() {
+            if let Some(click) = ui.input(|i| i.pointer.interact_pos()) {
+                if let Some(id) = nearest(click) {
+                    let name = with_view!(self, |v| nm(v, id));
+                    if ui.input(|i| i.modifiers.shift) {
+                        self.sel_b = Some(id);
+                        self.node_b = name;
+                    } else {
+                        self.sel_a = Some(id);
+                        self.node_a = name;
+                    }
+                    self.status = format!("selected node {id} on canvas");
+                    self.viz_dirty = true;
+                }
+            }
+        }
+
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::from_gray(24));
 
-        let to_screen = |p: (f32, f32)| rect.min + egui::vec2(p.0, p.1);
+        let to_screen = |p: (f32, f32)| {
+            rect.min + self.pan + egui::vec2(p.0 * self.zoom, p.1 * self.zoom)
+        };
 
         // Edges. LOD: past EDGE_DRAW_MAX only edges touching the
         // highlight/selection are drawn.
@@ -722,6 +798,47 @@ impl StrandApp {
             }
         }
 
+        // Hover tooltip: name + degrees for the node under the cursor.
+        if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
+            if rect.contains(hover) {
+                if let Some(id) = nearest(hover) {
+                    let name = with_view!(self, |v| nm(v, id));
+                    let (outd, ind) =
+                        with_view!(self, |v| (v.out_degree(id), v.in_degree(id)));
+                    let text = format!("{name}\n{outd} deps, {ind} dependents");
+                    let font = egui::FontId::monospace(12.0);
+                    let galley = painter.layout_no_wrap(
+                        text,
+                        font,
+                        egui::Color32::WHITE,
+                    );
+                    let pad = egui::vec2(8.0, 4.0);
+                    let tip_pos = hover + egui::vec2(14.0, 14.0);
+                    let bg = egui::Rect::from_min_size(
+                        tip_pos,
+                        galley.size() + pad,
+                    );
+                    painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(220));
+                    painter.galley(
+                        tip_pos + egui::vec2(4.0, 2.0),
+                        galley,
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
+        }
+
+        painter.text(
+            rect.right_bottom() + egui::vec2(-8.0, -8.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!(
+                "{:.0}%  (scroll=zoom, drag=pan, click=A, shift+click=B, 2x-click=reset)",
+                self.zoom * 100.0
+            ),
+            egui::FontId::proportional(11.0),
+            egui::Color32::GRAY,
+        );
+
         if self.viz_nodes > MAX_VIZ_NODES {
             painter.text(
                 rect.left_bottom() + egui::vec2(8.0, -8.0),
@@ -768,7 +885,7 @@ impl eframe::App for StrandApp {
                 ui.label("A:");
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.node_a);
-                    if ui.button("go").clicked() {
+                    if ui.button("select").clicked() {
                         self.resolve(0);
                     }
                 });
@@ -779,7 +896,7 @@ impl eframe::App for StrandApp {
                 ui.label("B:");
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.node_b);
-                    if ui.button("go").clicked() {
+                    if ui.button("select").clicked() {
                         self.resolve(1);
                     }
                 });
@@ -787,6 +904,55 @@ impl eframe::App for StrandApp {
                     self.node_b = m;
                     self.resolve(1);
                 }
+                ui.add_space(4.0);
+                // Browse every node name — click picks A, shift+click B.
+                ui.collapsing("Browse nodes", |ui| {
+                    ui.text_edit_singleline(&mut self.node_filter);
+                    let q = self.node_filter.trim().to_lowercase();
+                    let mut picked: Option<(String, bool)> = None;
+                    let mut shown = 0usize;
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for name in &self.names {
+                                if !q.is_empty() && !name.to_lowercase().contains(&q) {
+                                    continue;
+                                }
+                                if shown >= 300 {
+                                    break;
+                                }
+                                shown += 1;
+                                let resp = ui.selectable_label(false, name);
+                                if resp.clicked() {
+                                    picked = Some((
+                                        name.clone(),
+                                        ui.input(|i| i.modifiers.shift),
+                                    ));
+                                }
+                            }
+                        });
+                    if shown >= 300 {
+                        ui.label("… first 300 matches — refine the filter");
+                    }
+                    if let Some((name, to_b)) = picked {
+                        let id = with_view!(self, |v| v.node_id(name.as_str()));
+                        match id {
+                            Some(id) => {
+                                if to_b {
+                                    self.sel_b = Some(id);
+                                    self.node_b = name.clone();
+                                } else {
+                                    self.sel_a = Some(id);
+                                    self.node_a = name.clone();
+                                }
+                                self.status = format!("'{name}' -> node {id}");
+                                self.viz_dirty = true;
+                            }
+                            None => self.status = format!("no node named '{name}'"),
+                        }
+                    }
+                });
                 ui.label(format!(
                     "A = {}, B = {}",
                     self.sel_a.map(|i| i.to_string()).unwrap_or("-".into()),
