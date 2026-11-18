@@ -5,6 +5,7 @@
 //! writes stay in the library/CLI domain for now.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 use eframe::egui;
@@ -100,6 +101,18 @@ struct StrandApp {
     pos: Vec<(f32, f32)>,
     /// (src, dst) id pairs for drawing (capped).
     edge_ids: Vec<(u32, u32)>,
+    /// Edges incident to sel_a/sel_b that fell outside the sampled edge
+    /// set — (selected node, neighbor) pairs, always drawn tier-2.
+    sel_nbr_edges: Vec<(u32, u32)>,
+    /// Neighbors with no canvas position: (neighbor id, anchor sel id).
+    sel_nbr_extra: Vec<(u32, u32)>,
+    /// Per-edge draw tier (0 cold / 1 highlight / 2 selection), computed
+    /// at rebuild so painting does not rescan the highlight set per frame.
+    edge_tiers: Vec<u8>,
+    /// Whether tier-1 edges are under the draw cap (precomputed).
+    tier1_draw: bool,
+    /// Hover tooltip cache: (node id, pre-rendered text).
+    hover_tip: Option<(u32, String)>,
     /// ids highlighted by the last deps/impact run.
     highlight: BTreeSet<u32>,
     /// BFS depth per node for ring layout (UNVISITED = outer scatter).
@@ -119,6 +132,11 @@ struct StrandApp {
     /// collapsed for the layout; empty = coords align 1:1 with ids.
     layout_map: Vec<(u32, f32, f32)>,
     layout_gen: u64,
+
+    /// First-run tutorial: `Some(i)` shows card `i`; `None` = closed/done.
+    tutorial_idx: Option<usize>,
+    /// Reference window opened by the "Instructions" button.
+    show_instructions: bool,
 }
 
 const MAX_VIZ_NODES: usize = 100_000;
@@ -135,6 +153,9 @@ const MAX_LAYOUT_NODES: usize = 1_500;
 const LAYOUT_DEPTH: u32 = 3;
 /// Fruchterman-Reingold iterations (deterministic, single-threaded).
 const LAYOUT_ITERS: usize = 100;
+/// Max real edges pulled in per selected node (in+out combined).
+/// Max real edges pulled in per selected node per direction (in+out).
+const MAX_SEL_NEIGHBORS: usize = 64;
 
 /// One line in the report panel; `node` makes the row clickable (sets A).
 struct ReportRow {
@@ -170,7 +191,14 @@ fn force_layout(start: &[(f32, f32)], edges: &[(u32, u32)]) -> Vec<(f32, f32)> {
     let span = (maxx - minx).max(maxy - miny).max(1e-3);
     let mut pos: Vec<(f32, f32)> = start
         .iter()
-        .map(|&(x, y)| ((x - cx) / span, (y - cy) / span))
+        .enumerate()
+        .map(|(i, &(x, y))| {
+            // Tiny deterministic jitter: coincident start points would
+            // otherwise never separate (repulsion is zero at d=0).
+            let h = (i as u32).wrapping_mul(0x9E37_79B9);
+            let j = ((h % 1024) as f32 / 1024.0 - 0.5) * 1e-4;
+            ((x - cx) / span + j, (y - cy) / span - j)
+        })
         .collect();
 
     let k = (1.0f32 / n as f32).sqrt() * 0.75;
@@ -252,6 +280,148 @@ fn nearest_node(
     best.map(|(id, _)| id)
 }
 
+/// First-run tutorial cards: (title, body).
+const TUTORIAL: &[(&str, &str)] = &[
+    (
+        "Welcome to Strand",
+        "Strand draws dependency graphs and answers \"what breaks if this\n\
+         changes?\" questions. This card tour takes 30 seconds.\n\n\
+         You'll need a .strand file — build one with the `strand` CLI,\n\
+         or open a .strandb store for read-write editing.",
+    ),
+    (
+        "Open a graph",
+        "Click \"Open .strand...\" (top-left) to load an immutable graph,\n\
+         or \"Open store...\" to open a writable .strandb directory.\n\
+         The status bar shows the file name and node/edge counts,\n\
+         plus a warning if the file exceeds the canvas caps.",
+    ),
+    (
+        "Pick nodes A and B",
+        "Three ways: type a name in the A/B boxes (they autocomplete),\n\
+         click a dot on the canvas (click = A, shift+click = B),\n\
+         or browse every name under \"Browse nodes\".\n\n\
+         Hover any dot to see its name and dependency counts.",
+    ),
+    (
+        "Run an analysis",
+        "Left panel, \"Analyze\" section: Deps of A/B (what it needs),\n\
+         Impact of A/B (what breaks if it changes), Why A->B\n\
+         or B->A (a path between two nodes), swap A/B, Cycles,
+\n         Build order, Roots, Leaves,\n\
+         Top, and Common deps/impact. \"max depth\" limits hops.\n\n\
+         Results appear in the bottom panel — type in its filter\n\
+         box to search thousands of rows.",
+    ),
+    (
+        "Read the canvas",
+        "After an analysis the graph re-lays out: rings show hop\n\
+         distance from your node, orange = affected. Edges touching\n\
+         A/B draw bright yellow on top; everything else stays dim.\n\n\
+         Scroll to zoom (up to 200x), drag to pan, double-click to\n\
+         reset. \"Clear highlight\" wipes selections and colors.\n\n\
+         The \"organic layout\" checkbox runs a force-directed\n\
+         layout on the neighborhood — uncheck for pure rings.",
+    ),
+    (
+        "You're ready",
+        "Click a row in the report to re-select that node and keep\n\
+         exploring. Stuck? The \"Instructions\" button (top bar)\n\
+         opens a full reference of every button.\n\n\
+         This tour only shows once — enjoy Strand!",
+    ),
+];
+
+/// Reference text for the Instructions window.
+const INSTRUCTIONS: &str = "\
+STRAND — button reference
+==========================
+
+TOP BAR
+  Open .strand...   Load an immutable .strand graph file.
+  Open store...     Open a .strandb store directory (read-write if
+                    the lock is free, read-only otherwise).
+  Close             Unload the current graph and reset the canvas.
+  Instructions      This window.
+
+NODES (left panel)
+  A / B boxes       Type a node name; suggestions appear below —
+                    click one to select it. The \"select\" button
+                    resolves the typed name.
+  Browse nodes      Lists every node name (filterable). Click = pick
+                    as A, shift+click = pick as B.
+  max depth         Optional hop limit for Deps/Impact/Why/Common.
+                    Blank = unlimited.
+
+ANALYZE
+  Deps of A / B     Everything the node depends on (outgoing edges),
+                    with hop distance.
+  Impact of A / B   Everything affected if the node changes
+                    (reverse reach).
+  Why A->B / B->A   A shortest path between the two nodes.
+  swap A/B          Exchange the A and B selections.
+  Cycles            Circular dependency chains (needs both A and B
+                    unset, or scoped — see report).
+  Build order       Topological order of the graph.
+  Roots             Nodes nothing depends on.
+  Leaves            Nodes that depend on nothing.
+  Top               Ranked nodes: in-degree, impact, or pagerank.
+                    \"n\" sets how many rows.
+  Common deps/impact A,B   Nodes both A and B reach (deps) or that
+                    reach both (impact).
+
+GRAPH
+  Rebuild view      Force the canvas to re-layout.
+  Clear highlight   Reset selections, rings, and layout — back to
+                    the plain scatter view.
+  organic layout    Force-directed layout of the selected
+                    neighborhood (deterministic; runs on a worker).
+
+CANVAS
+  Click             Select node A.
+  Shift+click       Select node B.
+  Scroll / pinch    Zoom toward the cursor (up to 200x).
+  Drag              Pan.
+  Double-click      Reset zoom and pan.
+  Hover             Node name + dep/dependent counts.
+
+REPORT (bottom panel)
+  filter            Substring search across all result rows.
+  Click a row       Re-selects that node as A.
+  Right-click a row Re-selects that node as B.
+
+EDIT STORE (only when a writable store is open)
+  Add/Remove edge A->B, Add/Remove node A   Real store edits, durable
+                    immediately via the WAL.
+  Compact           Merge the WAL into a fresh base generation.
+
+TIPS
+  Very large graphs (>100k nodes / >300k edges) show a partial canvas
+  sample with a warning — analyses always cover the whole graph.
+  On huge result sets the middle edge tier is skipped so the canvas
+  stays readable; the report still lists everything.
+";
+
+/// Path of the first-run marker file (`~/.strand/tutorial_seen`).
+fn tutorial_flag() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".strand").join("tutorial_seen"))
+}
+
+fn tutorial_seen() -> bool {
+    tutorial_flag().map_or(false, |p| p.exists())
+}
+
+fn mark_tutorial_seen() {
+    if let Some(p) = tutorial_flag() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, b"");
+    }
+}
+
 fn row_node(text: impl Into<String>, id: u32, name: String) -> ReportRow {
     ReportRow {
         text: text.into(),
@@ -297,6 +467,11 @@ impl StrandApp {
             viz_edges: 0,
             pos: Vec::new(),
             edge_ids: Vec::new(),
+            sel_nbr_edges: Vec::new(),
+            sel_nbr_extra: Vec::new(),
+            edge_tiers: Vec::new(),
+            tier1_draw: true,
+            hover_tip: None,
             highlight: BTreeSet::new(),
             depths: Vec::new(),
             viz_dirty: true,
@@ -308,6 +483,8 @@ impl StrandApp {
             layout_ids: Vec::new(),
             layout_map: Vec::new(),
             layout_gen: 0,
+            tutorial_idx: if tutorial_seen() { None } else { Some(0) },
+            show_instructions: false,
         }
     }
 
@@ -506,42 +683,35 @@ impl StrandApp {
     // ---- analyses ----
 
     fn run_deps(&mut self) {
-        let Some(a) = self.sel_a else {
-            self.status = "select node A first".into();
-            return;
-        };
-        let depth = self.depth_arg();
-        let lines = with_view!(self, |v| {
-            let d = algo::bfs(v, &[a], Dir::Out, depth);
-            let mut out = Vec::new();
-            let mut by_depth: BTreeMap<u32, Vec<(u32, String)>> = BTreeMap::new();
-            for (id, &dep) in d.iter().enumerate() {
-                if dep != algo::UNVISITED && dep > 0 {
-                    by_depth
-                        .entry(dep)
-                        .or_default()
-                        .push((id as u32, nm(v, id as u32)));
-                }
-            }
-            for (dep, items) in by_depth {
-                for (id, name) in items {
-                    out.push(row_node(format!("{dep}\t{name}"), id, name));
-                }
-            }
-            out
-        });
-        self.highlight_from_depths(a, Dir::Out, depth);
-        self.set_report(format!("dependencies of node {a}"), lines);
+        self.bfs_report(0, Dir::Out);
+    }
+
+    fn run_deps_b(&mut self) {
+        self.bfs_report(1, Dir::Out);
     }
 
     fn run_impact(&mut self) {
-        let Some(a) = self.sel_a else {
-            self.status = "select node A first".into();
+        self.bfs_report(0, Dir::In);
+    }
+
+    fn run_impact_b(&mut self) {
+        self.bfs_report(1, Dir::In);
+    }
+
+    /// Shared body for Deps/Impact on either selection slot.
+    /// `which`: 0 = A, 1 = B. `dir`: Out = dependencies, In = impact.
+    fn bfs_report(&mut self, which: usize, dir: Dir) {
+        let seed = if which == 0 { self.sel_a } else { self.sel_b };
+        let Some(a) = seed else {
+            self.status = format!(
+                "select node {} first",
+                if which == 0 { "A" } else { "B" }
+            );
             return;
         };
         let depth = self.depth_arg();
         let lines = with_view!(self, |v| {
-            let d = algo::bfs(v, &[a], Dir::In, depth);
+            let d = algo::bfs(v, &[a], dir, depth);
             let mut out = Vec::new();
             let mut by_depth: BTreeMap<u32, Vec<(u32, String)>> = BTreeMap::new();
             for (id, &dep) in d.iter().enumerate() {
@@ -554,13 +724,17 @@ impl StrandApp {
             }
             for (dep, items) in by_depth {
                 for (id, name) in items {
-                    out.push(row_node(format!("{dep}\t{name}"), id, name));
+                    out.push(row_node(format!("{dep}	{name}"), id, name));
                 }
             }
             out
         });
-        self.highlight_from_depths(a, Dir::In, depth);
-        self.set_report(format!("impact of node {a} (who depends on it)"), lines);
+        self.highlight_from_depths(a, dir, depth);
+        let title = match dir {
+            Dir::Out => format!("dependencies of node {a}"),
+            Dir::In => format!("impact of node {a} (who depends on it)"),
+        };
+        self.set_report(title, lines);
     }
 
     /// Re-layout around the selected node: BFS a few hops in both
@@ -617,6 +791,32 @@ impl StrandApp {
         self.set_report(format!("shortest dependency path {a} -> {b}"), lines);
     }
 
+    /// Same as run_why but B -> A.
+    fn run_why_rev(&mut self) {
+        let (Some(a), Some(b)) = (self.sel_a, self.sel_b) else {
+            self.status = "select nodes A and B first".into();
+            return;
+        };
+        let lines = with_view!(self, |v| {
+            match algo::shortest_path(v, b, a) {
+                Some(path) => {
+                    let names: Vec<String> =
+                        path.iter().map(|&id| nm(v, id)).collect();
+                    vec![row(names.join(" -> "))]
+                }
+                None => vec![row("no path")],
+            }
+        });
+        self.set_report(format!("shortest dependency path {b} -> {a}"), lines);
+    }
+
+    /// Swap the A and B selections (ids and name boxes).
+    fn swap_ab(&mut self) {
+        std::mem::swap(&mut self.sel_a, &mut self.sel_b);
+        std::mem::swap(&mut self.node_a, &mut self.node_b);
+        self.viz_dirty = true;
+    }
+
     fn run_cycles(&mut self) {
         let lines = with_view!(self, |v| {
             let sccs = algo::strongly_connected(v);
@@ -626,9 +826,22 @@ impl StrandApp {
             } else {
                 let mut out = Vec::new();
                 for c in cycles.iter().take(500) {
-                    let names: Vec<String> =
-                        c.iter().map(|&id| nm(v, id)).collect();
-                    out.push(row(format!("cycle ({}): {}", c.len(), names.join(", "))));
+                    let names: Vec<String> = c
+                        .iter()
+                        .take(20)
+                        .map(|&id| nm(v, id))
+                        .collect();
+                    let suffix = if c.len() > 20 {
+                        format!(", ... +{} more", c.len() - 20)
+                    } else {
+                        String::new()
+                    };
+                    out.push(row(format!(
+                        "cycle ({}): {}{}",
+                        c.len(),
+                        names.join(", "),
+                        suffix
+                    )));
                 }
                 if cycles.len() > 500 {
                     out.push(row(format!("... {} more cycles", cycles.len() - 500)));
@@ -689,9 +902,22 @@ impl StrandApp {
                     let name = nm(v, comp[0]);
                     out.push(row_node(format!("{}. {name}", i + 1), comp[0], name));
                 } else {
-                    let names: Vec<String> =
-                        comp.iter().map(|&id| nm(v, id)).collect();
-                    out.push(row(format!("{}. {{{}}}", i + 1, names.join(", "))));
+                    let names: Vec<String> = comp
+                        .iter()
+                        .take(20)
+                        .map(|&id| nm(v, id))
+                        .collect();
+                    let suffix = if comp.len() > 20 {
+                        format!(", ... +{} more", comp.len() - 20)
+                    } else {
+                        String::new()
+                    };
+                    out.push(row(format!(
+                        "{}. {{{}{}}}",
+                        i + 1,
+                        names.join(", "),
+                        suffix
+                    )));
                 }
                 if out.len() > MAX_REPORT_LINES {
                     out.push(row("... truncated"));
@@ -706,11 +932,18 @@ impl StrandApp {
     fn run_roots(&mut self) {
         let lines = with_view!(self, |v| {
             let mut out = Vec::new();
+            let mut total = 0usize;
             for id in 0..nn(v) as u32 {
                 if v.in_degree(id) == 0 {
-                    let name = nm(v, id);
-                    out.push(row_node(name.clone(), id, name));
+                    total += 1;
+                    if out.len() < MAX_REPORT_LINES {
+                        let name = nm(v, id);
+                        out.push(row_node(name.clone(), id, name));
+                    }
                 }
+            }
+            if total > out.len() {
+                out.push(row(format!("... {} more", total - out.len())));
             }
             out
         });
@@ -720,11 +953,18 @@ impl StrandApp {
     fn run_leaves(&mut self) {
         let lines = with_view!(self, |v| {
             let mut out = Vec::new();
+            let mut total = 0usize;
             for id in 0..nn(v) as u32 {
                 if v.out_degree(id) == 0 {
-                    let name = nm(v, id);
-                    out.push(row_node(name.clone(), id, name));
+                    total += 1;
+                    if out.len() < MAX_REPORT_LINES {
+                        let name = nm(v, id);
+                        out.push(row_node(name.clone(), id, name));
+                    }
                 }
+            }
+            if total > out.len() {
+                out.push(row(format!("... {} more", total - out.len())));
             }
             out
         });
@@ -748,8 +988,12 @@ impl StrandApp {
                     .collect::<Vec<_>>()
             });
             out.push(row(format!("== {label} ({}) ==", names.len())));
-            for (id, name) in names {
-                out.push(row_node(name.clone(), id, name));
+            for (i, (id, name)) in names.iter().enumerate() {
+                if i >= MAX_REPORT_LINES {
+                    out.push(row(format!("... {} more", names.len() - i)));
+                    break;
+                }
+                out.push(row_node(name.clone(), *id, name.clone()));
             }
             out.push(row(""));
         }
@@ -788,6 +1032,9 @@ impl StrandApp {
     /// Fold the delta into a fresh base. Runs on the UI thread — fine for
     /// typical deltas; very large ones will pause the window briefly.
     fn store_compact(&mut self) {
+        // Compaction renumbers node ids — capture selection names first.
+        let name_a = self.sel_a.map(|id| with_view!(self, |v| nm(v, id)));
+        let name_b = self.sel_b.map(|id| with_view!(self, |v| nm(v, id)));
         let res = match &self.backend {
             Some(Backend::Store(s)) => s.compact(),
             _ => return,
@@ -795,6 +1042,19 @@ impl StrandApp {
         match res {
             Ok(()) => {
                 self.status = "compacted".into();
+                self.sel_a = None;
+                self.sel_b = None;
+                self.highlight.clear();
+                self.depths.clear();
+                self.cancel_layout();
+                if let Some(name) = name_a {
+                    self.node_a = name.clone();
+                    self.sel_a = with_view!(self, |v| v.node_id(&name));
+                }
+                if let Some(name) = name_b {
+                    self.node_b = name.clone();
+                    self.sel_b = with_view!(self, |v| v.node_id(&name));
+                }
                 self.collect_names();
                 self.viz_dirty = true;
             }
@@ -806,6 +1066,8 @@ impl StrandApp {
         self.viz_dirty = false;
         self.pos.clear();
         self.edge_ids.clear();
+        self.sel_nbr_edges.clear();
+        self.sel_nbr_extra.clear();
         with_view!(self, |v| {
             let n = nn(v);
             self.viz_nodes = n;
@@ -813,7 +1075,10 @@ impl StrandApp {
             let cap_n = n.min(MAX_VIZ_NODES);
             self.pos = vec![(0.0, 0.0); cap_n];
             self.edge_ids = Vec::with_capacity(MAX_VIZ_EDGES.min(1 << 16));
-            for id in 0..cap_n as u32 {
+            'nodes: for id in 0..cap_n as u32 {
+                if self.edge_ids.len() >= MAX_VIZ_EDGES {
+                    break 'nodes;
+                }
                 v.out_edges(id, &mut |t| {
                     if self.edge_ids.len() < MAX_VIZ_EDGES && (t as usize) < cap_n {
                         self.edge_ids.push((id, t));
@@ -821,7 +1086,65 @@ impl StrandApp {
                 });
             }
             self.viz_edges = self.edge_ids.len();
+
+            // Always pull in edges incident to the A/B selection — the
+            // sampled edge set can miss them entirely on big graphs.
+            // Each direction gets its own budget so a hub's out-edges
+            // can't starve its dependents (the impact direction).
+            for &s in [self.sel_a, self.sel_b].iter().flatten() {
+                if s as usize >= cap_n {
+                    continue;
+                }
+                let mut seen = HashSet::new();
+                let push = |t: u32,
+                                edges: &mut Vec<(u32, u32)>,
+                                extra: &mut Vec<(u32, u32)>,
+                                seen: &mut HashSet<u32>| {
+                    if seen.insert(t) {
+                        edges.push((s, t));
+                        if t as usize >= cap_n {
+                            extra.push((t, s));
+                        }
+                    }
+                };
+                let mut out_n = 0usize;
+                v.out_edges(s, &mut |t| {
+                    if out_n < MAX_SEL_NEIGHBORS {
+                        out_n += 1;
+                        push(t, &mut self.sel_nbr_edges, &mut self.sel_nbr_extra, &mut seen);
+                    }
+                });
+                let mut in_n = 0usize;
+                v.in_edges(s, &mut |t| {
+                    if in_n < MAX_SEL_NEIGHBORS {
+                        in_n += 1;
+                        push(t, &mut self.sel_nbr_edges, &mut self.sel_nbr_extra, &mut seen);
+                    }
+                });
+            }
         });
+
+        // Edge tiers depend only on sel/highlight, which always dirty the
+        // viz — compute once here instead of per frame.
+        self.edge_tiers = self
+            .edge_ids
+            .iter()
+            .map(|&(s, t)| {
+                if Some(s) == self.sel_a
+                    || Some(s) == self.sel_b
+                    || Some(t) == self.sel_a
+                    || Some(t) == self.sel_b
+                {
+                    2
+                } else if self.highlight.contains(&s) || self.highlight.contains(&t) {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect();
+        self.tier1_draw =
+            self.edge_tiers.iter().filter(|&&t| t == 1).count() <= 20_000;
 
         // Layout: ring by BFS depth when we have one, else a circle.
         let w = self.canvas_size.x.max(400.0);
@@ -836,7 +1159,12 @@ impl StrandApp {
                 let d = self.depths.get(id as usize).copied().unwrap_or(u32::MAX);
                 rings.entry(d).or_default().push(id);
             }
-            let max_d = rings.keys().next_back().copied().unwrap_or(0);
+            let max_d = rings
+                .keys()
+                .copied()
+                .filter(|&d| d != u32::MAX)
+                .max()
+                .unwrap_or(0);
             let ring_step = (w.min(h) / 2.0 / (max_d.max(1) as f32 + 2.0)).max(24.0);
             for (d, members) in rings {
                 let r = if d == u32::MAX {
@@ -867,8 +1195,18 @@ impl StrandApp {
     /// (nodes within LAYOUT_DEPTH hops of the last analysis/selection),
     /// capped at MAX_LAYOUT_NODES. Runs on a worker thread; results are
     /// generation-tagged so stale layouts are dropped.
+    /// Invalidate any in-flight layout so a stale worker result can't
+    /// overwrite fresh positions.
+    fn cancel_layout(&mut self) {
+        self.layout_gen += 1;
+        self.layout_rx = None;
+        self.layout_ids.clear();
+        self.layout_map.clear();
+    }
+
     fn maybe_start_layout(&mut self) {
         if !self.organic || self.depths.is_empty() {
+            self.cancel_layout();
             return;
         }
         // Candidates: drawn nodes within the hop limit, nearest first.
@@ -880,6 +1218,7 @@ impl StrandApp {
             }
         }
         if cand.len() < 8 {
+            self.cancel_layout();
             return;
         }
         cand.sort_by_key(|&(d, _)| d);
@@ -1100,27 +1439,12 @@ impl StrandApp {
         // Hot tiers get a dark underlay stroke so they stay readable over
         // the hairball.
         let draw_all = self.edge_ids.len() <= EDGE_DRAW_MAX;
-        let tiers: Vec<u8> = self
-            .edge_ids
-            .iter()
-            .map(|&(s, t)| {
-                if Some(s) == self.sel_a
-                    || Some(s) == self.sel_b
-                    || Some(t) == self.sel_a
-                    || Some(t) == self.sel_b
-                {
-                    2
-                } else if self.highlight.contains(&s) || self.highlight.contains(&t) {
-                    1
-                } else {
-                    0
-                }
-            })
-            .collect();
+        let tiers = &self.edge_tiers;
+        debug_assert_eq!(tiers.len(), self.edge_ids.len());
         // If the highlighted set touches too many edges, drawing them all
         // just repaints the hairball — skip tier 1 entirely (nodes stay
         // highlighted; only selection edges remain). Tier 2 always draws.
-        let draw_tier1 = tiers.iter().filter(|&&t| t == 1).count() <= 20_000;
+        let draw_tier1 = self.tier1_draw;
         // Batch into a handful of Shape::Vec draws instead of one painter
         // shape per edge: [cold, t1 outline, t1 core, t2 outline, t2 core].
         let mut groups: [Vec<egui::Shape>; 5] = Default::default();
@@ -1153,6 +1477,25 @@ impl StrandApp {
                     groups[4].push(egui::Shape::line_segment(seg, group_strokes[4]));
                 }
             }
+        }
+        // Real edges incident to A/B that the sample missed. Neighbors
+        // outside the node cap get a deterministic spot on a ring around
+        // the selected node so the line has somewhere to land.
+        for &(s, t) in &self.sel_nbr_edges {
+            let Some(&ps) = self.pos.get(s as usize) else {
+                continue;
+            };
+            let pt = match self.pos.get(t as usize) {
+                Some(&p) => p,
+                None => {
+                    let h = t.wrapping_mul(0x9E37_79B9);
+                    let ang = (h % 6283) as f32 / 1000.0;
+                    (ps.0 + 60.0 * ang.cos(), ps.1 + 60.0 * ang.sin())
+                }
+            };
+            let seg = [to_screen(ps), to_screen(pt)];
+            groups[3].push(egui::Shape::line_segment(seg, group_strokes[3]));
+            groups[4].push(egui::Shape::line_segment(seg, group_strokes[4]));
         }
         for group in groups {
             if !group.is_empty() {
@@ -1192,19 +1535,39 @@ impl StrandApp {
             }
         }
 
+        // Dots for selection neighbors that have no canvas node —
+        // they sit on the deterministic ring around their anchor.
+        for &(nid, anchor) in &self.sel_nbr_extra {
+            let Some(&as_) = self.pos.get(anchor as usize) else {
+                continue;
+            };
+            let h = nid.wrapping_mul(0x9E37_79B9);
+            let ang = (h % 6283) as f32 / 1000.0;
+            let p = (as_.0 + 60.0 * ang.cos(), as_.1 + 60.0 * ang.sin());
+            let c = to_screen(p);
+            painter.circle_filled(c, 4.0, egui::Color32::from_gray(24));
+            painter.circle_filled(c, 2.5, egui::Color32::from_rgb(140, 170, 220));
+        }
+
         // Hover tooltip: name + degrees for the node under the cursor.
         if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
             if rect.contains(hover) {
                 if let Some(id) =
                     nearest_node(&self.pos, self.pan, self.zoom, rect.min, hover)
                 {
-                    let name = with_view!(self, |v| nm(v, id));
-                    let (outd, ind) =
-                        with_view!(self, |v| (v.out_degree(id), v.in_degree(id)));
-                    let text = format!("{name}\n{outd} deps, {ind} dependents");
+                    if self.hover_tip.as_ref().map(|(i, _)| *i) != Some(id) {
+                        let name = with_view!(self, |v| nm(v, id));
+                        let (outd, ind) =
+                            with_view!(self, |v| (v.out_degree(id), v.in_degree(id)));
+                        self.hover_tip = Some((
+                            id,
+                            format!("{name}\n{outd} deps, {ind} dependents"),
+                        ));
+                    }
+                    let text = &self.hover_tip.as_ref().unwrap().1;
                     let font = egui::FontId::monospace(12.0);
                     let galley = painter.layout_no_wrap(
-                        text,
+                        text.clone(),
                         font,
                         egui::Color32::WHITE,
                     );
@@ -1266,6 +1629,9 @@ impl eframe::App for StrandApp {
                 }
                 if ui.button("Close").clicked() {
                     self.close_graph();
+                }
+                if ui.button("Instructions").clicked() {
+                    self.show_instructions = true;
                 }
                 ui.separator();
                 ui.label(&self.source_label);
@@ -1368,11 +1734,25 @@ impl eframe::App for StrandApp {
                     if ui.button("Deps of A").clicked() {
                         self.run_deps();
                     }
+                    if ui.button("Deps of B").clicked() {
+                        self.run_deps_b();
+                    }
                     if ui.button("Impact of A").clicked() {
                         self.run_impact();
                     }
+                    if ui.button("Impact of B").clicked() {
+                        self.run_impact_b();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Why A->B").clicked() {
                         self.run_why();
+                    }
+                    if ui.button("Why B->A").clicked() {
+                        self.run_why_rev();
+                    }
+                    if ui.button("swap A/B").clicked() {
+                        self.swap_ab();
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -1425,6 +1805,9 @@ impl eframe::App for StrandApp {
                         self.sel_b = None;
                         self.node_a.clear();
                         self.node_b.clear();
+                        self.report_lines.clear();
+                        self.report_title.clear();
+                        self.report_filter.clear();
                         self.layout_rx = None;
                         self.layout_ids.clear();
                         self.layout_map.clear();
@@ -1489,29 +1872,37 @@ impl eframe::App for StrandApp {
                 });
                 ui.heading(&self.report_title);
                 let q = self.report_filter.trim().to_lowercase();
-                let mut pick: Option<(u32, String)> = None;
+                // Click = select as A, right-click = select as B.
+                let mut pick: Option<(u32, String, bool)> = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for r in &self.report_lines {
                         if !q.is_empty() && !r.text.to_lowercase().contains(&q) {
                             continue;
                         }
                         if let Some((id, name)) = &r.node {
-                            // Clickable: selects the node as A.
-                            if ui
-                                .selectable_label(self.sel_a == Some(*id), &r.text)
-                                .clicked()
-                            {
-                                pick = Some((*id, name.clone()));
+                            let resp = ui.selectable_label(
+                                self.sel_a == Some(*id) || self.sel_b == Some(*id),
+                                &r.text,
+                            );
+                            if resp.clicked() {
+                                pick = Some((*id, name.clone(), false));
+                            } else if resp.secondary_clicked() {
+                                pick = Some((*id, name.clone(), true));
                             }
                         } else {
                             ui.monospace(&r.text);
                         }
                     }
                 });
-                if let Some((id, name)) = pick {
-                    self.sel_a = Some(id);
-                    self.node_a = name;
-                    self.focus_a();
+                if let Some((id, name, to_b)) = pick {
+                    if to_b {
+                        self.sel_b = Some(id);
+                        self.node_b = name;
+                    } else {
+                        self.sel_a = Some(id);
+                        self.node_a = name;
+                        self.focus_a();
+                    }
                     self.viz_dirty = true;
                 }
             });
@@ -1525,6 +1916,76 @@ impl eframe::App for StrandApp {
 
         if self.backend.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+
+        // First-run tutorial cards.
+        if let Some(i) = self.tutorial_idx {
+            let last = i + 1 >= TUTORIAL.len();
+            let mut advance = false;
+            let mut finish = false;
+            egui::Window::new(format!(
+                "Welcome to Strand — {} of {}",
+                i + 1,
+                TUTORIAL.len()
+            ))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(&ctx, |ui| {
+                ui.set_max_width(500.0);
+                let (title, body) = TUTORIAL[i];
+                ui.heading(title);
+                ui.add_space(6.0);
+                ui.label(body);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if i > 0 && ui.button("< Back").clicked() {
+                        self.tutorial_idx = Some(i - 1);
+                    }
+                    if last {
+                        if ui.button("Done").clicked() {
+                            finish = true;
+                        }
+                    } else if ui.button("Next >").clicked() {
+                        advance = true;
+                    }
+                    ui.label("— or press → (right arrow) to proceed");
+                });
+            });
+            // Right arrow advances, but not while a text field has focus
+            // (it would just move the caret).
+            if ctx.input(|inp| inp.key_pressed(egui::Key::ArrowRight))
+                && !ctx.egui_wants_keyboard_input()
+            {
+                advance = true;
+            }
+            if advance {
+                if last {
+                    finish = true;
+                } else {
+                    self.tutorial_idx = Some(i + 1);
+                }
+            }
+            if finish {
+                mark_tutorial_seen();
+                self.tutorial_idx = None;
+            }
+        }
+
+        // Instructions reference window.
+        if self.show_instructions {
+            let mut open = true;
+            egui::Window::new("Instructions")
+                .open(&mut open)
+                .default_size([680.0, 540.0])
+                .show(&ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(INSTRUCTIONS).monospace(),
+                        ).wrap());
+                    });
+                });
+            self.show_instructions = open;
         }
     }
 }

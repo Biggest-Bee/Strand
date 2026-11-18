@@ -1,8 +1,6 @@
 //! Strongly connected components via **iterative** Tarjan (no recursion, so
 //! deep graphs cannot overflow the stack), plus condensation into a DAG.
 
-use std::collections::BTreeSet;
-
 use crate::view::GraphView;
 
 /// Tarjan's SCC algorithm, iterative.
@@ -118,21 +116,31 @@ pub fn condensation<G: GraphView>(graph: &G, sccs: &[Vec<u32>]) -> Condensation 
             comp[v as usize] = cid as u32;
         }
     }
-    let mut sets: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); sccs.len()];
-    for v in 0..n as u32 {
-        let cv = comp[v as usize];
-        graph.out_edges(v, &mut |w| {
-            if (w as usize) < n {
-                let cw = comp[w as usize];
-                if cw != cv && cw != u32::MAX {
-                    sets[cv as usize].insert(cw);
+    // Per-component neighbor lists via one reused buffer: gather comp ids,
+    // sort + dedup. Flat Vecs beat a BTreeSet per component on graphs with
+    // millions of singleton SCCs.
+    let mut adj: Vec<Vec<u32>> = Vec::with_capacity(sccs.len());
+    let mut buf: Vec<u32> = Vec::new();
+    for members in sccs {
+        buf.clear();
+        let cv = comp[members[0] as usize];
+        for &v in members {
+            graph.out_edges(v, &mut |w| {
+                if (w as usize) < n {
+                    let cw = comp[w as usize];
+                    if cw != u32::MAX && cw != cv {
+                        buf.push(cw);
+                    }
                 }
-            }
-        });
+            });
+        }
+        buf.sort_unstable();
+        buf.dedup();
+        adj.push(buf.clone());
     }
     Condensation {
         comp,
         members: sccs.to_vec(),
-        adj: sets.into_iter().map(|s| s.into_iter().collect()).collect(),
+        adj,
     }
 }

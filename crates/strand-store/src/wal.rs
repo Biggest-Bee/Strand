@@ -140,48 +140,80 @@ pub fn decode_tx(payload: &[u8]) -> Result<Vec<Op>> {
     Ok(ops)
 }
 
-/// Append one framed record to `w`. Does not fsync — caller decides.
+/// Append one framed record to `w` as a single write. Does not fsync —
+/// caller decides. On error the caller should roll back to the pre-append
+/// file length (`set_len`) so no torn record is left behind.
 pub fn append_record(w: &mut impl Write, payload: &[u8]) -> Result<()> {
     let crc = xxh32(payload, 0);
-    w.write_all(&(payload.len() as u32).to_le_bytes())?;
-    w.write_all(&crc.to_le_bytes())?;
-    w.write_all(payload)?;
+    let mut buf = Vec::with_capacity(8 + payload.len());
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf.extend_from_slice(payload);
+    w.write_all(&buf)?;
     Ok(())
 }
 
-/// Replay a WAL file: yields each successfully decoded transaction.
+/// Upper bound on one transaction payload. Commits are small; this only
+/// stops a corrupt length field from forcing a giant allocation.
+const MAX_RECORD_LEN: u64 = 256 << 20; // 256 MiB
+
+/// Replay a WAL file: returns `(transactions, valid_len)` where `valid_len`
+/// is the byte offset just past the last good record — i.e. where a torn or
+/// corrupt tail should be truncated before appending again.
 ///
-/// Stops silently at the first record with a bad length or checksum (torn
-/// tail). Returns `(txs, trailing_bytes_ignored)`.
-pub fn replay(mut r: impl Read) -> Result<Vec<Vec<Op>>> {
+/// A bad record is a *torn tail* only when nothing follows it; a bad record
+/// with more data after it is mid-log corruption and returns an error
+/// rather than silently dropping every later transaction.
+pub fn replay(file: &std::fs::File) -> Result<(Vec<Vec<Op>>, u64)> {
+    let file_len = file.metadata()?.len();
+    let mut r = file;
     let mut txs = Vec::new();
+    let mut offset = 0u64; // end of the last good record
     let mut hdr = [0u8; 8];
     loop {
-        match r.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(Error::Io(e)),
+        // Fewer than 8 bytes left: torn header, stop here.
+        if file_len - offset < 8 {
+            break;
         }
-        let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+        r.read_exact(&mut hdr)?;
+        let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as u64;
         let crc = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-        // Sanity: a record can't be longer than the file could plausibly be.
-        if len > 1 << 30 {
-            break; // torn/garbage header
+        let rec_len = 8u64.saturating_add(len);
+        if rec_len > file_len - offset {
+            // Record claims more bytes than the file holds: torn tail.
+            break;
         }
-        let mut payload = vec![0u8; len];
+        if len > MAX_RECORD_LEN {
+            return Err(Error::Invalid("wal: absurd record length".into()));
+        }
+        let mut payload = vec![0u8; len as usize];
         match r.read_exact(&mut payload) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(Error::Io(e)),
         }
-        if xxh32(&payload, 0) != crc {
-            break; // torn/corrupt record: stop here
-        }
-        match decode_tx(&payload) {
-            Ok(ops) => txs.push(ops),
-            Err(_) => break, // undecodable record: treat as torn tail
+        let decoded = if xxh32(&payload, 0) == crc {
+            decode_tx(&payload).ok()
+        } else {
+            None
+        };
+        match decoded {
+            Some(ops) => {
+                txs.push(ops);
+                offset += rec_len;
+            }
+            None => {
+                // Bad record: torn tail only if it is the last thing in
+                // the file; anything after it means mid-log corruption.
+                if offset + rec_len >= file_len {
+                    break;
+                }
+                return Err(Error::Invalid(
+                    "wal: corrupt record before end of log".into(),
+                ));
+            }
         }
     }
-    Ok(txs)
+    Ok((txs, offset))
 }
 

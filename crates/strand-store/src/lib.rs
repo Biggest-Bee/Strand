@@ -210,11 +210,20 @@ impl Store {
         let wal_path = dir.join(&wal_name);
         if wal_path.exists() {
             let f = File::open(&wal_path)?;
-            let txs = wal::replay(f)?;
+            let (txs, valid_len) = wal::replay(&f)?;
+            let actual_len = f.metadata()?.len();
             for ops in txs {
                 let d = Arc::make_mut(&mut state.delta);
                 apply_ops_inner(&state.base, state.base_n, &ops, d)?;
                 state.seq += 1;
+            }
+            // Truncate a torn/corrupt tail so later commits don't get
+            // stranded behind garbage that replay would stop at.
+            if writable && valid_len < actual_len {
+                drop(f);
+                let wf = OpenOptions::new().write(true).open(&wal_path)?;
+                wf.set_len(valid_len)?;
+                wf.sync_all()?;
             }
         }
 
@@ -362,8 +371,27 @@ impl Store {
         let new_epoch = epoch + 1;
         let base_name = format!("base-{new_epoch}.strand");
         let wal_name = format!("wal-{new_epoch}.log");
-        builder.build(&self.dir.join(&base_name))?;
-        File::create(self.dir.join(&wal_name))?;
+        let base_path = self.dir.join(&base_name);
+        let wal_path = self.dir.join(&wal_name);
+        builder.build(&base_path)?;
+
+        // Do ALL fallible work before the manifest swap: create+validate
+        // the new WAL handle and open the new base. After the swap only
+        // infallible in-memory updates remain — a failure here used to
+        // leave the store appending to a WAL the manifest no longer
+        // referenced (and gc would delete).
+        let new_wal_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)?;
+        new_wal_file.sync_all()?;
+        let new_base = Arc::new(Graph::open(&base_path)?);
+        let new_base_n = new_base.n_nodes();
+
+        // The only remaining fallible ops are the mutex locks — take them
+        // before the swap too.
+        let mut st = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let mut wf = self.wal_file.lock().map_err(|_| Error::Poisoned)?;
 
         // Atomic manifest swap.
         write_manifest(
@@ -376,28 +404,16 @@ impl Store {
             },
         )?;
 
-        // Swap in-memory state.
-        let new_base = Arc::new(Graph::open(self.dir.join(format!("base-{new_epoch}.strand")))?);
-        let new_base_n = new_base.n_nodes();
-        {
-            let mut st = self.state.lock().map_err(|_| Error::Poisoned)?;
-            st.base = Some(new_base);
-            st.delta = Arc::new(Delta::default());
-            st.base_n = new_base_n;
-            st.epoch = new_epoch;
-        }
+        st.base = Some(new_base);
+        st.delta = Arc::new(Delta::default());
+        st.base_n = new_base_n;
+        st.epoch = new_epoch;
+        *wf = Some(new_wal_file);
+        drop(wf);
+        drop(st);
 
-        // Reopen WAL handle for the new epoch.
-        {
-            let mut wf = self.wal_file.lock().map_err(|_| Error::Poisoned)?;
-            *wf = Some(
-                OpenOptions::new()
-                    .append(true)
-                    .open(self.dir.join(format!("wal-{new_epoch}.log")))?,
-            );
-        }
-
-        self.gc_stale_files()?;
+        // Best-effort: a GC failure must not report compaction as failed.
+        let _ = self.gc_stale_files();
         Ok(())
     }
 
@@ -544,8 +560,15 @@ impl<'a> WriteTx<'a> {
         {
             let mut wf = self.store.wal_file.lock().map_err(|_| Error::Poisoned)?;
             let f = wf.as_mut().ok_or(Error::ReadOnly)?;
-            wal::append_record(f, &payload)?;
-            f.flush()?;
+            let pre_len = f.metadata()?.len();
+            if let Err(e) = wal::append_record(f, &payload)
+                .and_then(|_| f.flush().map_err(strand_core::Error::Io))
+            {
+                // Roll back a torn record so the next replay doesn't stop
+                // at garbage and strand later commits.
+                let _ = f.set_len(pre_len);
+                return Err(e.into());
+            }
             if self.store.fsync {
                 f.sync_all()?;
             }

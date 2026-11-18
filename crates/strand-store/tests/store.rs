@@ -542,3 +542,69 @@ fn auto_compact_threshold() {
     assert_eq!(adj["b"], BTreeSet::from(["c".to_string()]));
     assert_eq!(adj["c"], BTreeSet::from(["d".to_string()]));
 }
+
+#[test]
+fn torn_tail_then_new_commit_survives_reopen() {
+    // Regression: a torn WAL tail used to leave garbage in the file;
+    // commits made after reopening landed *behind* it, and the next
+    // replay stopped at the garbage — silently losing those commits.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.strandb");
+    {
+        let store = Store::open(&path).unwrap();
+        commit(&store, |tx| {
+            tx.add_edge("a", "b").unwrap();
+        });
+        commit(&store, |tx| {
+            tx.add_edge("c", "d").unwrap();
+        });
+    }
+    // Simulate a torn tail: chop inside the last record.
+    let wal = path.join("wal-0.log");
+    let len = std::fs::metadata(&wal).unwrap().len();
+    {
+        let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        f.set_len(len - 3).unwrap();
+    }
+    // Reopen: replay keeps a->b, drops the torn tail, truncates the file.
+    {
+        let store = Store::open(&path).unwrap();
+        let adj = adj_of(&store.begin_read().unwrap());
+        assert!(adj["a"].contains("b"));
+        // Commit AFTER the torn tail was truncated.
+        commit(&store, |tx| {
+            tx.add_edge("x", "y").unwrap();
+        });
+    }
+    // Reopen again: the post-crash commit must still be there.
+    let store = Store::open(&path).unwrap();
+    let adj = adj_of(&store.begin_read().unwrap());
+    assert!(adj["x"].contains("y"), "post-crash commit lost: {adj:?}");
+    assert!(adj["a"].contains("b"));
+}
+
+#[test]
+fn mid_log_corruption_is_an_error() {
+    // A bad record followed by more data is corruption, not a torn tail —
+    // replay must fail loudly instead of dropping later transactions.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.strandb");
+    {
+        let store = Store::open(&path).unwrap();
+        commit(&store, |tx| {
+            tx.add_edge("a", "b").unwrap();
+        });
+        commit(&store, |tx| {
+            tx.add_edge("c", "d").unwrap();
+        });
+        commit(&store, |tx| {
+            tx.add_edge("e", "f").unwrap();
+        });
+    }
+    // Flip a byte inside the FIRST record's payload.
+    let wal = path.join("wal-0.log");
+    let mut bytes = std::fs::read(&wal).unwrap();
+    bytes[10] ^= 0xFF;
+    std::fs::write(&wal, &bytes).unwrap();
+    assert!(Store::open(&path).is_err());
+}

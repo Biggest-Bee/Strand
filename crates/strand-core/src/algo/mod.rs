@@ -125,31 +125,47 @@ pub fn rerank_impact_exact<G: GraphView>(
 ) -> Vec<u32> {
     use rayon::prelude::*;
     let n = scores.len();
-    if n == 0 || m == 0 {
+    if n == 0 || m == 0 || cap == 0 {
         return Vec::new();
     }
     let want = m.min(n).min(cap);
     let mut idx: Vec<u32> = (0..n as u32).collect();
-    idx.sort_by(|&a, &b| {
+    // Partial sort: only the top `want` need ordering — O(n) instead of
+    // O(n log n) on 10M-node graphs. total_cmp is a total order (NaN-safe).
+    let cmp = |&a: &u32, &b: &u32| {
         scores[b as usize]
-            .partial_cmp(&scores[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&scores[a as usize])
             .then(a.cmp(&b))
-    });
-    // Extend past `want` while scores tie the boundary value.
+    };
+    idx.select_nth_unstable_by(want - 1, &cmp);
+    // Extend past `want` with every node tied at the boundary score
+    // (deterministic by id), capped at `cap` total.
     let boundary = scores[idx[want - 1] as usize];
-    let mut end = want;
-    while end < n && end < cap && scores[idx[end] as usize] == boundary {
-        end += 1;
+    let mut sel: Vec<u32> = idx[..want].to_vec();
+    if want < cap {
+        let mut ties: Vec<u32> = idx[want..]
+            .iter()
+            .copied()
+            .filter(|&i| scores[i as usize] == boundary)
+            .collect();
+        ties.sort_unstable();
+        for t in ties {
+            if sel.len() >= cap {
+                break;
+            }
+            sel.push(t);
+        }
     }
-    let exact: Vec<f64> = idx[..end]
+    sel.sort_by(|a, b| cmp(a, b));
+    let exact: Vec<f64> = sel
         .par_iter()
         .map(|&i| impact_size_exact(graph, i) as f64)
         .collect();
-    for (k, &i) in idx[..end].iter().enumerate() {
+    for (k, &i) in sel.iter().enumerate() {
         scores[i as usize] = exact[k];
     }
-    idx[..end].to_vec()
+    sel.sort_unstable();
+    sel
 }
 
 /// Force the landmark-sampling path regardless of graph size (for
@@ -202,6 +218,9 @@ pub fn impact_sizes_approx_detail<G: GraphView>(
     if n == 0 || samples == 0 {
         return (vec![0.0; n], 0);
     }
+    // Cap landmarks: samples >= n would make every node a landmark —
+    // that's n full BFS passes (exact-cost) under an "approx" label.
+    let samples = samples.min(n).min(1024);
 
     // Deterministic landmark set: ids whose xxh64 hash falls below the
     // samples/n quantile of hash space. Hash of the id (not the name)
@@ -255,6 +274,9 @@ fn impact_sizes_sampled<G: GraphView>(
             while let Some(x) = queue.pop() {
                 graph.out_edges(x, &mut |w| {
                     let i = w as usize;
+                    if i >= n {
+                        return; // malformed edge target: skip, don't panic
+                    }
                     let word = &mut bits[i / 64];
                     let bit = 1u64 << (i % 64);
                     if *word & bit == 0 {

@@ -1,6 +1,5 @@
 //! Tests for lockfile/manifest importers (locks.rs).
 
-use strand_import::locks;
 use strand_import::Format;
 
 fn edges(text: &str, f: Format) -> Vec<(String, String)> {

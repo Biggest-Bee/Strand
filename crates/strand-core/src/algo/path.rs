@@ -21,10 +21,13 @@ pub struct PathList {
 /// One shortest dependency chain `from -> ... -> to` (forward edges).
 /// Returns `None` if `to` is not reachable from `from`.
 pub fn shortest_path<G: GraphView>(graph: &G, from: u32, to: u32) -> Option<Vec<u32>> {
+    let n = graph.n_nodes();
+    if from as usize >= n || to as usize >= n {
+        return None;
+    }
     if from == to {
         return Some(vec![from]);
     }
-    let n = graph.n_nodes();
     let mut parent = vec![UNVISITED; n];
     let mut queue = std::collections::VecDeque::new();
     parent[from as usize] = from;
@@ -75,6 +78,12 @@ pub fn k_shortest_paths<G: GraphView>(graph: &G, from: u32, to: u32, k: usize) -
         // The only simple chain is the trivial one — enumeration is exact.
         return PathList {
             paths: vec![vec![from]],
+            truncated: false,
+        };
+    }
+    if from as usize >= graph.n_nodes() || to as usize >= graph.n_nodes() {
+        return PathList {
+            paths: Vec::new(),
             truncated: false,
         };
     }
@@ -184,6 +193,12 @@ pub fn paths_within_depth<G: GraphView>(
             truncated: false,
         };
     }
+    if from as usize >= graph.n_nodes() || to as usize >= graph.n_nodes() {
+        return PathList {
+            paths: Vec::new(),
+            truncated: false,
+        };
+    }
     let n = graph.n_nodes();
     // dist[v] = hops from v to `to` (reverse BFS). Any partial path that
     // can't reach `to` within the remaining depth budget is pruned, which
@@ -273,6 +288,9 @@ where
     F: Fn(u32, u32) -> Option<f64>,
 {
     let n = graph.n_nodes();
+    if from as usize >= n || to as usize >= n {
+        return None;
+    }
     let mut dist = vec![f64::INFINITY; n];
     let mut parent = vec![UNVISITED; n];
     let mut heap = BinaryHeap::new();
@@ -333,6 +351,9 @@ pub fn shortest_path_weighted_csr(
         return Some((vec![from], 0.0));
     }
     let n = graph.n_nodes() as usize;
+    if from as usize >= n || to as usize >= n {
+        return None;
+    }
     let mut dist = vec![f64::INFINITY; n];
     let mut parent = vec![UNVISITED; n];
     let mut heap = BinaryHeap::new();

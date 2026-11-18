@@ -123,11 +123,14 @@ impl<'a, 'b> Merger<'a, 'b> {
 impl<'a> View<'a> {
     /// Node id for `name`, or `None`. Delta-added names shadow base names:
     /// a name re-added after removal resolves to its newest incarnation.
+    /// Tombstoned (removed) nodes never resolve.
     pub fn node_id(&self, name: &str) -> Option<u32> {
         if let Some(id) = self.delta.added_id(name) {
-            return Some(id);
+            return (!self.delta.removed.contains(&id)).then_some(id);
         }
-        self.base.and_then(|b| b.node_id(name))
+        self.base
+            .and_then(|b| b.node_id(name))
+            .filter(|id| !self.delta.removed.contains(id))
     }
 
     /// Node name as `&str` (avoids the `String` alloc of the trait method).
