@@ -3,3 +3,5 @@
 *.strandb
 /APP_LAYOUT.md
 /meta*.json
+/commands_for_test.md
+

@@ -4,7 +4,8 @@
 //! runs the `strand-core` analyses on a merged read view. Read-only: store
 //! writes stay in the library/CLI domain for now.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 use eframe::egui;
 use strand_core::algo::{self, Dir};
@@ -86,6 +87,8 @@ struct StrandApp {
     // Last analysis output.
     report_title: String,
     report_lines: Vec<ReportRow>,
+    /// Substring filter applied to the report list.
+    report_filter: String,
 
     /// All node names, sorted — powers the A/B autocomplete.
     names: Vec<String>,
@@ -106,6 +109,16 @@ struct StrandApp {
     /// View transform: world->screen is `rect.min + pan + world * zoom`.
     zoom: f32,
     pan: egui::Vec2,
+    /// Force-directed layout for the focused neighborhood.
+    organic: bool,
+    /// Latest layout worker result channel (generation-tagged).
+    layout_rx: Option<Receiver<(u64, Vec<(f32, f32)>)>>,
+    /// Node ids matching `layout_rx` result order.
+    layout_ids: Vec<u32>,
+    /// Per-node (super-node idx, x-offset, y-offset) when SCCs were
+    /// collapsed for the layout; empty = coords align 1:1 with ids.
+    layout_map: Vec<(u32, f32, f32)>,
+    layout_gen: u64,
 }
 
 const MAX_VIZ_NODES: usize = 100_000;
@@ -116,6 +129,12 @@ const NODE_CIRCLE_MAX: usize = 8_000;
 /// Above this many edges we only draw edges touching the highlight set.
 const EDGE_DRAW_MAX: usize = 150_000;
 const MAX_REPORT_LINES: usize = 5_000;
+/// Neighborhood size cap for the force-directed layout (O(n²) per iter).
+const MAX_LAYOUT_NODES: usize = 1_500;
+/// BFS hops included in the layout neighborhood.
+const LAYOUT_DEPTH: u32 = 3;
+/// Fruchterman-Reingold iterations (deterministic, single-threaded).
+const LAYOUT_ITERS: usize = 100;
 
 /// One line in the report panel; `node` makes the row clickable (sets A).
 struct ReportRow {
@@ -130,6 +149,109 @@ fn row(text: impl Into<String>) -> ReportRow {
     }
 }
 
+/// Fruchterman-Reingold layout, deterministic (no RNG, single-threaded).
+/// `start`/`edges` use local indices; returns unit-ish coords centered ~0.
+fn force_layout(start: &[(f32, f32)], edges: &[(u32, u32)]) -> Vec<(f32, f32)> {
+    let n = start.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Normalize start positions into a centered unit box.
+    let (mut minx, mut miny, mut maxx, mut maxy) =
+        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(x, y) in start {
+        minx = minx.min(x);
+        miny = miny.min(y);
+        maxx = maxx.max(x);
+        maxy = maxy.max(y);
+    }
+    let cx = (minx + maxx) / 2.0;
+    let cy = (miny + maxy) / 2.0;
+    let span = (maxx - minx).max(maxy - miny).max(1e-3);
+    let mut pos: Vec<(f32, f32)> = start
+        .iter()
+        .map(|&(x, y)| ((x - cx) / span, (y - cy) / span))
+        .collect();
+
+    let k = (1.0f32 / n as f32).sqrt() * 0.75;
+    let k2 = k * k;
+    let mut temp = 0.08f32;
+    let mut disp = vec![(0.0f32, 0.0f32); n];
+    for _ in 0..LAYOUT_ITERS {
+        for d in disp.iter_mut() {
+            *d = (0.0, 0.0);
+        }
+        // Repulsion between all pairs.
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dx = pos[i].0 - pos[j].0;
+                let dy = pos[i].1 - pos[j].1;
+                let d = (dx * dx + dy * dy + 1e-6).sqrt();
+                // Standard FR: force magnitude k^2/d along unit direction.
+                let mag = k2 / d;
+                let ux = dx / d;
+                let uy = dy / d;
+                disp[i].0 += ux * mag;
+                disp[i].1 += uy * mag;
+                disp[j].0 -= ux * mag;
+                disp[j].1 -= uy * mag;
+            }
+        }
+        // Attraction along edges.
+        for &(a, b) in edges {
+            let (a, b) = (a as usize, b as usize);
+            let dx = pos[b].0 - pos[a].0;
+            let dy = pos[b].1 - pos[a].1;
+            let d = (dx * dx + dy * dy + 1e-6).sqrt();
+            let mag = d * d / k;
+            let ux = dx / d;
+            let uy = dy / d;
+            disp[a].0 += ux * mag;
+            disp[a].1 += uy * mag;
+            disp[b].0 -= ux * mag;
+            disp[b].1 -= uy * mag;
+        }
+        // Apply displacements capped by temperature, then cool.
+        // Early-stop once the largest move is negligible.
+        let mut max_step = 0.0f32;
+        for i in 0..n {
+            let (dx, dy) = disp[i];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 1e-9 {
+                let step = len.min(temp);
+                max_step = max_step.max(step);
+                let s = step / len;
+                pos[i].0 += dx * s;
+                pos[i].1 += dy * s;
+            }
+        }
+        temp *= 0.97;
+        if max_step < 0.0005 {
+            break;
+        }
+    }
+    pos
+}
+
+/// Nearest node id within 10px of screen point `pt`.
+fn nearest_node(
+    pos: &[(f32, f32)],
+    pan: egui::Vec2,
+    zoom: f32,
+    origin: egui::Pos2,
+    pt: egui::Pos2,
+) -> Option<u32> {
+    let mut best: Option<(u32, f32)> = None;
+    for (i, &p) in pos.iter().enumerate() {
+        let sp = origin + pan + egui::vec2(p.0 * zoom, p.1 * zoom);
+        let d = sp.distance(pt);
+        if d <= 10.0 && best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((i as u32, d));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
 fn row_node(text: impl Into<String>, id: u32, name: String) -> ReportRow {
     ReportRow {
         text: text.into(),
@@ -141,6 +263,11 @@ fn row_node(text: impl Into<String>, id: u32, name: String) -> ReportRow {
 /// trait returns `usize`, so always go through the trait.
 fn nn<G: GraphView + ?Sized>(g: &G) -> usize {
     g.n_nodes()
+}
+
+/// Uniform edge count (same u64/usize split as `nn`).
+fn ne<G: GraphView + ?Sized>(g: &G) -> usize {
+    g.n_edges()
 }
 
 /// Uniform node name (trait method returns `String` on both backends).
@@ -164,6 +291,7 @@ impl StrandApp {
             top_n: "20".to_string(),
             report_title: String::new(),
             report_lines: Vec::new(),
+            report_filter: String::new(),
             names: Vec::new(),
             viz_nodes: 0,
             viz_edges: 0,
@@ -175,6 +303,11 @@ impl StrandApp {
             canvas_size: egui::Vec2::ZERO,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
+            organic: true,
+            layout_rx: None,
+            layout_ids: Vec::new(),
+            layout_map: Vec::new(),
+            layout_gen: 0,
         }
     }
 
@@ -191,7 +324,8 @@ impl StrandApp {
                 self.backend = Some(Backend::File(g));
                 self.reset_query_state();
                 self.collect_names();
-                self.status = "opened".to_string();
+                let w = self.cap_warning();
+                self.status = w.unwrap_or_else(|| "opened".to_string());
             }
             Err(e) => self.status = format!("open failed: {e}"),
         }
@@ -222,10 +356,25 @@ impl StrandApp {
                 self.backend = Some(Backend::Store(s));
                 self.reset_query_state();
                 self.collect_names();
-                self.status = "opened".to_string();
+                let w = self.cap_warning();
+                self.status = w.unwrap_or_else(|| "opened".to_string());
             }
             Err(e) => self.status = format!("open failed: {e}"),
         }
+    }
+
+    /// Unload the current graph/store and return to the empty state.
+    fn close_graph(&mut self) {
+        self.backend = None;
+        self.source_label = "no graph open - File -> Open...".to_string();
+        self.status = "closed".to_string();
+        self.reset_query_state();
+        self.pos.clear();
+        self.edge_ids.clear();
+        self.viz_nodes = 0;
+        self.viz_edges = 0;
+        self.zoom = 1.0;
+        self.pan = egui::Vec2::ZERO;
     }
 
     fn reset_query_state(&mut self) {
@@ -235,10 +384,29 @@ impl StrandApp {
         self.sel_b = None;
         self.report_lines.clear();
         self.report_title.clear();
+        self.report_filter.clear();
         self.names.clear();
         self.highlight.clear();
         self.depths.clear();
         self.viz_dirty = true;
+    }
+
+    /// Warn when the graph exceeds canvas caps — the view is then only a
+    /// sample (queries still cover the full graph).
+    fn cap_warning(&mut self) -> Option<String> {
+        with_view!(self, |v| {
+            let n = nn(v);
+            let e = ne(v);
+            if n > MAX_VIZ_NODES || e > MAX_VIZ_EDGES {
+                Some(format!(
+                    "warning: {n} nodes / {e} edges exceeds canvas caps \
+                     ({MAX_VIZ_NODES} nodes / {MAX_VIZ_EDGES} edges) — \
+                     canvas shows a partial sample; analyses cover everything"
+                ))
+            } else {
+                None
+            }
+        })
     }
 
     /// Snapshot every node name (sorted, deduped) for autocomplete. Skipped
@@ -309,6 +477,7 @@ impl StrandApp {
             Some(id) => {
                 if which == 0 {
                     self.sel_a = Some(id);
+                    self.focus_a();
                 } else {
                     self.sel_b = Some(id);
                 }
@@ -331,6 +500,7 @@ impl StrandApp {
         }
         self.report_title = title;
         self.report_lines = lines;
+        self.report_filter.clear();
     }
 
     // ---- analyses ----
@@ -391,6 +561,25 @@ impl StrandApp {
         });
         self.highlight_from_depths(a, Dir::In, depth);
         self.set_report(format!("impact of node {a} (who depends on it)"), lines);
+    }
+
+    /// Re-layout around the selected node: BFS a few hops in both
+    /// directions so its neighborhood clusters into view. Does not touch
+    /// the highlight set (that's analyses-only).
+    fn focus_a(&mut self) {
+        let Some(a) = self.sel_a else { return };
+        self.depths = with_view!(self, |v| {
+            let out = algo::bfs(v, &[a], Dir::Out, Some(3));
+            let inn = algo::bfs(v, &[a], Dir::In, Some(3));
+            out.iter()
+                .zip(inn.iter())
+                .map(|(&x, &y)| match (x, y) {
+                    (algo::UNVISITED, d) | (d, algo::UNVISITED) => d,
+                    (x, y) => x.min(y),
+                })
+                .collect()
+        });
+        self.viz_dirty = true;
     }
 
     /// Recompute depths for the ring layout and store the affected set.
@@ -671,12 +860,176 @@ impl StrandApp {
                 self.pos[i] = (cx + r * ang.cos(), cy + r * ang.sin());
             }
         }
+        self.maybe_start_layout();
+    }
+
+    /// Kick off a force-directed layout for the focused neighborhood
+    /// (nodes within LAYOUT_DEPTH hops of the last analysis/selection),
+    /// capped at MAX_LAYOUT_NODES. Runs on a worker thread; results are
+    /// generation-tagged so stale layouts are dropped.
+    fn maybe_start_layout(&mut self) {
+        if !self.organic || self.depths.is_empty() {
+            return;
+        }
+        // Candidates: drawn nodes within the hop limit, nearest first.
+        let mut cand: Vec<(u32, u32)> = Vec::new(); // (depth, id)
+        for id in 0..self.pos.len().min(self.depths.len()) as u32 {
+            let d = self.depths[id as usize];
+            if d != algo::UNVISITED && d <= LAYOUT_DEPTH {
+                cand.push((d, id));
+            }
+        }
+        if cand.len() < 8 {
+            return;
+        }
+        cand.sort_by_key(|&(d, _)| d);
+        let total = cand.len();
+        cand.truncate(MAX_LAYOUT_NODES);
+        self.layout_ids = cand.iter().map(|&(_, id)| id).collect();
+
+        let mut idx = HashMap::with_capacity(cand.len());
+        for (i, &(_, id)) in cand.iter().enumerate() {
+            idx.insert(id, i as u32);
+        }
+        let mut start = Vec::with_capacity(cand.len());
+        for &(_, id) in &cand {
+            start.push(self.pos[id as usize]);
+        }
+        let edges = with_view!(self, |v| {
+            let mut e = Vec::new();
+            for (i, &(_, gid)) in cand.iter().enumerate() {
+                v.out_edges(gid, &mut |t| {
+                    if let Some(&lt) = idx.get(&t) {
+                        e.push((i as u32, lt));
+                    }
+                });
+            }
+            e
+        });
+
+        // Collapse SCCs inside the neighborhood: mutually-dependent nodes
+        // are laid out as one super-node, then re-expanded with a tiny
+        // deterministic offset so members don't perfectly overlap.
+        let n_loc = cand.len();
+        let mut pg = petgraph::graph::DiGraph::<(), ()>::new();
+        for _ in 0..n_loc {
+            pg.add_node(());
+        }
+        for &(a, b) in &edges {
+            pg.add_edge(
+                petgraph::graph::NodeIndex::new(a as usize),
+                petgraph::graph::NodeIndex::new(b as usize),
+                (),
+            );
+        }
+        let sccs = petgraph::algo::tarjan_scc(&pg);
+        let mut layout_map: Vec<(u32, f32, f32)> = Vec::new();
+        let (w_start, w_edges) = if sccs.len() == n_loc {
+            (start, edges)
+        } else {
+            let mut comp_of = vec![0u32; n_loc];
+            let mut rank_of = vec![0u32; n_loc];
+            let mut size_of = vec![0u32; sccs.len()];
+            for (si, scc) in sccs.iter().enumerate() {
+                size_of[si] = scc.len() as u32;
+                for (rank, ni) in scc.iter().enumerate() {
+                    comp_of[ni.index()] = si as u32;
+                    rank_of[ni.index()] = rank as u32;
+                }
+            }
+            let ns = sccs.len();
+            let mut sstart = vec![(0f32, 0f32); ns];
+            let mut scount = vec![0f32; ns];
+            for i in 0..n_loc {
+                let c = comp_of[i] as usize;
+                sstart[c].0 += start[i].0;
+                sstart[c].1 += start[i].1;
+                scount[c] += 1.0;
+            }
+            for c in 0..ns {
+                sstart[c].0 /= scount[c];
+                sstart[c].1 /= scount[c];
+            }
+            let mut seset: HashSet<(u32, u32)> = HashSet::new();
+            for &(a, b) in &edges {
+                let (ca, cb) = (comp_of[a as usize], comp_of[b as usize]);
+                if ca != cb {
+                    seset.insert((ca.min(cb), ca.max(cb)));
+                }
+            }
+            layout_map = (0..n_loc)
+                .map(|i| {
+                    let c = comp_of[i] as usize;
+                    let r = rank_of[i] as f32;
+                    let ang = r * 2.399_963;
+                    // Bigger components spread wider (still tiny).
+                    let rad = 0.003 * (size_of[c] as f32).sqrt().min(4.0);
+                    (comp_of[i], rad * ang.cos(), rad * ang.sin())
+                })
+                .collect();
+            (sstart, seset.into_iter().collect())
+        };
+        self.layout_map = layout_map;
+
+        self.layout_gen += 1;
+        let gen = self.layout_gen;
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let res = force_layout(&w_start, &w_edges);
+            let _ = tx.send((gen, res));
+        });
+        self.layout_rx = Some(rx);
+        self.status = format!(
+            "organizing {} of {} nodes…",
+            self.layout_ids.len(),
+            total
+        );
+    }
+
+    /// Apply a finished layout result if it's still current.
+    fn poll_layout(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.layout_rx else { return };
+        match rx.try_recv() {
+            Ok((gen, coords)) if gen == self.layout_gen => {
+                let ids = std::mem::take(&mut self.layout_ids);
+                let w = self.canvas_size.x.max(400.0);
+                let h = self.canvas_size.y.max(300.0);
+                let (cx, cy) = (w / 2.0, h / 2.0);
+                let s = w.min(h) * 0.7;
+                for (i, &id) in ids.iter().enumerate() {
+                    // With SCC collapse, coords are per super-node; map
+                    // back through layout_map (comp idx + micro-offset).
+                    let xy = if self.layout_map.is_empty() {
+                        coords.get(i).copied()
+                    } else {
+                        self.layout_map.get(i).and_then(|&(c, ox, oy)| {
+                            coords.get(c as usize).map(|&(x, y)| (x + ox, y + oy))
+                        })
+                    };
+                    if let Some((x, y)) = xy {
+                        let p = id as usize;
+                        if p < self.pos.len() {
+                            self.pos[p] = (cx + x * s, cy + y * s);
+                        }
+                    }
+                }
+                self.layout_rx = None;
+                self.status = format!("organic layout: {} nodes", ids.len());
+                ctx.request_repaint();
+            }
+            Ok(_) => self.layout_rx = None, // stale generation
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(TryRecvError::Disconnected) => self.layout_rx = None,
+        }
     }
 
     fn paint_canvas(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         if self.viz_dirty {
             self.rebuild_viz();
         }
+        self.poll_layout(ui.ctx());
         let response = ui.interact(
             rect,
             ui.id().with("graph_canvas"),
@@ -689,7 +1042,7 @@ impl StrandApp {
         if scroll != 0.0 && hover.is_some_and(|p| rect.contains(p)) {
             let cursor = hover.unwrap();
             let factor = if scroll > 0.0 { 1.15 } else { 1.0 / 1.15 };
-            let new_zoom = (self.zoom * factor).clamp(0.05, 40.0);
+            let new_zoom = (self.zoom * factor).clamp(0.05, 200.0);
             // Keep the world point under the cursor stationary.
             let world = (cursor - rect.min - self.pan) / self.zoom;
             self.pan = cursor - rect.min - world * new_zoom;
@@ -701,7 +1054,7 @@ impl StrandApp {
         // Trackpad pinch / ctrl+scroll zooms around the viewport center.
         let zd = ui.input(|i| i.zoom_delta());
         if (zd - 1.0).abs() > 0.001 {
-            let new_zoom = (self.zoom * zd).clamp(0.05, 40.0);
+            let new_zoom = (self.zoom * zd).clamp(0.05, 200.0);
             let center = rect.center();
             let world = (center - rect.min - self.pan) / self.zoom;
             self.pan = center - rect.min - world * new_zoom;
@@ -711,24 +1064,12 @@ impl StrandApp {
             self.zoom = 1.0;
             self.pan = egui::Vec2::ZERO;
         }
-        // Nearest node within 10px of a screen point (canvas coords -> px).
-        let nearest = |pt: egui::Pos2| -> Option<u32> {
-            let mut best: Option<(u32, f32)> = None;
-            for (i, &p) in self.pos.iter().enumerate() {
-                let sp = rect.min
-                    + self.pan
-                    + egui::vec2(p.0 * self.zoom, p.1 * self.zoom);
-                let d = sp.distance(pt);
-                if d <= 10.0 && best.map_or(true, |(_, bd)| d < bd) {
-                    best = Some((i as u32, d));
-                }
-            }
-            best.map(|(id, _)| id)
-        };
         // Click a node to select it: click = A, shift+click = B.
         if response.clicked() {
             if let Some(click) = ui.input(|i| i.pointer.interact_pos()) {
-                if let Some(id) = nearest(click) {
+                if let Some(id) =
+                    nearest_node(&self.pos, self.pan, self.zoom, rect.min, click)
+                {
                     let name = with_view!(self, |v| nm(v, id));
                     if ui.input(|i| i.modifiers.shift) {
                         self.sel_b = Some(id);
@@ -736,6 +1077,7 @@ impl StrandApp {
                     } else {
                         self.sel_a = Some(id);
                         self.node_a = name;
+                        self.focus_a();
                     }
                     self.status = format!("selected node {id} on canvas");
                     self.viz_dirty = true;
@@ -751,33 +1093,71 @@ impl StrandApp {
         };
 
         // Edges. LOD: past EDGE_DRAW_MAX only edges touching the
-        // highlight/selection are drawn.
+        // highlight/selection are drawn. Three tiers, drawn back-to-front:
+        //   0 = cold (dim gray)
+        //   1 = touches the highlighted set (amber)
+        //   2 = touches the A/B selection (bright yellow + glow)
+        // Hot tiers get a dark underlay stroke so they stay readable over
+        // the hairball.
         let draw_all = self.edge_ids.len() <= EDGE_DRAW_MAX;
-        for &(s, t) in &self.edge_ids {
-            let hot = self.highlight.contains(&s)
-                || self.highlight.contains(&t)
-                || Some(s) == self.sel_a
-                || Some(s) == self.sel_b
-                || Some(t) == self.sel_a
-                || Some(t) == self.sel_b;
-            if !draw_all && !hot {
+        let tiers: Vec<u8> = self
+            .edge_ids
+            .iter()
+            .map(|&(s, t)| {
+                if Some(s) == self.sel_a
+                    || Some(s) == self.sel_b
+                    || Some(t) == self.sel_a
+                    || Some(t) == self.sel_b
+                {
+                    2
+                } else if self.highlight.contains(&s) || self.highlight.contains(&t) {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect();
+        // If the highlighted set touches too many edges, drawing them all
+        // just repaints the hairball — skip tier 1 entirely (nodes stay
+        // highlighted; only selection edges remain). Tier 2 always draws.
+        let draw_tier1 = tiers.iter().filter(|&&t| t == 1).count() <= 20_000;
+        // Batch into a handful of Shape::Vec draws instead of one painter
+        // shape per edge: [cold, t1 outline, t1 core, t2 outline, t2 core].
+        let mut groups: [Vec<egui::Shape>; 5] = Default::default();
+        let group_strokes = [
+            egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+            egui::Stroke::new(2.2, egui::Color32::from_black_alpha(230)),
+            egui::Stroke::new(1.1, egui::Color32::from_rgb(235, 160, 50)),
+            egui::Stroke::new(3.0, egui::Color32::from_black_alpha(230)),
+            egui::Stroke::new(1.6, egui::Color32::from_rgb(255, 225, 80)),
+        ];
+        for (i, &(s, t)) in self.edge_ids.iter().enumerate() {
+            let tr = tiers[i];
+            if (tr == 1 && !draw_tier1) || (!draw_all && tr == 0) {
                 continue;
             }
-            let (Some(&ps), Some(&pt)) = (self.pos.get(s as usize), self.pos.get(t as usize))
+            let (Some(&ps), Some(&pt)) =
+                (self.pos.get(s as usize), self.pos.get(t as usize))
             else {
                 continue;
             };
-            painter.line_segment(
-                [to_screen(ps), to_screen(pt)],
-                egui::Stroke::new(
-                    1.0,
-                    if hot {
-                        egui::Color32::from_rgb(120, 90, 40)
-                    } else {
-                        egui::Color32::from_gray(60)
-                    },
-                ),
-            );
+            let seg = [to_screen(ps), to_screen(pt)];
+            match tr {
+                0 => groups[0].push(egui::Shape::line_segment(seg, group_strokes[0])),
+                1 => {
+                    groups[1].push(egui::Shape::line_segment(seg, group_strokes[1]));
+                    groups[2].push(egui::Shape::line_segment(seg, group_strokes[2]));
+                }
+                _ => {
+                    groups[3].push(egui::Shape::line_segment(seg, group_strokes[3]));
+                    groups[4].push(egui::Shape::line_segment(seg, group_strokes[4]));
+                }
+            }
+        }
+        for group in groups {
+            if !group.is_empty() {
+                painter.add(egui::Shape::Vec(group));
+            }
         }
 
         // Nodes. LOD: small graphs get circles; large graphs get cheap
@@ -793,9 +1173,17 @@ impl StrandApp {
             } else {
                 egui::Color32::from_rgb(90, 110, 160)
             };
+            // Dark halo behind each node so it stays visible through edges.
+            let halo = egui::Color32::from_gray(24);
             if detail {
+                painter.circle_filled(c, 5.0, halo);
                 painter.circle_filled(c, 3.5, color);
             } else {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(c, egui::vec2(5.0, 5.0)),
+                    0.0,
+                    halo,
+                );
                 painter.rect_filled(
                     egui::Rect::from_center_size(c, egui::vec2(3.0, 3.0)),
                     0.0,
@@ -807,7 +1195,9 @@ impl StrandApp {
         // Hover tooltip: name + degrees for the node under the cursor.
         if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
             if rect.contains(hover) {
-                if let Some(id) = nearest(hover) {
+                if let Some(id) =
+                    nearest_node(&self.pos, self.pan, self.zoom, rect.min, hover)
+                {
                     let name = with_view!(self, |v| nm(v, id));
                     let (outd, ind) =
                         with_view!(self, |v| (v.out_degree(id), v.in_degree(id)));
@@ -873,6 +1263,9 @@ impl eframe::App for StrandApp {
                 }
                 if ui.button("Open store...").clicked() {
                     self.open_store();
+                }
+                if ui.button("Close").clicked() {
+                    self.close_graph();
                 }
                 ui.separator();
                 ui.label(&self.source_label);
@@ -951,6 +1344,7 @@ impl eframe::App for StrandApp {
                                 } else {
                                     self.sel_a = Some(id);
                                     self.node_a = name.clone();
+                                    self.focus_a();
                                 }
                                 self.status = format!("'{name}' -> node {id}");
                                 self.viz_dirty = true;
@@ -1020,8 +1414,33 @@ impl eframe::App for StrandApp {
 
                 ui.add_space(12.0);
                 ui.heading("Graph");
-                if ui.button("Rebuild view").clicked() {
+                ui.horizontal(|ui| {
+                    if ui.button("Rebuild view").clicked() {
+                        self.viz_dirty = true;
+                    }
+                    if ui.button("Clear highlight").clicked() {
+                        self.highlight.clear();
+                        self.depths.clear();
+                        self.sel_a = None;
+                        self.sel_b = None;
+                        self.node_a.clear();
+                        self.node_b.clear();
+                        self.layout_rx = None;
+                        self.layout_ids.clear();
+                        self.layout_map.clear();
+                        self.viz_dirty = true;
+                        self.status = "cleared".to_string();
+                    }
+                });
+                if ui
+                    .checkbox(&mut self.organic, "organic layout")
+                    .changed()
+                    && !self.organic
+                {
                     self.viz_dirty = true;
+                }
+                if self.layout_rx.is_some() {
+                    ui.label("organizing layout…");
                 }
                 ui.label(format!("{} nodes | {} edges drawn", self.viz_nodes, self.viz_edges));
 
@@ -1052,10 +1471,30 @@ impl eframe::App for StrandApp {
         egui::Panel::bottom("report")
             .default_size(180.0)
             .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("filter:");
+                    ui.text_edit_singleline(&mut self.report_filter);
+                    let q = self.report_filter.trim().to_lowercase();
+                    let (shown, total) = if q.is_empty() {
+                        (self.report_lines.len(), self.report_lines.len())
+                    } else {
+                        let s = self
+                            .report_lines
+                            .iter()
+                            .filter(|r| r.text.to_lowercase().contains(&q))
+                            .count();
+                        (s, self.report_lines.len())
+                    };
+                    ui.label(format!("{shown} of {total}"));
+                });
                 ui.heading(&self.report_title);
+                let q = self.report_filter.trim().to_lowercase();
                 let mut pick: Option<(u32, String)> = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for r in &self.report_lines {
+                        if !q.is_empty() && !r.text.to_lowercase().contains(&q) {
+                            continue;
+                        }
                         if let Some((id, name)) = &r.node {
                             // Clickable: selects the node as A.
                             if ui
@@ -1072,6 +1511,7 @@ impl eframe::App for StrandApp {
                 if let Some((id, name)) = pick {
                     self.sel_a = Some(id);
                     self.node_a = name;
+                    self.focus_a();
                     self.viz_dirty = true;
                 }
             });

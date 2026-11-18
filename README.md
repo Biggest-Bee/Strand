@@ -225,21 +225,35 @@ also works from any directory.
 
 - **Open .strand…** loads an immutable graph; **Open store…** loads a
   `.strandb` directory (read-write if the lock is free, read-only
-  otherwise — analyses work identically on the merged view).
-- Pick nodes A and B — the boxes autocomplete as you type (up to 8
-  case-insensitive substring matches; the index is skipped on graphs over
-  200k nodes) — then run **Deps**, **Impact**, **Why A->B**,
-  **Cycles**, **Build order**, **Roots**, **Leaves**, **Top** (in-degree /
-  impact / pagerank), and **Common deps/impact** — all with an optional
-  depth limit.
-- Report rows that name a single node are clickable: clicking one selects
-  it as node A, so you can walk the graph (e.g. click an impacted
-  dependent, then re-run Impact).
-- The canvas draws the graph (ring layout by BFS depth after an
-  impact/deps run, golden-angle scatter otherwise), highlighting the
-  affected set. It handles up to 100k nodes / 300k edges: past 8k nodes
-  it switches to cheap square markers, and past 150k edges it only draws
-  edges touching the highlighted set.
+  otherwise — analyses work identically on the merged view); **Close**
+  unloads the current graph.
+- Pick nodes A and B three ways: the boxes autocomplete as you type (up
+  to 8 case-insensitive substring matches; the index is skipped on graphs
+  over 200k nodes), **click a node on the canvas** (click = A,
+  shift+click = B), or browse every name in the **Browse nodes** panel
+  (same click/shift+click rules). Then run **Deps**, **Impact**,
+  **Why A->B**, **Cycles**, **Build order**, **Roots**, **Leaves**,
+  **Top** (in-degree / impact / pagerank), and **Common deps/impact** —
+  all with an optional depth limit.
+- The bottom report panel lists full results — even ones too large to
+  draw — with a **filter box** (case-insensitive substring, shows
+  "shown of total") and clickable rows that re-select a node as A.
+- The canvas draws the graph and supports **scroll/pinch zoom** (up to
+  200×, toward the cursor), **drag pan**, and **double-click reset**.
+  Hovering a node shows its name and dep/dependent counts.
+- After an impact/deps run the canvas switches to **ring layout by BFS
+  depth**; selecting a node alone also clusters its 3-hop neighborhood.
+  The **organic layout** toggle runs a deterministic force-directed
+  layout on that neighborhood (SCCs collapsed to super-nodes, computed
+  on a worker thread); **Clear highlight** resets selections, rings, and
+  layout back to the scatter view.
+- Edges are tiered: edges touching your A/B selection draw bright yellow
+  with a black outline on top, highlight-set edges amber, everything
+  else dim. On huge highlight sets the middle tier is skipped so the
+  canvas stays readable — the report list still has every node.
+- It handles up to 100k nodes / 300k edges: past 8k nodes it switches to
+  cheap square markers, and opening a larger file shows a warning that
+  the canvas is a partial sample (analyses always cover the full graph).
 - **Large files may feel sluggish** — especially with `cargo run` (a
   debug build) or graphs near the 100k-node canvas cap: layout,
   hit-testing, and repaints all run on the UI thread. For big graphs,

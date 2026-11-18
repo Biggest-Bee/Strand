@@ -3545,6 +3545,7 @@ version = "0.2.0"
 dependencies = [
  "eframe",
  "egui",
+ "petgraph",
  "rfd",
  "serde_json",
  "strand-core",
