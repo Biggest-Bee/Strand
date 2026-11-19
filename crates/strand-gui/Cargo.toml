@@ -1,6 +1,6 @@
 [package]
 name = "strand-gui"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Desktop GUI for Strand dependency/impact analysis (eframe/egui)"
 license = "Apache-2.0"
