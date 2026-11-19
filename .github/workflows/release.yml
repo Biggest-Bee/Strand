@@ -123,9 +123,9 @@ jobs:
           # runners are scarce; two legs doubled the queue wait.
           - os: macos-latest
             artifact: strand-aarch64-apple-darwin
-            archives: |
-              strand-aarch64-apple-darwin.tar.gz
-              strand-x86_64-apple-darwin.tar.gz
+            # Space-separated, single line — a multi-line value breaks
+            # the `for a in ...` word list in the extract step.
+            archives: strand-aarch64-apple-darwin.tar.gz strand-x86_64-apple-darwin.tar.gz
             rosetta: x86_64
     runs-on: ${{ matrix.os }}
     steps:
