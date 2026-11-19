@@ -62,10 +62,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          cargo build --release --locked -p strand-cli -p strand-app --target ${{ matrix.target }}
+          cargo build --release --locked -p strand-cli -p strand-gui --target ${{ matrix.target }}
           for t in $EXTRA_TARGETS; do
             [ -z "$t" ] && continue
-            cargo build --release --locked -p strand-cli -p strand-app --target "$t"
+            cargo build --release --locked -p strand-cli -p strand-gui --target "$t"
           done
 
       - name: Package
@@ -77,14 +77,14 @@ jobs:
             local t="$1"
             if [ "${{ matrix.archive }}" = "zip" ]; then
               cp "target/$t/release/strand.exe" dist/
-              cp "target/$t/release/strand-app.exe" dist/
-              (cd dist && 7z a "strand-$t.zip" strand.exe strand-app.exe)
-              rm dist/strand.exe dist/strand-app.exe
+              cp "target/$t/release/strand-gui.exe" dist/
+              (cd dist && 7z a "strand-$t.zip" strand.exe strand-gui.exe)
+              rm dist/strand.exe dist/strand-gui.exe
             else
               cp "target/$t/release/strand" dist/
-              cp "target/$t/release/strand-app" dist/
-              tar -czf "dist/strand-$t.tar.gz" -C dist strand strand-app
-              rm dist/strand dist/strand-app
+              cp "target/$t/release/strand-gui" dist/
+              tar -czf "dist/strand-$t.tar.gz" -C dist strand strand-gui
+              rm dist/strand dist/strand-gui
             fi
           }
           pkg_one "${{ matrix.target }}"
@@ -101,7 +101,7 @@ jobs:
 
   # Download each archive back and actually run the binary — proves the
   # artifact launches on its target OS, not just that it compiled.
-  # strand-app is a GUI and can't run headless; the CLI covers the
+  # strand-gui is a GUI and can't run headless; the CLI covers the
   # shared strand-core/strand-import code paths.
   smoke:
     needs: build

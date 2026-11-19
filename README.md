@@ -45,7 +45,7 @@ crates/
   strand-import/    importers (cargo metadata JSON, CSV/TSV edge lists)
   strand-cli/       the `strand` binary
   strand-store/     embeddable read-write store (base + WAL delta)
-  strand-app/       desktop GUI (eframe/egui) for browsing + analysis
+  strand-gui/       desktop GUI (eframe/egui) for browsing + analysis
 docs/
   FORMAT.md         binary format spec (normative, .strand + .strandb)
 testdata/           sample graphs used by tests and docs
@@ -58,7 +58,7 @@ Tests live in each crate's `tests/` directory (see [Testing](#testing)).
 **Prebuilt binaries** — grab the archive for your platform from
 [Releases](https://github.com/Biggest-Bee/Strand/releases) and verify it
 against `SHA256SUMS.txt`. Each archive contains `strand` (CLI) and
-`strand-app` (desktop GUI).
+`strand-gui` (desktop GUI).
 
 > The binaries are **unsigned**: Windows SmartScreen ("Windows protected
 > your PC") and macOS Gatekeeper ("cannot be opened because the
@@ -71,8 +71,8 @@ against `SHA256SUMS.txt`. Each archive contains `strand` (CLI) and
 ```console
 cd path/to/Strand
 cargo install --path crates/strand-cli   # the `strand` CLI
-cargo install --path crates/strand-app   # the desktop GUI
-# (once published to crates.io: `cargo install strand-cli strand-app`)
+cargo install --path crates/strand-gui   # the desktop GUI
+# (once published to crates.io: `cargo install strand-cli strand-gui`)
 ```
 
 `cargo install` puts the binaries in `%USERPROFILE%\.cargo\bin`
@@ -209,7 +209,7 @@ db.compact()?;   // fold delta into a fresh base-<epoch>.strand, atomic manifest
 Store layout and the WAL/op encoding are specified in
 [`docs/FORMAT.md`](docs/FORMAT.md#store-directory-format-strandb).
 
-## Desktop app (`strand-app`)
+## Desktop app (`strand-gui`)
 
 A native window (eframe/egui, no webview) for people who'd rather click
 than type. Run it **from the repo root** (cargo needs the workspace
@@ -217,10 +217,10 @@ than type. Run it **from the repo root** (cargo needs the workspace
 
 ```console
 cd path/to/Strand            # the directory containing Cargo.toml
-cargo run -p strand-app      # or: cargo build --release -p strand-app
+cargo run -p strand-gui      # or: cargo build --release -p strand-gui
 ```
 
-Once installed (`cargo install --path crates/strand-app`), `strand-app`
+Once installed (`cargo install --path crates/strand-gui`), `strand-gui`
 also works from any directory.
 
 - **Open .strand…** loads an immutable graph; **Open store…** loads a
@@ -265,7 +265,7 @@ also works from any directory.
 - **Large files may feel sluggish** — especially with `cargo run` (a
   debug build) or graphs near the 100k-node canvas cap: layout,
   hit-testing, and repaints all run on the UI thread. For big graphs,
-  prefer `cargo build --release -p strand-app` (or an installed/release
+  prefer `cargo build --release -p strand-gui` (or an installed/release
   binary); the CLI handles the same analyses far faster regardless of
   size.
 - With a writable store open, the **Edit store** panel commits real
@@ -283,11 +283,11 @@ render it — the GUI is the viewer. To make double-clicking a `.strand`
 file open Strand:
 
 - **Windows**: right-click the file → *Open with* → *Choose another
-  app* → select `strand-app.exe` → tick *Always use this app*.
+  app* → select `strand-gui.exe` → tick *Always use this app*.
 - **macOS**: right-click → *Get Info* → *Open with* → select
-  `strand-app` → *Change All*.
+  `strand-gui` → *Change All*.
 - **Linux**: create a `~/.local/share/applications/strand.desktop`
-  entry with `Exec=/path/to/strand-app %f` and `MimeType=` for the
+  entry with `Exec=/path/to/strand-gui %f` and `MimeType=` for the
   extension, then set it as default for `.strand` files.
 
 Alternatively use **Open .strand…** inside the app.

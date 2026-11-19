@@ -383,12 +383,12 @@ fn scan_own_repo_is_sane() {
     let out = scan_lang(&root, Lang::Rust).unwrap();
     assert!(out.edges.len() > 20, "only {} edges", out.edges.len());
     assert!(out.nodes.iter().all(|n| n.ends_with(".rs")));
-    // strand-app's main.rs uses strand_core::algo/view paths, so it must
+    // strand-gui's main.rs uses strand_core::algo/view paths, so it must
     // resolve into strand-core's module files.
     assert!(out.edges.iter().any(|(s, d, _)| {
-        s == "crates/strand-app/src/main.rs" && d == "crates/strand-core/src/algo/mod.rs"
+        s == "crates/strand-gui/src/main.rs" && d == "crates/strand-core/src/algo/mod.rs"
     }));
     assert!(out.edges.iter().any(|(s, d, _)| {
-        s == "crates/strand-app/src/main.rs" && d == "crates/strand-store/src/lib.rs"
+        s == "crates/strand-gui/src/main.rs" && d == "crates/strand-store/src/lib.rs"
     }));
 }

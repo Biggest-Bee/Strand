@@ -5,7 +5,7 @@ members = [
     "crates/strand-import",
     "crates/strand-cli",
     "crates/strand-store",
-    "crates/strand-app",
+    "crates/strand-gui",
 ]
 
 [workspace.package]
@@ -37,7 +37,7 @@ lto = "thin"
 codegen-units = 1
 
 # Debug builds stay debuggable but deps (egui, wgpu…) get real optimizations
-# so `cargo run -p strand-app` isn't unusable.
+# so `cargo run -p strand-gui` isn't unusable.
 [profile.dev]
 opt-level = 1
 

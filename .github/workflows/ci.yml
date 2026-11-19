@@ -42,4 +42,4 @@ jobs:
           sudo apt-get install -y \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libssl-dev
-      - run: cargo build --release --locked -p strand-cli -p strand-app
+      - run: cargo build --release --locked -p strand-cli -p strand-gui

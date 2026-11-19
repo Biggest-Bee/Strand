@@ -1,4 +1,4 @@
-//! `strand-app`: desktop GUI for Strand dependency/impact analysis.
+//! `strand-gui`: desktop GUI for Strand dependency/impact analysis.
 //!
 //! Opens an immutable `.strand` graph or a read-write `.strandb` store and
 //! runs the `strand-core` analyses on a merged read view. Read-only: store
