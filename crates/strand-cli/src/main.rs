@@ -450,6 +450,9 @@ fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
         ScanLang::All => vec![Lang::Rust, Lang::Python, Lang::Js],
     };
     let scan = strand_import::scan::scan_project(&a.dir, &langs)?;
+    for w in &scan.warnings {
+        eprintln!("warning: {w}");
+    }
     let mut b = GraphBuilder::new();
     for n in &scan.nodes {
         b.add_node(n.clone());

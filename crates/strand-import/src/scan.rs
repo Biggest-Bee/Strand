@@ -6,17 +6,21 @@
 //! (e.g. `crates/strand-core/src/graph.rs`), which keeps builds
 //! deterministic across platforms and names unique.
 //!
-//! This is deliberately a pattern-matching scanner, not a full Rust
-//! parser: it strips comments, finds `mod foo;` declarations and `use`
-//! paths, and resolves them with Rust 2018 path rules. `#[path]`
-//! attributes, macros that expand to modules, and `include!` are not
-//! followed. External crates (`use serde::...`) are ignored.
+//! All three languages are parsed with real parsers: `syn` for Rust,
+//! tree-sitter for Python and JS/TS — comments, string literals, and
+//! broken-code recovery are handled by the grammars, not text matching.
+//! `#[path]` attributes, `include!("...")`, `tsconfig`/`jsconfig`
+//! aliases, and `package.json` `"imports"` are resolved on top.
+//! Macros that expand to modules are not followed. External crates and
+//! node_modules packages are ignored.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use strand_core::{Error, Result};
+use syn::ext::IdentExt;
+use syn::visit::{self, Visit};
 
 use crate::EdgeList;
 
@@ -45,6 +49,9 @@ pub struct ScanOutput {
     pub edges: EdgeList,
     /// All discovered source files as root-relative `/` paths, sorted.
     pub nodes: Vec<String>,
+    /// Non-fatal problems (e.g. files that failed to parse). The graph
+    /// may be incomplete when this is non-empty.
+    pub warnings: Vec<String>,
 }
 
 /// Languages the scanner supports.
@@ -75,14 +82,20 @@ pub fn scan_lang(root: &Path, lang: Lang) -> Result<ScanOutput> {
 pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
     let mut edges = EdgeList::new();
     let mut nodes = Vec::new();
+    let mut warnings = Vec::new();
     for &lang in langs {
         let out = scan_lang(root, lang)?;
         edges.extend(out.edges);
         nodes.extend(out.nodes);
+        warnings.extend(out.warnings);
     }
     nodes.sort();
     nodes.dedup();
-    Ok(ScanOutput { edges, nodes })
+    Ok(ScanOutput {
+        edges,
+        nodes,
+        warnings,
+    })
 }
 
 fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
@@ -93,40 +106,34 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
     let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
     let crates = crate_map(root, &names);
     let mut edges: EdgeList = Vec::new();
+    let mut warnings = Vec::new();
 
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
             .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        // `lex_rs` produces two views: `clean` (comments stripped, string
-        // contents kept for `#[path]`/`include!`) and `masked` (string
-        // contents blanked, positions preserved) for `mod`/`use` scanning
-        // so tokens inside literals can't create phantom edges.
-        let (clean, masked) = lex_rs(&text);
+        // Real parse via syn: comments, string/char/raw literals, and
+        // grouped `use` trees are handled by the grammar, not text
+        // matching. A file that fails to parse contributes no edges and
+        // is reported in `warnings` — the graph may be incomplete.
+        let refs = match parse_rs_refs(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                let first = msg.lines().next().unwrap_or(&msg);
+                warnings.push(format!("{rel}: {first}"));
+                continue;
+            }
+        };
         let mut deps: BTreeSet<String> = BTreeSet::new();
 
         // `mod foo;` declarations -> foo.rs or foo/mod.rs under this
-        // file's module directory. A preceding `#[path = "..."]`
-        // attribute overrides the location.
+        // file's module directory. `#[path = "..."]` comes straight from
+        // the item's attributes — no proximity guessing.
         let mdir = module_dir_rel(rel);
-        let attrs = path_attrs(&clean);
-        for (idx, seg) in mod_decls(&masked) {
-            // The attribute applies only if nothing item-like sits
-            // between it and this `mod` (no `;`, `{`, `}`).
-            let custom = attrs
-                .iter()
-                .rev()
-                .find(|(_, ae, _)| {
-                    *ae < idx
-                        && !masked
-                            .chars()
-                            .skip(*ae)
-                            .take(idx - ae)
-                            .any(|c| matches!(c, ';' | '{' | '}'))
-                })
-                .map(|(_, _, p)| p.as_str());
+        for (seg, custom) in &refs.mods {
             let dep = match custom {
                 Some(p) => normalize_rel(&mdir, p).filter(|c| names.contains(c)),
-                None => resolve(&names, &mdir, std::slice::from_ref(&seg)),
+                None => resolve(&names, &mdir, std::slice::from_ref(seg)),
             };
             if let Some(dep) = dep {
                 if dep != *rel {
@@ -137,16 +144,16 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
 
         // `include!("file.rs")` pulls the file's contents into this one.
         let parent = parent_rel(rel);
-        for inc in include_paths(&clean) {
-            if let Some(dep) = normalize_rel(parent, &inc).filter(|c| names.contains(c)) {
+        for inc in &refs.includes {
+            if let Some(dep) = normalize_rel(parent, inc).filter(|c| names.contains(c)) {
                 if dep != *rel {
                     deps.insert(dep);
                 }
             }
         }
 
-        // `use` paths.
-        for segments in use_paths(&masked) {
+        // `use` paths (flattened: `use a::{b, c::d}` yields both tails).
+        for segments in &refs.uses {
             let Some((first, rest)) = segments.split_first() else {
                 continue;
             };
@@ -184,7 +191,116 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
     }
 
     let nodes = names.into_iter().collect();
-    Ok(ScanOutput { edges, nodes })
+    Ok(ScanOutput {
+        edges,
+        nodes,
+        warnings,
+    })
+}
+
+// ---------- Rust reference extraction (syn) ----------
+
+/// Everything the resolver needs from one parsed `.rs` file.
+#[derive(Default)]
+struct RustRefs {
+    /// `mod name;` declarations: `(ident, #[path] value if present)`.
+    mods: Vec<(String, Option<String>)>,
+    /// `use` paths flattened to segment lists (`use a::{b, c::d}`
+    /// yields `["a","b"]` and `["a","c","d"]`).
+    uses: Vec<Vec<String>>,
+    /// String literals inside `include!(...)` calls.
+    includes: Vec<String>,
+}
+
+fn parse_rs_refs(text: &str) -> std::result::Result<RustRefs, syn::Error> {
+    let file = syn::parse_file(text)?;
+    let mut v = RustRefVisitor::default();
+    v.visit_file(&file);
+    Ok(v.refs)
+}
+
+#[derive(Default)]
+struct RustRefVisitor {
+    refs: RustRefs,
+}
+
+impl<'ast> Visit<'ast> for RustRefVisitor {
+    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
+        // `mod foo;` (no inline body) declares a child module file.
+        // `mod foo { ... }` still gets visited for nested items.
+        if i.content.is_none() {
+            let custom = i.attrs.iter().find_map(path_attr_value);
+            self.refs
+                .mods
+                .push((i.ident.unraw().to_string(), custom));
+        }
+        visit::visit_item_mod(self, i);
+    }
+
+    fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
+        let mut prefix = Vec::new();
+        flatten_use(&i.tree, &mut prefix, &mut self.refs.uses);
+    }
+
+    fn visit_macro(&mut self, i: &'ast syn::Macro) {
+        if i.path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "include")
+        {
+            if let Ok(lit) = syn::parse2::<syn::LitStr>(i.tokens.clone()) {
+                self.refs.includes.push(lit.value());
+            }
+        }
+        visit::visit_macro(self, i);
+    }
+}
+
+/// `#[path = "..."]` -> the literal value, for `mod` items only.
+fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
+    if !attr.path().is_ident("path") {
+        return None;
+    }
+    if let syn::Meta::NameValue(nv) = &attr.meta {
+        if let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) = &nv.value
+        {
+            return Some(s.value());
+        }
+    }
+    None
+}
+
+/// Flatten a `use` tree into full segment paths. `self`/`super`/`crate`
+/// are ordinary idents here — the resolver interprets them.
+fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            prefix.push(p.ident.unraw().to_string());
+            flatten_use(&p.tree, prefix, out);
+            prefix.pop();
+        }
+        syn::UseTree::Name(n) => {
+            prefix.push(n.ident.unraw().to_string());
+            out.push(prefix.clone());
+            prefix.pop();
+        }
+        // `use a::b as c` depends on `a::b`, not the rename.
+        syn::UseTree::Rename(r) => {
+            prefix.push(r.ident.unraw().to_string());
+            out.push(prefix.clone());
+            prefix.pop();
+        }
+        // `use a::*` refers to module `a` itself.
+        syn::UseTree::Glob(_) => out.push(prefix.clone()),
+        syn::UseTree::Group(g) => {
+            for t in &g.items {
+                flatten_use(t, prefix, out);
+            }
+        }
+    }
 }
 
 // ---------- filesystem walk ----------
@@ -404,391 +520,6 @@ fn crate_src_rel(abs: &Path, root: &Path) -> Option<String> {
 
 // ---------- source scanning ----------
 
-/// Remove `//` line comments and `/* */` block comments. Char-based so
-/// non-ASCII source survives intact; string literals are not understood
-/// — a known limitation of the pattern approach.
-fn strip_comments(src: &str) -> String {
-    let b: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    let mut in_str = false;
-    while i < b.len() {
-        let c = b[i];
-        if in_str {
-            out.push(c);
-            if c == '"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            in_str = true;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '/' && i + 1 < b.len() && b[i + 1] == '/' {
-            while i < b.len() && b[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && i + 1 < b.len() && b[i + 1] == '*' {
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
-                i += 1;
-            }
-            i = (i + 2).min(b.len());
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-/// Lex Rust source into two aligned views:
-///
-/// - `clean`: comments removed, everything else verbatim (string contents
-///   kept — `#[path]`/`include!` extraction needs them).
-/// - `masked`: identical to `clean` except string/raw-string *contents*
-///   are blanked to spaces (length and char positions preserved), so
-///   `mod`/`use` scanning can't see tokens inside literals.
-///
-/// Handles line comments, nested block comments, normal strings with
-/// escapes, byte strings (`b".."` — the `b` is just a normal char), raw
-/// strings (`r".."`, `r#".."#`, `br#".."#`), char literals vs lifetimes
-/// (`'x'` vs `'a`), and non-ASCII text (char-based, not bytes).
-fn lex_rs(src: &str) -> (String, String) {
-    let b: Vec<char> = src.chars().collect();
-    let n = b.len();
-    let mut clean = String::with_capacity(src.len());
-    let mut masked = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < n {
-        let c = b[i];
-        // Line comment: dropped from both views.
-        if c == '/' && i + 1 < n && b[i + 1] == '/' {
-            while i < n && b[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Block comment (Rust nests them): dropped from both views.
-        if c == '/' && i + 1 < n && b[i + 1] == '*' {
-            let mut depth = 1usize;
-            i += 2;
-            while i < n && depth > 0 {
-                if i + 1 < n && b[i] == '/' && b[i + 1] == '*' {
-                    depth += 1;
-                    i += 2;
-                } else if i + 1 < n && b[i] == '*' && b[i + 1] == '/' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        // Raw string: r"..", r#".."#, r##".."##, or br".."/br#".."#.
-        if let Some(end) = raw_string_end(&b, i) {
-            let lit: String = b[i..end].iter().collect();
-            clean.push_str(&lit);
-            masked.push_str(&blank_literal(&lit));
-            i = end;
-            continue;
-        }
-        // Normal string literal (also covers b".." — `b` is emitted as a
-        // normal char on the previous iteration).
-        if c == '"' {
-            let start = i;
-            i += 1;
-            while i < n {
-                if b[i] == '\\' {
-                    i = (i + 2).min(n);
-                    continue;
-                }
-                if b[i] == '"' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            let lit: String = b[start..i.min(n)].iter().collect();
-            clean.push_str(&lit);
-            masked.push_str(&blank_literal(&lit));
-            continue;
-        }
-        // Char literal ('x', '\n', '\'', '"') vs lifetime ('a, 'static).
-        if c == '\'' {
-            if let Some(end) = char_literal_end(&b, i) {
-                let lit: String = b[i..end].iter().collect();
-                clean.push_str(&lit);
-                masked.push_str(&lit);
-                i = end;
-                continue;
-            }
-            clean.push('\'');
-            masked.push('\'');
-            i += 1;
-            continue;
-        }
-        clean.push(c);
-        masked.push(c);
-        i += 1;
-    }
-    (clean, masked)
-}
-
-/// `lit` with its interior blanked to spaces (quotes/delimiters kept,
-/// newlines preserved). Used for the `masked` view of string literals.
-fn blank_literal(lit: &str) -> String {
-    let chars: Vec<char> = lit.chars().collect();
-    if chars.len() <= 2 {
-        return lit.to_string();
-    }
-    let mut out = String::with_capacity(lit.len());
-    out.push(chars[0]);
-    for &ch in &chars[1..chars.len() - 1] {
-        out.push(if ch == '\n' { '\n' } else { ' ' });
-    }
-    out.push(chars[chars.len() - 1]);
-    out
-}
-
-/// If a raw string starts at `b[i]` (`r"`, `r#"`, `r##"`, ..., or the
-/// `br` byte-string variants), return the index just past its closing
-/// `"` + `#`s. Requires a non-identifier char before `r`/`b` so `parser`
-/// or `foobar` can't fake one.
-fn raw_string_end(b: &[char], i: usize) -> Option<usize> {
-    let n = b.len();
-    let mut j = i;
-    // Optional `b` prefix for byte raw strings.
-    if j < n && b[j] == 'b' && j + 1 < n && b[j + 1] == 'r' {
-        j += 1;
-    }
-    if j >= n || b[j] != 'r' {
-        return None;
-    }
-    // Boundary: the `r` (or `b`) must not continue an identifier.
-    if i > 0 && is_ident(b[i - 1]) {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0usize;
-    while j < n && b[j] == '#' {
-        hashes += 1;
-        j += 1;
-    }
-    if j >= n || b[j] != '"' {
-        return None;
-    }
-    // Find closing `"` followed by exactly `hashes` '#'s.
-    let mut k = j + 1;
-    while k < n {
-        if b[k] == '"'
-            && k + 1 + hashes <= n
-            && b[k + 1..k + 1 + hashes].iter().all(|&c| c == '#')
-        {
-            return Some(k + 1 + hashes);
-        }
-        k += 1;
-    }
-    None // unterminated: treat rest of file as not-a-string
-}
-
-/// If a char literal starts at `b[i]` (`'x'`, `'\n'`, `'\''`, `'"'`,
-/// `'\u{..}'`), return the index just past the closing `'`. Anything
-/// else starting with `'` is treated as a lifetime/label and returns
-/// `None` so the `'` is emitted as a normal char.
-fn char_literal_end(b: &[char], i: usize) -> Option<usize> {
-    let n = b.len();
-    if i + 1 >= n {
-        return None;
-    }
-    if b[i + 1] == '\\' {
-        // Escape form: '\<stuff>' — find the closing quote soon after.
-        let mut j = i + 2;
-        while j < n && j <= i + 14 {
-            if b[j] == '\'' {
-                return Some(j + 1);
-            }
-            j += 1;
-        }
-        return None;
-    }
-    // Simple form: '<one char>' — exactly one char between the quotes.
-    if i + 2 < n && b[i + 2] == '\'' {
-        return Some(i + 3);
-    }
-    None
-}
-
-fn is_ident(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-/// All `mod name;` declarations as `(char_index, name)` pairs
-/// (skips inline `mod name { ... }`).
-fn mod_decls(src: &str) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    let b: Vec<char> = src.chars().collect();
-    let n = b.len();
-    let mut i = 0;
-    while i < n {
-        // word "mod" at a boundary
-        if b[i] == 'm'
-            && (i == 0 || !is_ident(b[i - 1]))
-            && i + 3 <= n
-            && b[i..i + 3] == ['m', 'o', 'd']
-            && (i + 3 >= n || !is_ident(b[i + 3]))
-        {
-            let mut j = i + 3;
-            while j < n && b[j].is_whitespace() {
-                j += 1;
-            }
-            let start = j;
-            while j < n && is_ident(b[j]) {
-                j += 1;
-            }
-            if j > start {
-                let mut k = j;
-                while k < n && b[k].is_whitespace() {
-                    k += 1;
-                }
-                if k < n && b[k] == ';' {
-                    out.push((i, b[start..j].iter().collect()));
-                }
-            }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-/// All `use` paths as segment lists (`use a::b::{c}` yields `["a","b"]`).
-fn use_paths(src: &str) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let b: Vec<char> = src.chars().collect();
-    let n = b.len();
-    let mut i = 0;
-    while i < n {
-        if b[i] == 'u'
-            && (i == 0 || !is_ident(b[i - 1]))
-            && i + 3 <= n
-            && b[i..i + 3] == ['u', 's', 'e']
-            && (i + 3 >= n || b[i + 3].is_whitespace())
-        {
-            let mut j = i + 3;
-            while j < n && b[j].is_whitespace() {
-                j += 1;
-            }
-            // Collect path chars: idents, '_', and ':'.
-            let start = j;
-            while j < n && (is_ident(b[j]) || b[j] == ':') {
-                j += 1;
-            }
-            let raw: String = b[start..j].iter().collect();
-            let segs: Vec<String> = raw
-                .split("::")
-                .filter(|s| !s.is_empty())
-                .map(|s| s.trim_start_matches(':').to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !segs.is_empty() {
-                out.push(segs);
-            }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-
-/// `#[path = "..."]` attributes as `(start, end, path)` triples; `end` is
-/// the char index just past the closing quote.
-fn path_attrs(src: &str) -> Vec<(usize, usize, String)> {
-    let mut out = Vec::new();
-    let b: Vec<char> = src.chars().collect();
-    let n = b.len();
-    let mut i = 0;
-    while i + 6 < n {
-        if b[i] == '#' && b[i + 1] == '[' {
-            // Look for `path` then `=` then a quoted string before `]`.
-            let mut j = i + 2;
-            while j < n && b[j].is_whitespace() {
-                j += 1;
-            }
-            if j + 4 <= n && b[j..j + 4].iter().collect::<String>() == "path" {
-                j += 4;
-                while j < n && (b[j].is_whitespace() || b[j] == '=') {
-                    j += 1;
-                }
-                if j < n && (b[j] == '"' || b[j] == '\'') {
-                    let q = b[j];
-                    let start = j + 1;
-                    let mut k = start;
-                    while k < n && b[k] != q {
-                        k += 1;
-                    }
-                    if k < n {
-                        out.push((i, k + 1, b[start..k].iter().collect()));
-                        i = k;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
-/// Paths inside `include!("...")` macro calls.
-fn include_paths(src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let b: Vec<char> = src.chars().collect();
-    let n = b.len();
-    let needle = ['i', 'n', 'c', 'l', 'u', 'd', 'e', '!'];
-    let mut i = 0;
-    while i + needle.len() < n {
-        if (i == 0 || !is_ident(b[i - 1]))
-            && b[i..i + needle.len()] == needle
-            && (i + needle.len() >= n || !is_ident(b[i + needle.len()]))
-        {
-            let mut j = i + needle.len();
-            while j < n && b[j].is_whitespace() {
-                j += 1;
-            }
-            if j < n && b[j] == '(' {
-                j += 1;
-                while j < n && b[j].is_whitespace() {
-                    j += 1;
-                }
-                if j < n && (b[j] == '"' || b[j] == '\'') {
-                    let q = b[j];
-                    let start = j + 1;
-                    let mut k = start;
-                    while k < n && b[k] != q {
-                        k += 1;
-                    }
-                    if k < n {
-                        out.push(b[start..k].iter().collect());
-                        i = k;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
 /// Join `base` (a `/`-separated rel dir) with `p`, resolving `.` and `..`.
 /// Returns `None` if the result escapes the scan root.
 fn normalize_rel(base: &str, p: &str) -> Option<String> {
@@ -809,9 +540,216 @@ fn normalize_rel(base: &str, p: &str) -> Option<String> {
     Some(segs.join("/"))
 }
 
+// ---------- tree-sitter extraction ----------
+//
+// Python and JS/TS imports are found by walking the concrete syntax
+// tree, so comments, strings, and template literals can't create phantom
+// edges and broken code degrades to ERROR nodes instead of wrong guesses.
+
+/// Parse `text` with `lang`; returns the root node's sexp-visible tree.
+/// `None` only if the parser itself fails (tree-sitter is error-tolerant,
+/// so syntax errors still produce a usable tree).
+fn parse_ts(text: &str, lang: tree_sitter::Language) -> Option<tree_sitter::Tree> {
+    let mut p = tree_sitter::Parser::new();
+    p.set_language(&lang).ok()?;
+    p.parse(text, None)
+}
+
+/// Text of a string-ish node (`string`, `template_string`) with its
+/// surrounding quotes/backticks stripped. `None` for empty specs.
+fn spec_text(node: tree_sitter::Node, src: &str) -> Option<String> {
+    let text = node.utf8_text(src.as_bytes()).ok()?;
+    let inner = text
+        .strip_prefix(|c| matches!(c, '\'' | '"' | '`'))
+        .and_then(|s| s.strip_suffix(|c| matches!(c, '\'' | '"' | '`')))
+        .unwrap_or(text);
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
+/// Module specifier of an `import`/`export ... from` statement:
+/// the `source` field's string content.
+fn ts_source_spec(stmt: tree_sitter::Node, src: &str) -> Option<String> {
+    spec_text(stmt.child_by_field_name("source")?, src)
+}
+
+/// Specifier of `require('x')` / `import('x')` call arguments.
+fn ts_call_spec(call: tree_sitter::Node, src: &str) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+    let func_text = func.utf8_text(src.as_bytes()).ok()?;
+    let is_require = func.kind() == "identifier" && func_text == "require";
+    let is_dyn_import = func.kind() == "import";
+    if !is_require && !is_dyn_import {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    // First string-ish argument.
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if matches!(child.kind(), "string" | "template_string") {
+            return spec_text(child, src);
+        }
+    }
+    None
+}
+
+/// All module specifiers in JS/TS source, via tree-sitter.
+/// Returns `(specs, had_error)` — `had_error` means the tree contains
+/// ERROR nodes, so the spec list may be incomplete.
+fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, bool) {
+    let mut specs = Vec::new();
+    let Some(tree) = parse_ts(text, lang) else {
+        return (specs, true);
+    };
+    let had_error = tree.root_node().has_error();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "import_statement" | "export_statement" => {
+                if let Some(s) = ts_source_spec(node, text) {
+                    specs.push(s);
+                }
+            }
+            "call_expression" => {
+                if let Some(s) = ts_call_spec(node, text) {
+                    specs.push(s);
+                }
+            }
+            _ => {}
+        }
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    (specs, had_error)
+}
+
 // ---------- Python scanner ----------
 
 const PY_EXTS: &[&str] = &["py"];
+
+/// One import found by the tree-sitter Python parse.
+enum PyRef {
+    /// `import a.b.c` — full dotted path segments.
+    Import(Vec<String>),
+    /// `from <dots><mod> import <names>`: leading-dot count (0 =
+    /// absolute), module segments (empty for `from . import x`), and
+    /// imported names.
+    From {
+        level: usize,
+        segs: Vec<String>,
+        names: Vec<String>,
+    },
+}
+
+/// All imports in Python source, via tree-sitter. Docstrings, comments,
+/// and string contents can't produce phantom imports; syntax errors
+/// degrade to ERROR nodes rather than wrong guesses.
+fn py_import_refs(text: &str) -> (Vec<PyRef>, bool) {
+    let mut out = Vec::new();
+    let Some(tree) = parse_ts(text, tree_sitter_python::LANGUAGE.into()) else {
+        return (out, true);
+    };
+    let had_error = tree.root_node().has_error();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "import_statement" => {
+                let mut cursor = node.walk();
+                for name in node.children_by_field_name("name", &mut cursor) {
+                    // `import a.b` or `import a.b as c`.
+                    let dotted = if name.kind() == "aliased_import" {
+                        name.child_by_field_name("name")
+                    } else {
+                        Some(name)
+                    };
+                    if let Some(d) = dotted {
+                        if let Some(segs) = dotted_segs(d, text) {
+                            out.push(PyRef::Import(segs));
+                        }
+                    }
+                }
+            }
+            "import_from_statement" => {
+                let level_segs = node
+                    .child_by_field_name("module_name")
+                    .and_then(|m| rel_mod_segs(m, text));
+                let mut names = Vec::new();
+                let mut cursor = node.walk();
+                for name in node.children_by_field_name("name", &mut cursor) {
+                    // dotted_name, aliased_import, or wildcard_import.
+                    let dotted = if name.kind() == "aliased_import" {
+                        name.child_by_field_name("name")
+                    } else if name.kind() == "dotted_name" {
+                        Some(name)
+                    } else {
+                        None
+                    };
+                    if let Some(d) = dotted {
+                        if let Ok(t) = d.utf8_text(text.as_bytes()) {
+                            let t = t.trim();
+                            // Import names are single identifiers;
+                            // anything dotted isn't a real name.
+                            if !t.is_empty()
+                                && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                names.push(t.to_string());
+                            }
+                        }
+                    }
+                }
+                if let Some((level, segs)) = level_segs {
+                    out.push(PyRef::From { level, segs, names });
+                }
+            }
+            _ => {}
+        }
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    (out, had_error)
+}
+
+/// `a.b.c` node text -> segments, or `None` if not a plain dotted path.
+fn dotted_segs(node: tree_sitter::Node, text: &str) -> Option<Vec<String>> {
+    let t = node.utf8_text(text.as_bytes()).ok()?;
+    let segs: Vec<String> = t
+        .split('.')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if segs.is_empty() {
+        None
+    } else {
+        Some(segs)
+    }
+}
+
+/// `module_name` of a `from` import -> (leading-dot count, segments).
+/// `from . import x` gives `(1, [])`; `from ..pkg.mod import y` gives
+/// `(2, ["pkg","mod"])`; absolute gives `(0, [...])`.
+fn rel_mod_segs(node: tree_sitter::Node, text: &str) -> Option<(usize, Vec<String>)> {
+    let t = node.utf8_text(text.as_bytes()).ok()?;
+    let level = t.chars().take_while(|&c| c == '.').count();
+    let dotted = t[level..].trim();
+    let segs: Vec<String> = if dotted.is_empty() {
+        Vec::new()
+    } else {
+        dotted
+            .split('.')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    Some((level, segs))
+}
 
 fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
     let mut files: Vec<(String, PathBuf)> = Vec::new();
@@ -819,99 +757,24 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
     let mut edges: EdgeList = Vec::new();
+    let mut warnings = Vec::new();
 
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
             .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        let clean = strip_hash_comments(&text);
+        let (refs, had_error) = py_import_refs(&text);
+        if had_error {
+            warnings.push(format!("{rel}: parse errors (partial scan)"));
+        }
         let mut deps: BTreeSet<String> = BTreeSet::new();
         let parent = parent_rel(rel);
 
-        for line in logical_lines(&clean) {
-            let line = line.trim();
-            // `from <dots><mod> import <names>` (also `from x import (a,b)`).
-            if let Some(rest) = line.strip_prefix("from ") {
-                let Some((mod_part, names_part)) = rest.split_once(" import") else {
-                    continue;
-                };
-                let level = mod_part.chars().take_while(|&c| c == '.').count();
-                let dotted = mod_part[level..].trim();
-                let mut base = parent.to_string();
-                for _ in 1..level {
-                    base = parent_rel(&base).to_string();
-                }
-                let segs: Vec<String> = dotted
-                    .split('.')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect();
-                // Absolute imports (`from x.y import`, level 0) resolve against
-                // every ancestor dir of this file, like Python's sys.path —
-                // the package root may be a subdirectory (e.g. `repo/pkg/pkg/`).
-                // Relative imports keep their computed base only.
-                let bases: Vec<String> = if level == 0 {
-                    ancestor_bases(rel)
-                } else {
-                    vec![base]
-                };
-                // Module file for `from X import ...`.
-                if !segs.is_empty() {
-                    for b in &bases {
-                        if let Some(dep) = resolve_py(&names, b, &segs) {
-                            if dep != *rel {
-                                deps.insert(dep);
-                            }
-                            break;
-                        }
-                    }
-                    // `from pkg import sub` may pull pkg/sub.py too.
-                    for name in import_names(names_part) {
-                        let mut ns = segs.clone();
-                        ns.push(name);
-                        for b in &bases {
-                            if let Some(dep) = resolve_py(&names, b, &ns) {
-                                if dep != *rel {
-                                    deps.insert(dep);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    // `from . import x, y` — names are modules under base.
-                    for name in import_names(names_part) {
-                        for b in &bases {
-                            if let Some(dep) =
-                                resolve_py(&names, b, std::slice::from_ref(&name))
-                            {
-                                if dep != *rel {
-                                    deps.insert(dep);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            // `import a.b.c` (possibly comma-separated list).
-            if let Some(rest) = line.strip_prefix("import ") {
-                for item in rest.split(',') {
-                    let item = item.trim();
-                    let dotted = item.split(" as ").next().unwrap_or(item).trim();
-                    if dotted.is_empty() || dotted.starts_with('.') {
-                        continue; // relative `import .x` is invalid syntax anyway
-                    }
-                    let segs: Vec<String> = dotted
-                        .split('.')
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .collect();
-                    if segs.is_empty() {
-                        continue;
-                    }
-                    // `import a.b.c` needs the full path to resolve; try each
-                    // ancestor dir as a package root (sys.path heuristic).
+        for r in refs {
+            match r {
+                PyRef::Import(segs) => {
+                    // `import a.b.c` needs the full path to resolve; try
+                    // each ancestor dir as a package root (sys.path
+                    // heuristic).
                     for b in ancestor_bases(rel) {
                         if let Some(dep) = resolve_py_exact(&names, &b, &segs) {
                             if dep != *rel {
@@ -921,6 +784,9 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                         }
                     }
                 }
+                PyRef::From { level, segs, names: imps } => {
+                    add_py_from(&names, rel, parent, level, &segs, &imps, &mut deps);
+                }
             }
         }
 
@@ -929,24 +795,70 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
         }
     }
     let nodes = names.into_iter().collect();
-    Ok(ScanOutput { edges, nodes })
+    Ok(ScanOutput { edges, nodes, warnings })
 }
 
-/// Names in a `from X import ...` clause: `a, b as c, (d, e)`.
-fn import_names(s: &str) -> Vec<String> {
-    s.trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .filter_map(|part| {
-            let name = part.split(" as ").next().unwrap_or(part).trim();
-            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                None
-            } else {
-                Some(name.to_string())
+/// Resolve a `from <dots><mod> import <names>` against the file set.
+/// `level` is the count of leading dots (0 = absolute import, which
+/// tries every ancestor dir as a package root like `sys.path`).
+fn add_py_from(
+    names: &BTreeSet<String>,
+    rel: &str,
+    parent: &str,
+    level: usize,
+    segs: &[String],
+    imps: &[String],
+    deps: &mut BTreeSet<String>,
+) {
+    let mut base = parent.to_string();
+    for _ in 1..level {
+        base = parent_rel(&base).to_string();
+    }
+    // Absolute imports (`from x.y import`, level 0) resolve against
+    // every ancestor dir of this file, like Python's sys.path —
+    // the package root may be a subdirectory (e.g. `repo/pkg/pkg/`).
+    // Relative imports keep their computed base only.
+    let bases: Vec<String> = if level == 0 {
+        ancestor_bases(rel)
+    } else {
+        vec![base]
+    };
+    // Module file for `from X import ...`.
+    if !segs.is_empty() {
+        for b in &bases {
+            if let Some(dep) = resolve_py(names, b, segs) {
+                if dep != rel {
+                    deps.insert(dep);
+                }
+                break;
             }
-        })
-        .collect()
+        }
+        // `from pkg import sub` may pull pkg/sub.py too.
+        for name in imps {
+            let mut ns = segs.to_vec();
+            ns.push(name.clone());
+            for b in &bases {
+                if let Some(dep) = resolve_py(names, b, &ns) {
+                    if dep != rel {
+                        deps.insert(dep);
+                    }
+                    break;
+                }
+            }
+        }
+    } else {
+        // `from . import x, y` — names are modules under base.
+        for name in imps {
+            for b in &bases {
+                if let Some(dep) = resolve_py(names, b, std::slice::from_ref(name)) {
+                    if dep != rel {
+                        deps.insert(dep);
+                    }
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Ancestor directories of `rel` (root-relative file path), deepest
@@ -993,48 +905,6 @@ fn resolve_py_exact(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Op
     None
 }
 
-/// Join physical lines into logical ones for import scanning: a
-/// `from x import (` … `)` list or a trailing `\` continuation is
-/// collapsed into a single line. Only lines *starting* with `from ` or
-/// `import ` trigger joining, so multi-line calls/defs are untouched.
-fn logical_lines(src: &str) -> Vec<String> {
-    let raw: Vec<&str> = src.lines().collect();
-    let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        let mut l = raw[i].to_string();
-        let is_import = {
-            let t = l.trim_start();
-            t.starts_with("from ") || t.starts_with("import ")
-        };
-        let needs_more = |s: &str| {
-            let t = s.trim_end();
-            t.ends_with('\\') || t.matches('(').count() > t.matches(')').count()
-        };
-        while is_import && needs_more(&l) && i + 1 < raw.len() {
-            // Drop a trailing `\` continuation marker before joining.
-            let tlen = l.trim_end().len();
-            if tlen > 0 && l.as_bytes()[tlen - 1] == b'\\' {
-                l.truncate(tlen - 1);
-            }
-            i += 1;
-            l.push(' ');
-            l.push_str(raw[i].trim());
-        }
-        out.push(l);
-        i += 1;
-    }
-    out
-}
-
-/// Strip `#` line comments (naive: `#` inside strings is not understood).
-fn strip_hash_comments(src: &str) -> String {
-    src.lines()
-        .map(|l| l.split('#').next().unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 // ---------- JS/TS scanner ----------
 
 const JS_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
@@ -1045,17 +915,21 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
     let mut edges: EdgeList = Vec::new();
+    let mut warnings = Vec::new();
     let mut alias_cache = JsAliasCache::new(root);
 
     for (rel, abs) in &files {
         let text = fs::read_to_string(abs)
             .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        let clean = strip_comments(&text);
+        let (specs, had_error) = js_import_specs_ts(&text, js_language_for(rel));
+        if had_error {
+            warnings.push(format!("{rel}: parse errors (partial scan)"));
+        }
         let mut deps: BTreeSet<String> = BTreeSet::new();
         let parent = parent_rel(rel);
         let resolver = alias_cache.for_dir(parent);
 
-        for spec in js_import_specs(&clean) {
+        for spec in specs {
             // Relative specs ('./x', '../x') are always intra-project.
             if spec.starts_with(".") {
                 let Some(norm) = normalize_rel(parent, &spec) else {
@@ -1083,54 +957,16 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
         }
     }
     let nodes = names.into_iter().collect();
-    Ok(ScanOutput { edges, nodes })
+    Ok(ScanOutput { edges, nodes, warnings })
 }
 
-/// All module specifiers in `import ... from 'x'`, `import 'x'`,
-/// `import('x')`, `export ... from 'x'`, and `require('x')`.
-fn js_import_specs(src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let b: Vec<char> = src.chars().collect();
-    let n = b.len();
-    let mut i = 0;
-    while i < n {
-        for kw in ["from", "import", "require"] {
-            let klen = kw.len();
-            if i + klen > n
-                || (i > 0 && is_ident(b[i - 1]))
-                || b[i..i + klen].iter().collect::<String>() != kw
-                || (i + klen < n && is_ident(b[i + klen]))
-            {
-                continue;
-            }
-            let mut j = i + klen;
-            while j < n && b[j].is_whitespace() {
-                j += 1;
-            }
-            // Skip an optional `(` (dynamic import / require call).
-            if j < n && b[j] == '(' {
-                j += 1;
-                while j < n && b[j].is_whitespace() {
-                    j += 1;
-                }
-            }
-            if j < n && (b[j] == '\'' || b[j] == '"') {
-                let q = b[j];
-                let start = j + 1;
-                let mut k = start;
-                while k < n && b[k] != q && b[k] != '\n' {
-                    k += 1;
-                }
-                if k < n && b[k] == q {
-                    out.push(b[start..k].iter().collect());
-                    i = k;
-                }
-            }
-            break; // matched a keyword; move on regardless
-        }
-        i += 1;
+/// tree-sitter grammar for a JS/TS file extension.
+fn js_language_for(rel: &str) -> tree_sitter::Language {
+    match rel.rsplit('.').next() {
+        Some("ts") => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Some("tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        _ => tree_sitter_javascript::LANGUAGE.into(),
     }
-    out
 }
 
 /// Resolve a normalized relative JS spec to a file: exact, +ext, /index+ext.

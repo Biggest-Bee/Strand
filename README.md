@@ -435,13 +435,17 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
   output regardless of input order, duplicate-edge merging, node kinds,
   truncations and bit flips produce clean errors (never panics).
 - **scanner** (`strand-import/tests/scan.rs`): Rust `mod`/`use`/
-  `#[path]`/`include!`, Python and JS/TS imports, Python absolute
+  `#[path]`/`include!` via `syn`, Python and JS/TS imports via
+  tree-sitter, grouped `use` trees and `use`-inside-fn, parse-failure
+  warnings, docstring/string/comment false-positive rejection,
+  Python absolute
   imports resolving against ancestor package roots (nested `pkg/pkg/`
   layouts), `tsconfig`/`jsconfig`
   `paths` aliases + `baseUrl` + `extends` inheritance, JSONC comments/
   trailing commas, per-package configs in monorepos, `package.json`
-  `"imports"` (`#alias`), multiline/parenthesized imports, dedup,
-  string-literal masking, char literals vs lifetimes, raw strings,
+  `"imports"` (`#alias`), multiline/parenthesized imports, template-
+  literal `require()`, dedup,
+  char literals vs lifetimes, raw strings,
   non-ASCII, plus a dogfood test that scans Strand's own repo.
 - **store** (`strand-store/tests/store.rs`): transactions, persistence,
   snapshots, compaction (incl. weighted edges), read-only rejection,
@@ -517,13 +521,17 @@ cargo test
   (writers only publish via rename).
 - mmap assumes files aren't truncated while open (inherent SIGBUS risk);
   the write path always writes-then-renames.
-- `strand scan` is a pattern-matching scanner, not a real parser: it
-  handles `mod`/`use`/`#[path]`/`include!` (Rust), `import`/`from`
-  incl. relative imports (Python), and `import`/`export-from`/`require`
-  (JS/TS), including `tsconfig`/`jsconfig` `paths` aliases and
+- `strand scan` parses sources with real parsers — `syn` for Rust,
+  tree-sitter for Python and JS/TS — so comments, string literals, and
+  grouped `use` trees (`use a::{b, c::d}`) are handled by the grammar,
+  not text matching. It handles `mod`/`use`/`#[path]`/`include!` (Rust),
+  `import`/`from` incl. relative imports (Python), and
+  `import`/`export-from`/`require`/dynamic `import()` (JS/TS),
+  including `tsconfig`/`jsconfig` `paths` aliases and
   `baseUrl` (JSONC-tolerant, `extends` chains followed, nearest config
   per file for monorepos) and `package.json` `"imports"` (`#alias`).
-  It misses
+  Files that fail to parse are skipped with a warning (the scan may be
+  incomplete). It misses
   macro-generated modules (a real parser can't see
   them either without expanding macros — `cargo expand` output is a
   workaround for inspection, not for scanning), `include_str!` payloads,

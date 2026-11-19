@@ -373,6 +373,135 @@ fn scan_handles_literals_and_lifetimes() {
 }
 
 #[test]
+fn scan_rust_grouped_use_trees() {
+    // `use a::{b, c::d}` must yield edges for every leaf — the old
+    // text scanner stopped at `{` and saw only `a`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "Cargo.toml", "[package]\nname = \"p\"\n");
+    w(
+        root,
+        "src/lib.rs",
+        "mod m;\nmod n;\n",
+    );
+    w(root, "src/m.rs", "pub mod a;\npub mod b;\n");
+    w(root, "src/m/a.rs", "pub struct A;\n");
+    w(root, "src/m/b.rs", "pub struct B;\n");
+    w(root, "src/n.rs", "pub struct N;\n");
+    w(
+        root,
+        "src/user.rs",
+        concat!(
+            "use crate::m::{a::A, b::B as Bee};\n",
+            "use crate::n;\n",
+            "fn f() {\n    use crate::m::a::A as Local;\n    let _ = Local;\n}\n",
+        ),
+    );
+    // Register user.rs as a module so it's part of the crate.
+    let lib = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    fs::write(root.join("src/lib.rs"), format!("{lib}mod user;\n")).unwrap();
+
+    let out = scan_rust(root).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    assert!(has("src/user.rs", "src/m/a.rs")); // a::A leaf
+    assert!(has("src/user.rs", "src/m/b.rs")); // b::B as Bee leaf
+    assert!(has("src/user.rs", "src/n.rs")); // plain use crate::n
+    assert!(has("src/user.rs", "src/m/a.rs")); // use inside fn body (dedup w/ above)
+    assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+}
+
+#[test]
+fn scan_rust_parse_failure_warns_not_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "Cargo.toml", "[package]\nname = \"p\"\n");
+    w(root, "src/lib.rs", "mod good;\nmod bad;\n");
+    w(root, "src/good.rs", "pub fn g() {}\n");
+    // Syntactically invalid Rust: syn rejects it.
+    w(root, "src/bad.rs", "pub fn broken( {\n");
+    let out = scan_rust(root).unwrap();
+    let edges = edges_of(&out);
+    // The bad file is still a node; the good file still resolves.
+    assert!(out.nodes.contains(&"src/bad.rs".to_string()));
+    assert!(edges.contains(&("src/lib.rs".into(), "src/good.rs".into())));
+    assert!(
+        out.warnings.iter().any(|w| w.contains("src/bad.rs")),
+        "expected a parse warning for src/bad.rs, got {:?}",
+        out.warnings
+    );
+}
+
+#[test]
+fn scan_python_ignores_docstring_imports() {
+    // `from x import y` inside a docstring/comment/string is not an
+    // import — tree-sitter only emits real import statements.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/util.py", "");
+    w(
+        root,
+        "pkg/mod.py",
+        concat!(
+            "def f():\n",
+            "    \"\"\"Example:\n\n",
+            "        from pkg import util\n",
+            "        import os\n",
+            "    \"\"\"\n",
+            "    from pkg import util\n", // real import inside function
+            "# from pkg import commented\n",
+            "s = \"from pkg import stringy\"\n",
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    // `from pkg import util` depends on the package itself
+    // (__init__.py) and on pkg/util.py — exactly two edges; nothing
+    // from the docstring, comment, or string literal.
+    assert_eq!(
+        edges,
+        vec![
+            ("pkg/mod.py".to_string(), "pkg/__init__.py".to_string()),
+            ("pkg/mod.py".to_string(), "pkg/util.py".to_string()),
+        ],
+        "unexpected edges: {edges:?}"
+    );
+    assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+}
+
+#[test]
+fn scan_js_ignores_strings_and_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "src/a.ts", "export const a = 1;\n");
+    w(
+        root,
+        "src/index.ts",
+        concat!(
+            "import { a } from './a';\n",
+            "const s = \"from './ghost' import x\";\n",
+            "const t = `require('./tmpl')`;\n", // string content, not a call
+            "// import y from './commented'\n",
+            "/* export * from './blocked' */\n",
+            "const r = require(`./real-tmpl`);\n", // template literal arg
+            "import('./dyn-rel');\n",
+        ),
+    );
+    w(root, "src/real-tmpl.ts", "export const t = 1;\n");
+    w(root, "src/dyn-rel.ts", "export const d = 1;\n");
+    let out = scan_lang(root, Lang::Js).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    assert!(has("src/index.ts", "src/a.ts"));
+    assert!(has("src/index.ts", "src/real-tmpl.ts")); // require(`...`)
+    assert!(has("src/index.ts", "src/dyn-rel.ts")); // import('...')
+    assert_eq!(edges.len(), 3, "unexpected edges: {edges:?}");
+}
+
+#[test]
 fn scan_own_repo_is_sane() {
     // Dogfood: scan the Strand workspace itself. Must produce a non-trivial
     // file-level graph with no panics or garbage node names.
