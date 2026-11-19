@@ -1380,7 +1380,7 @@ impl StrandApp {
         let hover = ui.input(|i| i.pointer.hover_pos());
         if scroll != 0.0 && hover.is_some_and(|p| rect.contains(p)) {
             let cursor = hover.unwrap();
-            let factor = if scroll > 0.0 { 1.15 } else { 1.0 / 1.15 };
+            let factor = if scroll > 0.0 { 1.01 } else { 1.0 / 1.01 };
             let new_zoom = (self.zoom * factor).clamp(0.05, 200.0);
             // Keep the world point under the cursor stationary.
             let world = (cursor - rect.min - self.pan) / self.zoom;
@@ -1393,6 +1393,8 @@ impl StrandApp {
         // Trackpad pinch / ctrl+scroll zooms around the viewport center.
         let zd = ui.input(|i| i.zoom_delta());
         if (zd - 1.0).abs() > 0.001 {
+            // Dampen pinch/ctrl-scroll: raw deltas are twitchy.
+            let zd = zd.powf(0.2);
             let new_zoom = (self.zoom * zd).clamp(0.05, 200.0);
             let center = rect.center();
             let world = (center - rect.min - self.pan) / self.zoom;
