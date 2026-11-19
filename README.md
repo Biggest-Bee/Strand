@@ -85,6 +85,12 @@ cargo install --path crates/strand-cli   # the `strand` CLI
 cargo install --path crates/strand-gui   # the desktop GUI
 ```
 
+Both binaries include a lightweight **version check**: at most once
+per 24h they query crates.io in the background (800ms timeout, silent
+when offline) and note it when a newer release exists — stderr for the
+CLI, a notice card/top-bar label for the GUI. Disable with
+`STRAND_NO_UPDATE_CHECK=1`.
+
 `cargo install` puts the binaries in `%USERPROFILE%\.cargo\bin`
 (`C:\Users\<you>\.cargo\bin` on Windows), which rustup adds to PATH
 automatically. For the prebuilt binaries instead, extract the archive
