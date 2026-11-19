@@ -11,6 +11,7 @@ use strand_import::{self, Format};
 
 mod check;
 mod export;
+mod update_check;
 
 #[derive(Parser)]
 #[command(
@@ -334,14 +335,26 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    let update_rx = update_check::spawn();
     let cli = Cli::parse();
-    match run(cli.command) {
+    let code = match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("strand: {e}");
             ExitCode::FAILURE
         }
+    };
+    // The check runs on a thread; long commands already gave it time.
+    // Short commands get a small grace period. stderr keeps stdout
+    // machine-readable (--json, pipes).
+    if let Ok(Some(v)) = update_rx.recv_timeout(std::time::Duration::from_millis(600)) {
+        eprintln!(
+            "note: a new version of {} ({v}) is available — run `cargo install {}` to update",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_NAME"),
+        );
     }
+    code
 }
 
 fn run(cmd: Commands) -> strand_core::Result<()> {

@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
+mod update_check;
+
 use eframe::egui;
 use strand_core::algo::{self, Dir};
 use strand_core::view::GraphView;
@@ -137,6 +139,10 @@ struct StrandApp {
     tutorial_idx: Option<usize>,
     /// Reference window opened by the "Instructions" button.
     show_instructions: bool,
+    /// crates.io update check (background; resolves once).
+    update_rx: Option<Receiver<Option<String>>>,
+    /// Newer-version notice text, once known.
+    update_note: Option<String>,
 }
 
 const MAX_VIZ_NODES: usize = 100_000;
@@ -485,6 +491,8 @@ impl StrandApp {
             layout_gen: 0,
             tutorial_idx: if tutorial_seen() { None } else { Some(0) },
             show_instructions: false,
+            update_rx: Some(update_check::spawn()),
+            update_note: None,
         }
     }
 
@@ -1619,6 +1627,21 @@ impl eframe::App for StrandApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // crates.io update check resolves once in the background.
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(Some(v)) => {
+                    self.update_note = Some(format!(
+                        "strand-gui {v} available - run `cargo install strand-gui`"
+                    ));
+                    self.update_rx = None;
+                }
+                Ok(None) => self.update_rx = None,
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.update_rx = None,
+            }
+        }
+
         // Panels must be added outermost-first, CentralPanel last.
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1638,6 +1661,11 @@ impl eframe::App for StrandApp {
                 ui.separator();
                 ui.label(&self.source_label);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.backend.is_some() {
+                        if let Some(n) = &self.update_note {
+                            ui.colored_label(egui::Color32::from_rgb(255, 200, 80), n);
+                        }
+                    }
                     if !self.status.is_empty() {
                         ui.label(&self.status);
                     }
@@ -1988,6 +2016,20 @@ impl eframe::App for StrandApp {
                     });
                 });
             self.show_instructions = open;
+        }
+
+        // Update notice: centered until a graph is open, then it lives
+        // in the top bar instead.
+        if self.backend.is_none() {
+            if let Some(note) = &self.update_note {
+                egui::Window::new("Update available")
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(&ctx, |ui| {
+                        ui.label(note);
+                    });
+            }
         }
     }
 }
