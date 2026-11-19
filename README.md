@@ -66,13 +66,23 @@ against `SHA256SUMS.txt`. Each archive contains `strand` (CLI) and
 > — right-click → Open (macOS) or *More info → Run anyway* (Windows),
 > or build from source below.
 
+**From crates.io** (needs a Rust toolchain, no repo clone):
+
+```console
+cargo install strand-cli strand-gui   # full Strand: CLI + GUI
+cargo install strand-cli              # CLI only (`strand`)
+cargo install strand-gui              # GUI only (`strand-gui`)
+```
+
+Re-running any of these installs the latest published version — same
+command updates an existing install.
+
 **From source** (needs a Rust toolchain):
 
 ```console
 cd path/to/Strand
 cargo install --path crates/strand-cli   # the `strand` CLI
 cargo install --path crates/strand-gui   # the desktop GUI
-# (once published to crates.io: `cargo install strand-cli strand-gui`)
 ```
 
 `cargo install` puts the binaries in `%USERPROFILE%\.cargo\bin`
