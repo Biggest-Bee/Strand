@@ -272,12 +272,11 @@ also works from any directory.
 - It handles up to 100k nodes / 300k edges: past 8k nodes it switches to
   cheap square markers, and opening a larger file shows a warning that
   the canvas is a partial sample (analyses always cover the full graph).
-- **Large files may feel sluggish** — especially with `cargo run` (a
-  debug build) or graphs near the 100k-node canvas cap: layout,
-  hit-testing, and repaints all run on the UI thread. For big graphs,
-  prefer `cargo build --release -p strand-gui` (or an installed/release
-  binary); the CLI handles the same analyses far faster regardless of
-  size.
+- Analyses, the name index, node focusing, and the organic layout all
+  run on **worker threads** — the window stays responsive while they
+  compute. Very large graphs may still show "analyzing…" for a while;
+  the canvas itself is capped (see warning above) since hit-testing
+  and repaints scale with drawn nodes.
 - With a writable store open, the **Edit store** panel commits real
   transactions: **Add/Remove edge A->B** and **Add/Remove node A** (names
   come from the A/B boxes; edges auto-create missing nodes). Edits are

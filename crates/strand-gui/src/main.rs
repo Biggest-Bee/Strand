@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::Arc;
 
 mod update_check;
 
@@ -17,7 +19,7 @@ use strand_store::Store;
 
 enum Backend {
     /// Immutable mmap'd `.strand` file.
-    File(strand_core::Graph),
+    File(std::sync::Arc<strand_core::Graph>),
     /// Read-write store directory (`.strandb`).
     Store(Store),
 }
@@ -43,7 +45,7 @@ macro_rules! with_view {
     ($app:expr, |$v:ident| $body:expr) => {
         match &$app.backend {
             Some(Backend::File(g)) => {
-                let $v = g;
+                let $v = g.as_ref();
                 $body
             }
             Some(Backend::Store(s)) => match s.begin_read() {
@@ -62,6 +64,43 @@ macro_rules! with_view {
             }
         }
     };
+}
+
+/// Owned, `Send`able view handle for worker-thread analyses.
+/// File graphs are shared via `Arc`; store reads pin a `Snapshot`.
+enum JobView {
+    File(std::sync::Arc<strand_core::Graph>),
+    Store(strand_store::Snapshot),
+}
+
+/// Run `$body` with `$v` bound to the concrete view inside a `JobView`.
+/// The body must compile for both `&Graph` and `&View` — it does,
+/// because every algo/view call is generic over `GraphView`.
+macro_rules! job_view {
+    ($jv:expr, |$v:ident| $body:expr) => {
+        match $jv {
+            JobView::File(g) => {
+                let $v = g.as_ref();
+                $body
+            }
+            JobView::Store(s) => {
+                let view = s.view();
+                let $v = &view;
+                $body
+            }
+        }
+    };
+}
+
+/// Everything a worker-thread analysis returns for the UI to apply.
+struct AnalysisResult {
+    title: String,
+    lines: Vec<ReportRow>,
+    /// `Some` = replace ring-layout depths; `None` = leave untouched.
+    depths: Option<Vec<u32>>,
+    /// `Some` = replace the highlight set; `None` = leave untouched.
+    highlight: Option<BTreeSet<u32>>,
+    status: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -143,6 +182,14 @@ struct StrandApp {
     update_rx: Option<Receiver<Option<String>>>,
     /// Newer-version notice text, once known.
     update_note: Option<String>,
+    /// In-flight worker analysis; latest request wins.
+    analysis_rx: Option<Receiver<AnalysisResult>>,
+    /// In-flight focus-layout BFS (depths only, no report).
+    depths_rx: Option<Receiver<Vec<u32>>>,
+    /// Cancellation flag for the running force-layout thread.
+    layout_flag: Arc<AtomicBool>,
+    /// In-flight full-name collection for autocomplete/browse.
+    names_rx: Option<Receiver<Vec<String>>>,
 }
 
 const MAX_VIZ_NODES: usize = 100_000;
@@ -152,7 +199,7 @@ const MAX_VIZ_EDGES: usize = 300_000;
 const NODE_CIRCLE_MAX: usize = 8_000;
 /// Above this many edges we only draw edges touching the highlight set.
 const EDGE_DRAW_MAX: usize = 150_000;
-const MAX_REPORT_LINES: usize = 5_000;
+const MAX_REPORT_LINES: usize = 20_000;
 /// Neighborhood size cap for the force-directed layout (O(n²) per iter).
 const MAX_LAYOUT_NODES: usize = 1_500;
 /// BFS hops included in the layout neighborhood.
@@ -178,7 +225,11 @@ fn row(text: impl Into<String>) -> ReportRow {
 
 /// Fruchterman-Reingold layout, deterministic (no RNG, single-threaded).
 /// `start`/`edges` use local indices; returns unit-ish coords centered ~0.
-fn force_layout(start: &[(f32, f32)], edges: &[(u32, u32)]) -> Vec<(f32, f32)> {
+fn force_layout(
+    start: &[(f32, f32)],
+    edges: &[(u32, u32)],
+    cancel: &AtomicBool,
+) -> Vec<(f32, f32)> {
     let n = start.len();
     if n == 0 {
         return Vec::new();
@@ -212,6 +263,9 @@ fn force_layout(start: &[(f32, f32)], edges: &[(u32, u32)]) -> Vec<(f32, f32)> {
     let mut temp = 0.08f32;
     let mut disp = vec![(0.0f32, 0.0f32); n];
     for _ in 0..LAYOUT_ITERS {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         for d in disp.iter_mut() {
             *d = (0.0, 0.0);
         }
@@ -493,6 +547,10 @@ impl StrandApp {
             show_instructions: false,
             update_rx: Some(update_check::spawn()),
             update_note: None,
+            analysis_rx: None,
+            depths_rx: None,
+            names_rx: None,
+            layout_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -506,7 +564,7 @@ impl StrandApp {
         match strand_core::Graph::open(&path) {
             Ok(g) => {
                 self.source_label = format!("{} ({} nodes, {} edges)", path.display(), g.n_nodes(), g.n_edges());
-                self.backend = Some(Backend::File(g));
+                self.backend = Some(Backend::File(std::sync::Arc::new(g)));
                 self.reset_query_state();
                 self.collect_names();
                 let w = self.cap_warning();
@@ -596,16 +654,25 @@ impl StrandApp {
 
     /// Snapshot every node name (sorted, deduped) for autocomplete. Skipped
     /// on very large graphs where the index would cost too much memory.
+    /// Snapshot every node name (sorted, deduped) for autocomplete.
+    /// Runs on a worker thread — on big graphs this is a full scan.
+    /// Skipped entirely over 200k nodes (autocomplete falls back off).
     fn collect_names(&mut self) {
-        self.names = with_view!(self, |v| {
-            let n = nn(v);
-            let mut set = BTreeSet::new();
-            if n <= 200_000 {
-                for id in 0..n as u32 {
-                    set.insert(nm(v, id));
+        let Some(jv) = self.job_view() else { return };
+        let (tx, rx) = channel();
+        self.names_rx = Some(rx);
+        std::thread::spawn(move || {
+            let names = job_view!(&jv, |v| {
+                let n = nn(v);
+                let mut set = BTreeSet::new();
+                if n <= 200_000 {
+                    for id in 0..n as u32 {
+                        set.insert(nm(v, id));
+                    }
                 }
-            }
-            set.into_iter().collect()
+                set.into_iter().collect::<Vec<String>>()
+            });
+            let _ = tx.send(names);
         });
     }
 
@@ -677,6 +744,83 @@ impl StrandApp {
         self.depth_limit.trim().parse::<u32>().ok()
     }
 
+    /// Owned view handle for a worker thread: `Arc` clone for files,
+    /// a pinned read `Snapshot` for stores.
+    fn job_view(&self) -> Option<JobView> {
+        match &self.backend {
+            Some(Backend::File(g)) => Some(JobView::File(g.clone())),
+            Some(Backend::Store(s)) => {
+                s.begin_read().ok().map(JobView::Store)
+            }
+            None => None,
+        }
+    }
+
+    /// Run an analysis on a worker thread so the UI never blocks.
+    /// Latest request wins: starting a new job drops the old receiver,
+    /// so a stale result can't overwrite fresher state.
+    fn spawn_analysis(
+        &mut self,
+        status: &str,
+        job: impl FnOnce(&JobView) -> AnalysisResult + Send + 'static,
+    ) {
+        let Some(jv) = self.job_view() else {
+            self.status = "no graph open".to_string();
+            return;
+        };
+        let (tx, rx) = channel();
+        self.analysis_rx = Some(rx);
+        self.status = status.to_string();
+        std::thread::spawn(move || {
+            let res = job(&jv);
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Poll worker channels once per frame: apply finished analyses,
+    /// focus depths, and the name index.
+    fn poll_workers(&mut self) {
+        if let Some(rx) = &self.analysis_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.set_report(res.title, res.lines);
+                    if let Some(d) = res.depths {
+                        self.depths = d;
+                    }
+                    if let Some(h) = res.highlight {
+                        self.highlight = h;
+                    }
+                    self.status = res.status;
+                    self.viz_dirty = true;
+                    self.analysis_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.analysis_rx = None,
+            }
+        }
+        if let Some(rx) = &self.depths_rx {
+            match rx.try_recv() {
+                Ok(d) => {
+                    self.depths = d;
+                    self.viz_dirty = true;
+                    self.depths_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.depths_rx = None,
+            }
+        }
+        if let Some(rx) = &self.names_rx {
+            match rx.try_recv() {
+                Ok(names) => {
+                    self.names = names;
+                    self.names_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.names_rx = None,
+            }
+        }
+    }
+
     fn set_report(&mut self, title: String, lines: Vec<ReportRow>) {
         let mut lines = lines;
         if lines.len() > MAX_REPORT_LINES {
@@ -718,67 +862,64 @@ impl StrandApp {
             return;
         };
         let depth = self.depth_arg();
-        let lines = with_view!(self, |v| {
-            let d = algo::bfs(v, &[a], dir, depth);
-            let mut out = Vec::new();
-            let mut by_depth: BTreeMap<u32, Vec<(u32, String)>> = BTreeMap::new();
-            for (id, &dep) in d.iter().enumerate() {
-                if dep != algo::UNVISITED && dep > 0 {
-                    by_depth
-                        .entry(dep)
-                        .or_default()
-                        .push((id as u32, nm(v, id as u32)));
+        self.spawn_analysis("analyzing…", move |jv| {
+            job_view!(jv, |v| {
+                let d = algo::bfs(v, &[a], dir, depth);
+                let mut out = Vec::new();
+                let mut by_depth: BTreeMap<u32, Vec<(u32, String)>> =
+                    BTreeMap::new();
+                let mut affected = BTreeSet::new();
+                for (id, &dep) in d.iter().enumerate() {
+                    if dep != algo::UNVISITED && dep > 0 {
+                        affected.insert(id as u32);
+                        by_depth
+                            .entry(dep)
+                            .or_default()
+                            .push((id as u32, nm(v, id as u32)));
+                    }
                 }
-            }
-            for (dep, items) in by_depth {
-                for (id, name) in items {
-                    out.push(row_node(format!("{dep}	{name}"), id, name));
+                for (dep, items) in by_depth {
+                    for (id, name) in items {
+                        out.push(row_node(format!("{dep}\t{name}"), id, name));
+                    }
                 }
-            }
-            out
+                let title = match dir {
+                    Dir::Out => format!("dependencies of node {a}"),
+                    Dir::In => format!("impact of node {a} (who depends on it)"),
+                };
+                AnalysisResult {
+                    status: title.clone(),
+                    title,
+                    lines: out,
+                    depths: Some(d),
+                    highlight: Some(affected),
+                }
+            })
         });
-        self.highlight_from_depths(a, dir, depth);
-        let title = match dir {
-            Dir::Out => format!("dependencies of node {a}"),
-            Dir::In => format!("impact of node {a} (who depends on it)"),
-        };
-        self.set_report(title, lines);
     }
 
     /// Re-layout around the selected node: BFS a few hops in both
-    /// directions so its neighborhood clusters into view. Does not touch
-    /// the highlight set (that's analyses-only).
+    /// directions so its neighborhood clusters into view. Runs on a
+    /// worker thread (depths only — does not touch the report).
     fn focus_a(&mut self) {
         let Some(a) = self.sel_a else { return };
-        self.depths = with_view!(self, |v| {
-            let out = algo::bfs(v, &[a], Dir::Out, Some(3));
-            let inn = algo::bfs(v, &[a], Dir::In, Some(3));
-            out.iter()
-                .zip(inn.iter())
-                .map(|(&x, &y)| match (x, y) {
-                    (algo::UNVISITED, d) | (d, algo::UNVISITED) => d,
-                    (x, y) => x.min(y),
-                })
-                .collect()
+        let Some(jv) = self.job_view() else { return };
+        let (tx, rx) = channel();
+        self.depths_rx = Some(rx);
+        std::thread::spawn(move || {
+            let depths = job_view!(&jv, |v| {
+                let out = algo::bfs(v, &[a], Dir::Out, Some(3));
+                let inn = algo::bfs(v, &[a], Dir::In, Some(3));
+                out.iter()
+                    .zip(inn.iter())
+                    .map(|(&x, &y)| match (x, y) {
+                        (algo::UNVISITED, d) | (d, algo::UNVISITED) => d,
+                        (x, y) => x.min(y),
+                    })
+                    .collect::<Vec<u32>>()
+            });
+            let _ = tx.send(depths);
         });
-        self.viz_dirty = true;
-    }
-
-    /// Recompute depths for the ring layout and store the affected set.
-    fn highlight_from_depths(&mut self, seed: u32, dir: Dir, max_depth: Option<u32>) {
-        let (depths, names) = with_view!(self, |v| {
-            let d = algo::bfs(v, &[seed], dir, max_depth);
-            let affected: BTreeSet<u32> = d
-                .iter()
-                .enumerate()
-                .filter(|&(_, &x)| x != algo::UNVISITED && x > 0)
-                .map(|(i, _)| i as u32)
-                .collect();
-            (d, affected)
-        });
-        self.depths = depths;
-        self.highlight = names;
-        self.viz_dirty = true;
     }
 
     fn run_why(&mut self) {
@@ -786,17 +927,26 @@ impl StrandApp {
             self.status = "select nodes A and B first".into();
             return;
         };
-        let lines = with_view!(self, |v| {
-            match algo::shortest_path(v, a, b) {
-                Some(path) => {
-                    let names: Vec<String> =
-                        path.iter().map(|&id| nm(v, id)).collect();
-                    vec![row(names.join(" -> "))]
+        self.spawn_analysis("finding path…", move |jv| {
+            job_view!(jv, |v| {
+                let title = format!("shortest dependency path {a} -> {b}");
+                let lines = match algo::shortest_path(v, a, b) {
+                    Some(path) => {
+                        let names: Vec<String> =
+                            path.iter().map(|&id| nm(v, id)).collect();
+                        vec![row(names.join(" -> "))]
+                    }
+                    None => vec![row("no path")],
+                };
+                AnalysisResult {
+                    status: title.clone(),
+                    title,
+                    lines,
+                    depths: None,
+                    highlight: None,
                 }
-                None => vec![row("no path")],
-            }
+            })
         });
-        self.set_report(format!("shortest dependency path {a} -> {b}"), lines);
     }
 
     /// Same as run_why but B -> A.
@@ -805,17 +955,26 @@ impl StrandApp {
             self.status = "select nodes A and B first".into();
             return;
         };
-        let lines = with_view!(self, |v| {
-            match algo::shortest_path(v, b, a) {
-                Some(path) => {
-                    let names: Vec<String> =
-                        path.iter().map(|&id| nm(v, id)).collect();
-                    vec![row(names.join(" -> "))]
+        self.spawn_analysis("finding path…", move |jv| {
+            job_view!(jv, |v| {
+                let title = format!("shortest dependency path {b} -> {a}");
+                let lines = match algo::shortest_path(v, b, a) {
+                    Some(path) => {
+                        let names: Vec<String> =
+                            path.iter().map(|&id| nm(v, id)).collect();
+                        vec![row(names.join(" -> "))]
+                    }
+                    None => vec![row("no path")],
+                };
+                AnalysisResult {
+                    status: title.clone(),
+                    title,
+                    lines,
+                    depths: None,
+                    highlight: None,
                 }
-                None => vec![row("no path")],
-            }
+            })
         });
-        self.set_report(format!("shortest dependency path {b} -> {a}"), lines);
     }
 
     /// Swap the A and B selections (ids and name boxes).
@@ -826,157 +985,209 @@ impl StrandApp {
     }
 
     fn run_cycles(&mut self) {
-        let lines = with_view!(self, |v| {
-            let sccs = algo::strongly_connected(v);
-            let cycles: Vec<&Vec<u32>> = sccs.iter().filter(|c| c.len() > 1).collect();
-            if cycles.is_empty() {
-                vec![row("no cycles")]
-            } else {
-                let mut out = Vec::new();
-                for c in cycles.iter().take(500) {
-                    let names: Vec<String> = c
-                        .iter()
-                        .take(20)
-                        .map(|&id| nm(v, id))
-                        .collect();
-                    let suffix = if c.len() > 20 {
-                        format!(", ... +{} more", c.len() - 20)
+        self.spawn_analysis("finding cycles…", move |jv| {
+            job_view!(jv, |v| {
+                let lines = {
+                    let sccs = algo::strongly_connected(v);
+                    let cycles: Vec<&Vec<u32>> =
+                        sccs.iter().filter(|c| c.len() > 1).collect();
+                    if cycles.is_empty() {
+                        vec![row("no cycles")]
                     } else {
-                        String::new()
-                    };
-                    out.push(row(format!(
-                        "cycle ({}): {}{}",
-                        c.len(),
-                        names.join(", "),
-                        suffix
-                    )));
+                        let mut out = Vec::new();
+                        for c in cycles.iter().take(500) {
+                            let names: Vec<String> = c
+                                .iter()
+                                .take(20)
+                                .map(|&id| nm(v, id))
+                                .collect();
+                            let suffix = if c.len() > 20 {
+                                format!(", ... +{} more", c.len() - 20)
+                            } else {
+                                String::new()
+                            };
+                            out.push(row(format!(
+                                "cycle ({}): {}{}",
+                                c.len(),
+                                names.join(", "),
+                                suffix
+                            )));
+                        }
+                        if cycles.len() > 500 {
+                            out.push(row(format!(
+                                "... {} more cycles",
+                                cycles.len() - 500
+                            )));
+                        }
+                        out
+                    }
+                };
+                AnalysisResult {
+                    status: "cycles".into(),
+                    title: "cycles (SCCs with >1 node)".into(),
+                    lines,
+                    depths: None,
+                    highlight: None,
                 }
-                if cycles.len() > 500 {
-                    out.push(row(format!("... {} more cycles", cycles.len() - 500)));
-                }
-                out
-            }
+            })
         });
-        self.set_report("cycles (SCCs with >1 node)".into(), lines);
     }
 
     fn run_top(&mut self) {
         let n: usize = self.top_n.trim().parse().unwrap_or(20);
         let metric = self.top_metric;
-        let lines = with_view!(self, |v| {
-            let nv = nn(v);
-            let mut scored: Vec<(f64, u32)> = match metric {
-                TopMetric::InDegree => (0..nv as u32)
-                    .map(|id| (v.in_degree(id) as f64, id))
-                    .collect(),
-                TopMetric::PageRank => {
-                    let pr = algo::pagerank(v, false, 1e-9, 100);
-                    pr.into_iter().enumerate().map(|(i, s)| (s, i as u32)).collect()
+        self.spawn_analysis("ranking…", move |jv| {
+            job_view!(jv, |v| {
+                let nv = nn(v);
+                let mut scored: Vec<(f64, u32)> = match metric {
+                    TopMetric::InDegree => (0..nv as u32)
+                        .map(|id| (v.in_degree(id) as f64, id))
+                        .collect(),
+                    TopMetric::PageRank => {
+                        let pr = algo::pagerank(v, false, 1e-9, 100);
+                        pr.into_iter()
+                            .enumerate()
+                            .map(|(i, s)| (s, i as u32))
+                            .collect()
+                    }
+                    TopMetric::Impact => {
+                        let imp = algo::impact_sizes(v);
+                        imp.into_iter()
+                            .enumerate()
+                            .map(|(i, s)| (s as f64, i as u32))
+                            .collect()
+                    }
+                };
+                scored.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let lines: Vec<ReportRow> = scored
+                    .iter()
+                    .take(n)
+                    .map(|&(s, id)| {
+                        let name = nm(v, id);
+                        row_node(format!("{s:>10.4}\t{name}"), id, name)
+                    })
+                    .collect();
+                let label = match metric {
+                    TopMetric::InDegree => "in-degree",
+                    TopMetric::Impact => "impact size",
+                    TopMetric::PageRank => "pagerank",
+                };
+                let title = format!("top {n} by {label}");
+                AnalysisResult {
+                    status: title.clone(),
+                    title,
+                    lines,
+                    depths: None,
+                    highlight: None,
                 }
-                TopMetric::Impact => {
-                    let imp = algo::impact_sizes(v);
-                    imp.into_iter().enumerate().map(|(i, s)| (s as f64, i as u32)).collect()
-                }
-            };
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            scored
-                .iter()
-                .take(n)
-                .map(|&(s, id)| {
-                    let name = nm(v, id);
-                    row_node(format!("{s:>10.4}\t{name}"), id, name)
-                })
-                .collect()
+            })
         });
-        let label = match metric {
-            TopMetric::InDegree => "in-degree",
-            TopMetric::Impact => "impact size",
-            TopMetric::PageRank => "pagerank",
-        };
-        self.set_report(format!("top {n} by {label}"), lines);
     }
 
     fn run_order(&mut self) {
-        let lines = with_view!(self, |v| {
-            let bo = algo::analyze(v);
-            let mut out = vec![row(format!(
-                "{} SCCs, critical path length {}",
-                bo.sccs.len(),
-                bo.critical_len
-            ))];
-            out.push(row(""));
-            for (i, comp) in bo.sccs.iter().enumerate() {
-                if comp.len() == 1 {
-                    let name = nm(v, comp[0]);
-                    out.push(row_node(format!("{}. {name}", i + 1), comp[0], name));
-                } else {
-                    let names: Vec<String> = comp
-                        .iter()
-                        .take(20)
-                        .map(|&id| nm(v, id))
-                        .collect();
-                    let suffix = if comp.len() > 20 {
-                        format!(", ... +{} more", comp.len() - 20)
+        self.spawn_analysis("building order…", move |jv| {
+            job_view!(jv, |v| {
+                let bo = algo::analyze(v);
+                let mut out = vec![row(format!(
+                    "{} SCCs, critical path length {}",
+                    bo.sccs.len(),
+                    bo.critical_len
+                ))];
+                out.push(row(""));
+                for (i, comp) in bo.sccs.iter().enumerate() {
+                    if comp.len() == 1 {
+                        let name = nm(v, comp[0]);
+                        out.push(row_node(format!("{}. {name}", i + 1), comp[0], name));
                     } else {
-                        String::new()
-                    };
-                    out.push(row(format!(
-                        "{}. {{{}{}}}",
-                        i + 1,
-                        names.join(", "),
-                        suffix
-                    )));
+                        let names: Vec<String> = comp
+                            .iter()
+                            .take(20)
+                            .map(|&id| nm(v, id))
+                            .collect();
+                        let suffix = if comp.len() > 20 {
+                            format!(", ... +{} more", comp.len() - 20)
+                        } else {
+                            String::new()
+                        };
+                        out.push(row(format!(
+                            "{}. {{{}{}}}",
+                            i + 1,
+                            names.join(", "),
+                            suffix
+                        )));
+                    }
+                    if out.len() > MAX_REPORT_LINES {
+                        out.push(row("... truncated"));
+                        break;
+                    }
                 }
-                if out.len() > MAX_REPORT_LINES {
-                    out.push(row("... truncated"));
-                    break;
+                AnalysisResult {
+                    status: "build order".into(),
+                    title: "build order (dependencies first)".into(),
+                    lines: out,
+                    depths: None,
+                    highlight: None,
                 }
-            }
-            out
+            })
         });
-        self.set_report("build order (dependencies first)".into(), lines);
     }
 
     fn run_roots(&mut self) {
-        let lines = with_view!(self, |v| {
-            let mut out = Vec::new();
-            let mut total = 0usize;
-            for id in 0..nn(v) as u32 {
-                if v.in_degree(id) == 0 {
-                    total += 1;
-                    if out.len() < MAX_REPORT_LINES {
-                        let name = nm(v, id);
-                        out.push(row_node(name.clone(), id, name));
+        self.spawn_analysis("finding roots…", move |jv| {
+            job_view!(jv, |v| {
+                let mut out = Vec::new();
+                let mut total = 0usize;
+                for id in 0..nn(v) as u32 {
+                    if v.in_degree(id) == 0 {
+                        total += 1;
+                        if out.len() < MAX_REPORT_LINES {
+                            let name = nm(v, id);
+                            out.push(row_node(name.clone(), id, name));
+                        }
                     }
                 }
-            }
-            if total > out.len() {
-                out.push(row(format!("... {} more", total - out.len())));
-            }
-            out
+                if total > out.len() {
+                    out.push(row(format!("... {} more", total - out.len())));
+                }
+                AnalysisResult {
+                    status: "roots".into(),
+                    title: "roots (nothing depends on them)".into(),
+                    lines: out,
+                    depths: None,
+                    highlight: None,
+                }
+            })
         });
-        self.set_report("roots (nothing depends on them)".into(), lines);
     }
 
     fn run_leaves(&mut self) {
-        let lines = with_view!(self, |v| {
-            let mut out = Vec::new();
-            let mut total = 0usize;
-            for id in 0..nn(v) as u32 {
-                if v.out_degree(id) == 0 {
-                    total += 1;
-                    if out.len() < MAX_REPORT_LINES {
-                        let name = nm(v, id);
-                        out.push(row_node(name.clone(), id, name));
+        self.spawn_analysis("finding leaves…", move |jv| {
+            job_view!(jv, |v| {
+                let mut out = Vec::new();
+                let mut total = 0usize;
+                for id in 0..nn(v) as u32 {
+                    if v.out_degree(id) == 0 {
+                        total += 1;
+                        if out.len() < MAX_REPORT_LINES {
+                            let name = nm(v, id);
+                            out.push(row_node(name.clone(), id, name));
+                        }
                     }
                 }
-            }
-            if total > out.len() {
-                out.push(row(format!("... {} more", total - out.len())));
-            }
-            out
+                if total > out.len() {
+                    out.push(row(format!("... {} more", total - out.len())));
+                }
+                AnalysisResult {
+                    status: "leaves".into(),
+                    title: "leaves (depend on nothing)".into(),
+                    lines: out,
+                    depths: None,
+                    highlight: None,
+                }
+            })
         });
-        self.set_report("leaves (depend on nothing)".into(), lines);
     }
 
     fn run_common(&mut self) {
@@ -984,28 +1195,37 @@ impl StrandApp {
             self.status = "select nodes A and B first".into();
             return;
         };
-        let mut out = Vec::new();
-        for (dir, label) in [(Dir::Out, "common dependencies"), (Dir::In, "common impact")] {
-            let names = with_view!(self, |v| {
-                algo::common(v, a, b, dir)
-                    .iter()
-                    .map(|&id| {
-                        let name = nm(v, id);
-                        (id, name)
-                    })
-                    .collect::<Vec<_>>()
-            });
-            out.push(row(format!("== {label} ({}) ==", names.len())));
-            for (i, (id, name)) in names.iter().enumerate() {
-                if i >= MAX_REPORT_LINES {
-                    out.push(row(format!("... {} more", names.len() - i)));
-                    break;
+        self.spawn_analysis("comparing…", move |jv| {
+            job_view!(jv, |v| {
+                let mut out = Vec::new();
+                for (dir, label) in [
+                    (Dir::Out, "common dependencies"),
+                    (Dir::In, "common impact"),
+                ] {
+                    let names: Vec<(u32, String)> = algo::common(v, a, b, dir)
+                        .iter()
+                        .map(|&id| (id, nm(v, id)))
+                        .collect();
+                    out.push(row(format!("== {label} ({}) ==", names.len())));
+                    for (i, (id, name)) in names.iter().enumerate() {
+                        if i >= MAX_REPORT_LINES {
+                            out.push(row(format!("... {} more", names.len() - i)));
+                            break;
+                        }
+                        out.push(row_node(name.clone(), *id, name.clone()));
+                    }
+                    out.push(row(""));
                 }
-                out.push(row_node(name.clone(), *id, name.clone()));
-            }
-            out.push(row(""));
-        }
-        self.set_report(format!("common sets of {a} and {b}"), out);
+                let title = format!("common sets of {a} and {b}");
+                AnalysisResult {
+                    status: title.clone(),
+                    title,
+                    lines: out,
+                    depths: None,
+                    highlight: None,
+                }
+            })
+        });
     }
 
     // ---- graph canvas ----
@@ -1206,6 +1426,7 @@ impl StrandApp {
     /// Invalidate any in-flight layout so a stale worker result can't
     /// overwrite fresh positions.
     fn cancel_layout(&mut self) {
+        self.layout_flag.store(true, Ordering::Relaxed);
         self.layout_gen += 1;
         self.layout_rx = None;
         self.layout_ids.clear();
@@ -1320,9 +1541,11 @@ impl StrandApp {
 
         self.layout_gen += 1;
         let gen = self.layout_gen;
+        let flag = Arc::new(AtomicBool::new(false));
+        self.layout_flag = flag.clone();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let res = force_layout(&w_start, &w_edges);
+            let res = force_layout(&w_start, &w_edges, &flag);
             let _ = tx.send((gen, res));
         });
         self.layout_rx = Some(rx);
@@ -1642,6 +1865,8 @@ impl eframe::App for StrandApp {
             }
         }
 
+        self.poll_workers();
+
         // Panels must be added outermost-first, CentralPanel last.
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1714,7 +1939,7 @@ impl eframe::App for StrandApp {
                                 if !q.is_empty() && !name.to_lowercase().contains(&q) {
                                     continue;
                                 }
-                                if shown >= 300 {
+                                if shown >= 1000 {
                                     break;
                                 }
                                 shown += 1;
@@ -1727,8 +1952,8 @@ impl eframe::App for StrandApp {
                                 }
                             }
                         });
-                    if shown >= 300 {
-                        ui.label("… first 300 matches — refine the filter");
+                    if shown >= 1000 {
+                        ui.label("… first 1000 matches — refine the filter");
                     }
                     if let Some((name, to_b)) = picked {
                         let id = with_view!(self, |v| v.node_id(name.as_str()));

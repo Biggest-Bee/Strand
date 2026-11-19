@@ -119,15 +119,14 @@ jobs:
             binary: strand
           # macOS x86_64 runs under Rosetta on the ARM runner — avoids
           # the tiny/slow Intel runner pool (macos-13 queues for ages).
+          # Both macOS archives smoke on ONE runner — hosted macOS
+          # runners are scarce; two legs doubled the queue wait.
           - os: macos-latest
             artifact: strand-aarch64-apple-darwin
-            archive: strand-aarch64-apple-darwin.tar.gz
-            binary: strand
-          - os: macos-latest
-            artifact: strand-aarch64-apple-darwin
-            archive: strand-x86_64-apple-darwin.tar.gz
-            binary: strand
-            rosetta: true
+            archives: |
+              strand-aarch64-apple-darwin.tar.gz
+              strand-x86_64-apple-darwin.tar.gz
+            rosetta: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install Rosetta
@@ -139,38 +138,46 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist
 
-      - name: Extract archive
+      - name: Extract archives
         shell: bash
         run: |
           set -e
           cd dist
-          case "${{ matrix.archive }}" in
-            *.zip) unzip -o "${{ matrix.archive }}" ;;
-            *) tar -xzf "${{ matrix.archive }}" ;;
-          esac
-          chmod +x "${{ matrix.binary }}" 2>/dev/null || true
+          # Each archive extracts into its own dir — the macOS job tests
+          # two tarballs whose binaries are both named `strand`.
+          for a in ${{ matrix.archives || format('"{0}"', matrix.archive) }}; do
+            d="x/$(basename "$a" | sed 's/\.[^.]*$//')"
+            mkdir -p "$d"
+            case "$a" in
+              *.zip) unzip -o "$a" -d "$d" ;;
+              *) tar -xzf "$a" -C "$d" ;;
+            esac
+          done
+          chmod +x x/*/strand 2>/dev/null || true
 
-      - name: Smoke test binary
+      - name: Smoke test binaries
         shell: bash
         run: |
           set -e
           cd dist
-          # matrix.rosetta -> run the x86_64 binary via Rosetta 2
-          run_bin() {
-            if [ "${{ matrix.rosetta }}" = "true" ]; then
-              arch -x86_64 ./"${{ matrix.binary }}" "$@"
-            else
-              ./"${{ matrix.binary }}" "$@"
+          for d in x/*/; do
+            if [ -f "${d}strand.exe" ]; then bin="${d}strand.exe";
+            elif [ -f "${d}strand" ]; then bin="${d}strand";
+            else continue; fi
+            # x86_64 macOS binary runs under Rosetta 2.
+            prefix=()
+            if [ -n "${{ matrix.rosetta }}" ] && [[ "$d" == *x86_64* ]]; then
+              prefix=(arch -x86_64)
             fi
-          }
-          run_bin --version
-          printf 'src,dst\napp,lib\nlib,core\n' > t.csv
-          run_bin build t.csv -o t.strand
-          run_bin info t.strand
-          # No `grep -q`: it exits on first match and closes the pipe,
-          # which panics Rust binaries on EPIPE. Plain grep reads EOF.
-          run_bin nodes t.strand | grep app
-          run_bin impact t.strand lib
+            "${prefix[@]}" "$bin" --version
+            printf 'src,dst\napp,lib\nlib,core\n' > t.csv
+            "${prefix[@]}" "$bin" build t.csv -o t.strand
+            "${prefix[@]}" "$bin" info t.strand
+            # No `grep -q`: it exits on first match and closes the pipe,
+            # which panics Rust binaries on EPIPE. Plain grep reads EOF.
+            "${prefix[@]}" "$bin" nodes t.strand | grep app
+            "${prefix[@]}" "$bin" impact t.strand lib
+          done
 
   release:
     needs: [build, smoke]
