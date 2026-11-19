@@ -5,6 +5,7 @@ edition = "2021"
 description = "Embeddable read-write graph store: immutable CSR base + WAL delta + compaction"
 license = "Apache-2.0"
 repository = "https://github.com/Biggest-Bee/Strand"
+readme.workspace = true
 keywords = ["storage", "wal", "embedded-database", "graph"]
 categories = ["database-implementations"]
 

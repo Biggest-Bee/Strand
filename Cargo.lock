@@ -3526,20 +3526,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
-name = "strand"
-version = "0.1.0"
-dependencies = [
- "clap",
- "libc",
- "serde",
- "serde_json",
- "strand-core",
- "strand-import",
- "tempfile",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "strand-app"
 version = "0.2.0"
 dependencies = [
@@ -3550,6 +3536,20 @@ dependencies = [
  "serde_json",
  "strand-core",
  "strand-store",
+]
+
+[[package]]
+name = "strand-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "strand-core",
+ "strand-import",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

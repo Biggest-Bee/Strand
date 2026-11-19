@@ -5,6 +5,7 @@ edition = "2021"
 description = "Importers for strand graphs: cargo metadata, CSV/TSV, lockfiles (Cargo.lock, package-lock, poetry.lock, go.mod, pom.xml), and source scanners (Rust/Python/JS)"
 license = "Apache-2.0"
 repository = "https://github.com/Biggest-Bee/Strand"
+readme.workspace = true
 keywords = ["import", "parsers", "dependency-graph", "lockfile"]
 categories = ["parser-implementations"]
 

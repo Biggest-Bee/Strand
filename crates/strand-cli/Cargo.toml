@@ -1,10 +1,11 @@
 [package]
-name = "strand"
+name = "strand-cli"
 version = "0.1.0"
 edition = "2021"
 description = "Dependency and impact analysis CLI for memory-mapped CSR graphs"
 license = "Apache-2.0"
 repository = "https://github.com/Biggest-Bee/Strand"
+readme.workspace = true
 keywords = ["cli", "dependency-graph", "impact-analysis"]
 categories = ["command-line-utilities"]
 

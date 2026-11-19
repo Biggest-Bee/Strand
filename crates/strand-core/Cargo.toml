@@ -5,6 +5,7 @@ edition = "2021"
 description = "Memory-mapped CSR graph engine and dependency/impact analysis algorithms"
 license = "Apache-2.0"
 repository = "https://github.com/Biggest-Bee/Strand"
+readme.workspace = true
 keywords = ["graph", "csr", "mmap", "dependency-analysis"]
 categories = ["data-structures"]
 

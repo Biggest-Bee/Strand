@@ -8,6 +8,14 @@ members = [
     "crates/strand-app",
 ]
 
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Biggest-Bee/Strand"
+homepage = "https://github.com/Biggest-Bee/Strand"
+documentation = "https://docs.rs/strand-core"
+readme = "README.md"
+
 [workspace.dependencies]
 memmap2 = "0.9"
 bytemuck = "1"

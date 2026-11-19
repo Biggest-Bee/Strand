@@ -72,7 +72,7 @@ against `SHA256SUMS.txt`. Each archive contains `strand` (CLI) and
 cd path/to/Strand
 cargo install --path crates/strand-cli   # the `strand` CLI
 cargo install --path crates/strand-app   # the desktop GUI
-# (once published to crates.io: `cargo install strand`)
+# (once published to crates.io: `cargo install strand-cli strand-app`)
 ```
 
 `cargo install` puts the binaries in `%USERPROFILE%\.cargo\bin`
