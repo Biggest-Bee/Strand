@@ -348,13 +348,29 @@ fn main() -> ExitCode {
     // Short commands get a small grace period. stderr keeps stdout
     // machine-readable (--json, pipes).
     if let Ok(Some(v)) = update_rx.recv_timeout(std::time::Duration::from_millis(600)) {
-        eprintln!(
-            "note: a new version of {} ({v}) is available — run `cargo install {}` to update",
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_NAME"),
-        );
+        print_update_box(&v);
     }
     code
+}
+
+/// Boxed update notice drawn with `-` and `|` so it stands out in
+/// terminal output without ANSI colors.
+fn print_update_box(latest: &str) {
+    let pkg = env!("CARGO_PKG_NAME");
+    let current = env!("CARGO_PKG_VERSION");
+    let lines = [
+        format!("A new version of {pkg} is available"),
+        format!("installed: {current}    latest: {latest}"),
+        format!("update: cargo install {pkg}"),
+    ];
+    let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let bar = "-".repeat(width + 2);
+    eprintln!(" {bar}");
+    for line in &lines {
+        let pad = width - line.chars().count();
+        eprintln!("| {line}{} |", " ".repeat(pad));
+    }
+    eprintln!(" {bar}");
 }
 
 fn run(cmd: Commands) -> strand_core::Result<()> {
@@ -1321,4 +1337,12 @@ fn cmd_check(a: CheckArgs) -> strand_core::Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn update_box_renders() {
+        super::print_update_box("9.9.9");
+    }
 }

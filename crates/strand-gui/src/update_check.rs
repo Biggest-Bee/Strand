@@ -1,59 +1,24 @@
-//! crates.io version check: at most once per 24h, cached in
-//! `~/.strand/update_check_<pkg>`, ~800ms timeout, silent on any
-//! error (Strand is offline-first). Disable with
-//! `STRAND_NO_UPDATE_CHECK=1`.
+//! crates.io version check on every run: ~800ms timeout on a
+//! background thread, silent on any error (Strand is offline-first).
+//! Disable with `STRAND_NO_UPDATE_CHECK=1`.
 
-use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const PKG: &str = env!("CARGO_PKG_NAME");
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
-const CACHE_SECS: u64 = 24 * 3600;
 const TIMEOUT: Duration = Duration::from_millis(800);
-
-fn cache_path() -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))?;
-    Some(
-        PathBuf::from(home)
-            .join(".strand")
-            .join(format!("update_check_{PKG}")),
-    )
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn cache_fresh() -> bool {
-    let Some(c) = cache_path() else { return false };
-    let Ok(ts) = std::fs::read_to_string(c) else { return false };
-    ts.trim()
-        .parse::<u64>()
-        .map_or(false, |t| now_secs().saturating_sub(t) < CACHE_SECS)
-}
 
 /// Spawn a background check. The receiver yields `Some(new_version)`
 /// at most once if crates.io has a newer release; `None` otherwise.
 pub fn spawn() -> Receiver<Option<String>> {
     let (tx, rx) = channel();
-    if std::env::var_os("STRAND_NO_UPDATE_CHECK").is_some() || cache_fresh() {
+    if std::env::var_os("STRAND_NO_UPDATE_CHECK").is_some() {
         let _ = tx.send(None);
         return rx;
     }
-    let cache = cache_path();
     std::thread::spawn(move || {
         let _ = tx.send(fetch_latest());
-        if let Some(c) = cache {
-            if let Some(dir) = c.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(c, now_secs().to_string());
-        }
     });
     rx
 }
