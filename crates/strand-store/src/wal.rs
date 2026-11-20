@@ -179,12 +179,15 @@ pub fn replay(file: &std::fs::File) -> Result<(Vec<Vec<Op>>, u64)> {
         let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as u64;
         let crc = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
         let rec_len = 8u64.saturating_add(len);
+        // Cap check BEFORE the torn-tail bounds check: a corrupt huge
+        // length would otherwise look like a torn tail and silently
+        // truncate every later committed record.
+        if len > MAX_RECORD_LEN {
+            return Err(Error::Invalid("wal: absurd record length".into()));
+        }
         if rec_len > file_len - offset {
             // Record claims more bytes than the file holds: torn tail.
             break;
-        }
-        if len > MAX_RECORD_LEN {
-            return Err(Error::Invalid("wal: absurd record length".into()));
         }
         let mut payload = vec![0u8; len as usize];
         match r.read_exact(&mut payload) {

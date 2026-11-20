@@ -510,6 +510,119 @@ fn crash_consistency(iters: usize) {
     }
 }
 
+/// Corruption in the MIDDLE of the log (not the tail): flipping a byte
+/// inside an early record's payload must make open fail loudly — never
+/// silently drop that record and every later commit.
+#[test]
+fn wal_mid_log_corruption_refuses_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.strandb");
+    {
+        let store = Store::open(&path).unwrap();
+        // Several commits so the corrupted record is followed by more data.
+        for i in 0..4 {
+            commit(&store, |tx| {
+                tx.add_edge(&format!("n{i}"), "dep").unwrap();
+            });
+        }
+    }
+    let wal = path.join("wal-0.log");
+    let mut bytes = std::fs::read(&wal).unwrap();
+    assert!(bytes.len() > 30);
+    // Flip a byte inside the FIRST record's payload (past its 8-byte
+    // header, well before the end of the file).
+    bytes[10] ^= 0xFF;
+    std::fs::write(&wal, &bytes).unwrap();
+
+    let err = match Store::open(&path) {
+        Ok(_) => panic!("mid-log corruption must fail open"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("corrupt") || err.to_string().contains("wal"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A garbage length field (0x3FFFFFFF ≈ 1 GiB) at a record boundary must
+/// return an error — not be mistaken for a torn tail (which would
+/// silently truncate every later commit) and not trigger a giant alloc.
+#[test]
+fn wal_garbage_length_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.strandb");
+    {
+        let store = Store::open(&path).unwrap();
+        for i in 0..3 {
+            commit(&store, |tx| {
+                tx.add_edge(&format!("n{i}"), "dep").unwrap();
+            });
+        }
+    }
+    let wal = path.join("wal-0.log");
+    let mut bytes = std::fs::read(&wal).unwrap();
+    // Overwrite the first record's length field with 0x3FFFFFFF.
+    bytes[0..4].copy_from_slice(&0x3FFF_FFFFu32.to_le_bytes());
+    std::fs::write(&wal, &bytes).unwrap();
+
+    let err = match Store::open(&path) {
+        Ok(_) => panic!("garbage length must fail open"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("absurd") || err.to_string().contains("wal"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A compaction that fails BEFORE the manifest swap must leave the old
+/// base + WAL fully intact: the store reopens with every earlier commit.
+/// (Post-swap code is infallible by construction — all fallible work,
+/// including the manifest write, happens before the in-memory swap.)
+#[test]
+fn compact_failure_preserves_committed_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.strandb");
+    let store = Store::open(&path).unwrap();
+    for i in 0..5 {
+        commit(&store, |tx| {
+            tx.add_edge(&format!("n{i}"), "dep").unwrap();
+        });
+    }
+
+    // Block the new base path: `base-1.strand` exists as a *directory*,
+    // so builder.build() fails before the manifest swap.
+    std::fs::create_dir(path.join("base-1.strand")).unwrap();
+    let err = store.compact().expect_err("compaction must fail");
+    assert!(err.to_string().contains("base-1") || err.to_string().len() > 0);
+
+    // More commits after the failed compaction still work on the old WAL.
+    commit(&store, |tx| {
+        tx.add_edge("after", "dep").unwrap();
+    });
+    drop(store);
+
+    // Reopen: every commit — including post-failure ones — is present.
+    let store = Store::open(&path).unwrap();
+    let snap = store.begin_read().unwrap();
+    let adj = adj_of(&snap);
+    for i in 0..5 {
+        assert!(
+            adj.get(&format!("n{i}"))
+                .is_some_and(|deps| deps.contains(&"dep".to_string())),
+            "missing edge n{i} -> dep after failed compaction"
+        );
+    }
+    assert!(adj.get("after").is_some_and(|d| d.contains(&"dep".to_string())));
+
+    // Cleanup so a later compact can succeed.
+    std::fs::remove_dir(path.join("base-1.strand")).unwrap();
+    store.compact().unwrap();
+    let snap = store.begin_read().unwrap();
+    let adj = adj_of(&snap);
+    assert_eq!(adj.len(), 7); // n0..n4 + after + dep
+}
+
 #[test]
 fn auto_compact_threshold() {
     let dir = tempfile::tempdir().unwrap();
