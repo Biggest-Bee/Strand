@@ -347,22 +347,24 @@ fn main() -> ExitCode {
     // The check runs on a thread; long commands already gave it time.
     // Short commands get a small grace period. stderr keeps stdout
     // machine-readable (--json, pipes).
-    if let Ok(Some(v)) = update_rx.recv_timeout(std::time::Duration::from_millis(600)) {
-        print_update_box(&v);
+    if let Ok(Some(updates)) = update_rx.recv_timeout(std::time::Duration::from_millis(900)) {
+        print_update_box(&updates);
     }
     code
 }
 
 /// Boxed update notice drawn with `-` and `|` so it stands out in
-/// terminal output without ANSI colors.
-fn print_update_box(latest: &str) {
-    let pkg = env!("CARGO_PKG_NAME");
-    let current = env!("CARGO_PKG_VERSION");
-    let lines = [
-        format!("A new version of {pkg} is available"),
-        format!("installed: {current}    latest: {latest}"),
-        format!("update: cargo install {pkg}"),
-    ];
+/// terminal output without ANSI colors. Lists every strand crate on
+/// crates.io that is newer than the version compiled into this binary.
+fn print_update_box(updates: &[update_check::Update]) {
+    let mut lines = vec!["Updates available:".to_string()];
+    for u in updates {
+        lines.push(format!("{}: {} -> {}", u.name, u.installed, u.latest));
+    }
+    lines.push(format!(
+        "update: cargo install {} (libraries: cargo update)",
+        env!("CARGO_PKG_NAME")
+    ));
     let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let bar = "-".repeat(width + 2);
     eprintln!(" {bar}");
@@ -1343,6 +1345,17 @@ fn cmd_check(a: CheckArgs) -> strand_core::Result<()> {
 mod tests {
     #[test]
     fn update_box_renders() {
-        super::print_update_box("9.9.9");
+        super::print_update_box(&[
+            super::update_check::Update {
+                name: "strand-cli".into(),
+                installed: "0.3.0".into(),
+                latest: "9.9.9".into(),
+            },
+            super::update_check::Update {
+                name: "strand-store".into(),
+                installed: "0.2.1".into(),
+                latest: "0.2.2".into(),
+            },
+        ]);
     }
 }

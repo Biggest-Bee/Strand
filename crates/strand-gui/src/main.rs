@@ -179,7 +179,7 @@ struct StrandApp {
     /// Reference window opened by the "Instructions" button.
     show_instructions: bool,
     /// crates.io update check (background; resolves once).
-    update_rx: Option<Receiver<Option<String>>>,
+    update_rx: Option<Receiver<Option<Vec<update_check::Update>>>>,
     /// Newer-version notice text, once known.
     update_note: Option<String>,
     /// In-flight worker analysis; latest request wins.
@@ -1853,10 +1853,19 @@ impl eframe::App for StrandApp {
         // crates.io update check resolves once in the background.
         if let Some(rx) = &self.update_rx {
             match rx.try_recv() {
-                Ok(Some(v)) => {
-                    self.update_note = Some(format!(
-                        "strand-gui {v} available - run `cargo install strand-gui`"
-                    ));
+                Ok(Some(updates)) => {
+                    self.update_note = Some(
+                        updates
+                            .iter()
+                            .map(|u| {
+                                format!(
+                                    "{} {} -> {} available - run `cargo install {}`",
+                                    u.name, u.installed, u.latest, u.name
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
                     self.update_rx = None;
                 }
                 Ok(None) => self.update_rx = None,
