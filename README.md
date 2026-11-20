@@ -1,6 +1,7 @@
 # Strand
 
 [![CI](https://github.com/Biggest-Bee/Strand/actions/workflows/ci.yml/badge.svg)](https://github.com/Biggest-Bee/Strand/actions/workflows/ci.yml)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/kNCE7R3v8)
 
 ![Strand desktop app showing dependency analysis results](docs/screenshot.png)
 
