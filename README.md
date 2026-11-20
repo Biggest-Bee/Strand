@@ -58,8 +58,10 @@ Tests live in each crate's `tests/` directory (see [Testing](#testing)).
 
 **Prebuilt binaries** — grab the archive for your platform from
 [Releases](https://github.com/Biggest-Bee/Strand/releases) and verify it
-against `SHA256SUMS.txt`. Each archive contains `strand` (CLI) and
-`strand-gui` (desktop GUI).
+against `SHA256SUMS.txt`. Archives cover Windows x86_64, Linux x86_64
+(glibc 2.35), macOS arm64, and macOS x86_64 (runs under Rosetta 2 on
+Apple Silicon, natively on Intel). Each archive contains `strand` (CLI)
+and `strand-gui` (desktop GUI).
 
 > The binaries are **unsigned**: Windows SmartScreen ("Windows protected
 > your PC") and macOS Gatekeeper ("cannot be opened because the
@@ -383,9 +385,13 @@ i5-1335U (12 threads, 8GB RAM); page cache warm unless noted:
 | `top --by impact` (SCC condensation + bitsets) | ~17 s total incl. open+SCC |
 
 Caveat: the synthetic graph is near-regular (every node has exactly 5
-out-edges), so PageRank converges unusually fast. Real dependency graphs
-are skewed with a few hub nodes; expect more iterations there. BFS and SCC
-times are edge-count bound and should transfer to skewed graphs.
+out-edges) *and* collapses into one giant SCC, so the condensation has a
+single component and the bitsets are tiny — the ~17 s `top --by impact`
+row does not represent a large mostly-acyclic graph (that's what the
+sampling path covers, e.g. the 300k-node run). PageRank also converges
+unusually fast here. Real dependency graphs are skewed with a few hub
+nodes; expect more iterations there. BFS and SCC times are edge-count
+bound and should transfer to skewed graphs.
 
 ### Real-world graph (npm lockfiles)
 
@@ -501,8 +507,10 @@ cargo test
   sampling even when exact is affordable (benchmarking/validation);
   `--exact` forces the exact algorithm even over budget (per-node BFS
   fallback — can be very slow on huge DAGs). Estimates are clamped to
-  `n-1`. `impact_sizes()` itself still falls back to
-  per-node BFS for small graphs that exceed the bitset budget.
+  `n-1`. The library function `impact_sizes()` itself falls back to
+  exact per-node BFS for *any* graph over the bitset budget — which can
+  run for hours on a large mostly-acyclic DAG; use `impact_sizes_auto`
+  for the sampling path.
 - `why --all-paths` enumerates alternative *shortest* chains (cap via
   `--limit`), or every simple chain up to `--max-depth N` hops. Both are
   step-budgeted and report truncation, so dense graphs can't hang.
@@ -513,6 +521,14 @@ cargo test
   lock); scale-out means one store per shard — e.g. one `.strandb` per
   top-level subtree or per service, queried independently. Cross-shard
   queries are not supported yet.
+- Store node ids are **not stable across compaction**: the new base
+  renumbers nodes by name, so anything holding ids across a compaction
+  (selections, cached lookups) goes stale. Use node *names* as stable
+  keys — `node_id`/`node_name` re-resolve cheaply.
+- Edges have a single kind — optionally weighted (`f32`), nothing more.
+  There are no dependency-type distinctions (dev vs build vs optional,
+  import vs require); importers that know the kind (e.g. cargo
+  metadata's dep kinds) currently collapse them into one edge.
 - Store delta is in-memory, but commits auto-compact once it passes
   `Options::compact_threshold_ops` (default 1M ops, 0 disables) — the
   delta can still spike RAM between compactions, and readers pin their
@@ -539,6 +555,9 @@ cargo test
   and dynamic language tricks. Nodes are file
   paths, so it answers "what breaks if I change `src/foo.rs`?" —
   package-level questions still want `cargo metadata` input.
+  Unresolvable imports and third-party packages are dropped entirely
+  (they are not nodes); the node set is exactly the source files found
+  under the scan root.
 
 ## License
 
