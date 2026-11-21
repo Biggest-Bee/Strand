@@ -512,6 +512,39 @@ fn scan_python_dynamic_import_literals() {
 }
 
 #[test]
+fn scan_python_entry_points() {
+    // [project.entry-points] in pyproject.toml registers plugins at
+    // runtime; the config file becomes the edge source.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "myplugin/__init__.py", "");
+    w(root, "myplugin/ldap.py", "class Plugin: pass\n");
+    w(root, "myplugin/oauth.py", "class Plugin: pass\n");
+    w(
+        root,
+        "pyproject.toml",
+        concat!(
+            "[project]\nname = \"myplugin\"\nversion = \"0.1.0\"\n\n",
+            "[project.entry-points.\"myapp.plugins\"]\n",
+            "ldap = \"myplugin.ldap:Plugin\"\n",
+            "oauth = \"myplugin.oauth:Plugin [extra]\"\n",
+            "broken = \"not a module!!\"\n",
+        ),
+    );
+    // A pyproject with no entry points must not become a node.
+    w(root, "other/pyproject.toml", "[project]\nname = \"x\"\n");
+    w(root, "other/mod.py", "");
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    assert!(has("pyproject.toml", "myplugin/ldap.py"));
+    assert!(has("pyproject.toml", "myplugin/oauth.py")); // "module:attr [extras]"
+    assert!(out.nodes.contains(&"pyproject.toml".to_string()));
+    assert!(!out.nodes.contains(&"other/pyproject.toml".to_string()));
+}
+
+#[test]
 fn scan_js_ignores_strings_and_comments() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

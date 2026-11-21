@@ -118,7 +118,8 @@ enum ScanLang {
 
 #[derive(Parser)]
 struct ScanArgs {
-    /// Project directory to scan for source files.
+    /// Project directory to scan for source files. A file path scans
+    /// its project root (nearest ancestor with a manifest).
     dir: PathBuf,
     /// Output .strand file (default: <dir-name>.strand).
     #[arg(short, long)]
@@ -452,9 +453,15 @@ fn cmd_build(a: BuildArgs) -> strand_core::Result<()> {
 }
 
 fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
+    // A file argument scans its project root (nearest ancestor with a
+    // manifest) so imports and entry points resolve with full context.
+    let root = if a.dir.is_file() {
+        scan_root_for(&a.dir)
+    } else {
+        a.dir.clone()
+    };
     let out = a.output.unwrap_or_else(|| {
-        let name = a
-            .dir
+        let name = root
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "scan".to_string());
@@ -467,7 +474,7 @@ fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
         ScanLang::Js => vec![Lang::Js],
         ScanLang::All => vec![Lang::Rust, Lang::Python, Lang::Js],
     };
-    let scan = strand_import::scan::scan_project(&a.dir, &langs)?;
+    let scan = strand_import::scan::scan_project(&root, &langs)?;
     for w in &scan.warnings {
         eprintln!("warning: {w}");
     }
@@ -479,12 +486,85 @@ fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
     let stats = b.build(&out)?;
     eprintln!(
         "scanned {}: {} nodes, {} edges -> {}",
-        a.dir.display(),
+        root.display(),
         stats.n_nodes,
         stats.n_edges,
         stats.path.display()
     );
     Ok(())
+}
+
+/// Project root for a file argument: nearest ancestor directory
+/// containing a manifest (`pyproject.toml`, `Cargo.toml`, ...),
+/// falling back to the file's parent directory. The user's home
+/// directory is never accepted as a root - a stray `package.json`
+/// there would otherwise scan the whole home tree.
+fn scan_root_for(file: &Path) -> PathBuf {
+    const MARKERS: &[&str] = &[
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "Cargo.toml",
+        "package.json",
+        "go.mod",
+        "pom.xml",
+    ];
+    let parent = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let fallback = parent.to_path_buf();
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .and_then(|h| h.canonicalize().ok());
+    let mut dir = parent.canonicalize().unwrap_or_else(|_| fallback.clone());
+    // A member crate's Cargo.toml (no [workspace]) is only a fallback:
+    // keep climbing so a workspace root or higher manifest wins.
+    let mut cargo_candidate: Option<PathBuf> = None;
+    loop {
+        let is_home = home.as_ref().is_some_and(|h| dir == *h);
+        if !is_home {
+            let mut hit = dir.join(".git").exists();
+            let mut cargo_only = false;
+            if !hit {
+                for m in MARKERS {
+                    if dir.join(m).is_file() {
+                        hit = true;
+                        if *m == "Cargo.toml" {
+                            let ws = std::fs::read_to_string(dir.join(m))
+                                .map(|t| t.contains("[workspace]"))
+                                .unwrap_or(false);
+                            cargo_only = !ws;
+                        }
+                        break;
+                    }
+                }
+            }
+            if hit {
+                if cargo_only {
+                    if cargo_candidate.is_none() {
+                        cargo_candidate = Some(strip_verbatim(dir.clone()));
+                    }
+                } else {
+                    return strip_verbatim(dir);
+                }
+            }
+        }
+        match dir.parent() {
+            Some(p) if p != dir => dir = p.to_path_buf(),
+            _ => return cargo_candidate.unwrap_or(fallback),
+        }
+    }
+}
+
+/// `canonicalize` on Windows yields `\\?\`-prefixed paths; strip the
+/// prefix so scanned-root display stays readable.
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    match p.to_string_lossy().strip_prefix("\\\\?\\") {
+        Some(s) => PathBuf::from(s),
+        None => p,
+    }
 }
 
 fn cmd_info(a: InfoArgs) -> strand_core::Result<()> {

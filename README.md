@@ -543,7 +543,9 @@ cargo test
   grouped `use` trees (`use a::{b, c::d}`) are handled by the grammar,
   not text matching. It handles `mod`/`use`/`#[path]`/`include!` (Rust),
   `import`/`from` incl. relative imports and literal
-  `import_module()`/`__import__()` calls (Python), and
+  `import_module()`/`__import__()` calls, plus
+  `pyproject.toml` `[project.entry-points]` targets (the config file
+  becomes the edge source) (Python), and
   `import`/`export-from`/`require`/dynamic `import()` (JS/TS),
   including `tsconfig`/`jsconfig` `paths` aliases and
   `baseUrl` (JSONC-tolerant, `extends` chains followed, nearest config
@@ -554,8 +556,8 @@ cargo test
   them either without expanding macros - `cargo expand` output is a
   workaround for inspection, not for scanning), `include_str!` payloads,
   and dynamic language tricks - computed module names
-  (`import_module('pkg.' + name)`), `importlib.metadata` entry-point
-  plugins, and `getattr`-based dispatch stay invisible, so runtime-only
+  (`import_module('pkg.' + name)`), `setup.cfg` entry points, and
+  `getattr`-based dispatch stay invisible, so runtime-only
   dependencies can be missed. Nodes are file
   paths, so it answers "what breaks if I change `src/foo.rs`?" -
   package-level questions still want `cargo metadata` input.

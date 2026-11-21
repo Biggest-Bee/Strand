@@ -866,8 +866,88 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             edges.push((rel.clone(), dep, None));
         }
     }
-    let nodes = names.into_iter().collect();
-    Ok(ScanOutput { edges, nodes, warnings })
+
+    // `pyproject.toml` [project.entry-points] registers plugins at
+    // runtime. The config file becomes the edge source so impact
+    // analysis can see entry-point targets.
+    let mut tomls: Vec<(String, PathBuf)> = Vec::new();
+    walk_ext(root, root, &["toml"], &mut tomls)?;
+    let mut nodes: BTreeSet<String> = names.iter().cloned().collect();
+    for (rel, abs) in tomls {
+        if Path::new(&rel).file_name().and_then(|s| s.to_str()) != Some("pyproject.toml") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&abs) else {
+            continue;
+        };
+        let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
+            continue;
+        };
+        let Some(eps) = doc
+            .get("project")
+            .and_then(|p| p.get("entry-points"))
+            .and_then(|e| e.as_table())
+        else {
+            continue;
+        };
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        for (_group, specs) in eps {
+            let Some(specs) = specs.as_table() else {
+                continue;
+            };
+            for (_name, spec) in specs {
+                let Some(spec) = spec.as_str() else {
+                    continue;
+                };
+                // Entry-point spec is "module.path:attr [extras]".
+                let module = spec.split(':').next().unwrap_or(spec).trim();
+                let segs: Vec<String> = module
+                    .split('.')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let valid = !segs.is_empty()
+                    && segs.iter().all(|s| {
+                        s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                if !valid {
+                    continue;
+                }
+                for base in entry_bases(&rel) {
+                    if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
+                        if dep != rel {
+                            deps.insert(dep);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if !deps.is_empty() {
+            for dep in deps {
+                edges.push((rel.clone(), dep, None));
+            }
+            nodes.insert(rel);
+        }
+    }
+    Ok(ScanOutput { edges, nodes: nodes.into_iter().collect(), warnings })
+}
+
+/// Candidate package roots for entry-point module resolution:
+/// ancestor dirs of the pyproject plus their `src/` subdirs
+/// (src-layout projects).
+fn entry_bases(rel: &str) -> Vec<String> {
+    ancestor_bases(rel)
+        .into_iter()
+        .flat_map(|b| {
+            let src = if b.is_empty() {
+                "src".to_string()
+            } else {
+                format!("{b}/src")
+            };
+            [b, src]
+        })
+        .collect()
 }
 
 /// Resolve a `from <dots><mod> import <names>` against the file set.
