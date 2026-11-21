@@ -81,10 +81,20 @@ payload:
   u32 nkinds
   nkinds x { u32 len, utf8 kind name }     // interned kind strings
   n_nodes x u32 kind_index                 // u32::MAX = untyped
+  [n_edges x u8 fwd kind tags]             // only when any edge is non-Static
+  [n_edges x u8 rev kind tags]             // parallel to the CSR orders
 ```
 
-When the builder assigns no kinds, the section is just the 8-byte zero
-length prefix.
+When the builder assigns no node kinds AND every edge is `Static`, the
+section is just the 8-byte zero length prefix. When any edge carries a
+non-`Static` [`EdgeKind`](../crates/strand-core/src/lib.rs), the two
+trailing `u8` tables appear after the node kind ids - forward-CSR order
+then reverse-CSR order, one tag per edge, parallel to the target/source
+slices. Edge-kind tags are the `EdgeKind` confidence values
+(`Heuristic`=0 < `Traced`=1 < `Declared`=2 < `Resolved`=3 <
+`Static`=4). Readers that predate edge kinds stop after the node ids
+and treat every edge as `Static`; writers omit the tables entirely for
+all-`Static` graphs, so files stay byte-identical to the old format.
 
 ## Validation (reader contract)
 

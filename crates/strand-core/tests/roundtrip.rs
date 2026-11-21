@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use strand_core::{Graph, GraphBuilder, MergeOp};
+use strand_core::view::{ConfidenceView, GraphView};
+use strand_core::{EdgeKind, Graph, GraphBuilder, MergeOp};
 
 fn build(edges: &[(&str, &str)], dir: &tempfile::TempDir) -> std::path::PathBuf {
     let mut b = GraphBuilder::new();
@@ -124,6 +125,108 @@ fn node_kinds_roundtrip() {
     let g = Graph::open(&p).unwrap();
     assert_eq!(g.node_kind(g.node_id("app").unwrap()), Some("service"));
     assert_eq!(g.node_kind(g.node_id("lib").unwrap()), Some("crate"));
+}
+
+#[test]
+fn edge_kinds_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    b.add_edge_kind("a", "b", EdgeKind::Static);
+    b.add_edge_kind("a", "c", EdgeKind::Heuristic);
+    b.add_edge_kind("b", "c", EdgeKind::Traced);
+    b.add_edge_kind("b", "d", EdgeKind::Declared);
+    let p = dir.path().join("ek.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+
+    let a = g.node_id("a").unwrap();
+    let b = g.node_id("b").unwrap();
+    let c = g.node_id("c").unwrap();
+    let _d = g.node_id("d").unwrap();
+
+    // Targets are id-sorted: a's out = [b(1), c(2)].
+    let ka = g.out_kinds(a).unwrap();
+    assert_eq!(
+        ka,
+        &[EdgeKind::Static.as_tag(), EdgeKind::Heuristic.as_tag()]
+    );
+    let kb = g.out_kinds(b).unwrap();
+    assert_eq!(
+        kb,
+        &[EdgeKind::Traced.as_tag(), EdgeKind::Declared.as_tag()]
+    );
+
+    // Reverse kinds parallel in_targets.
+    let kc = g.in_kinds(c).unwrap();
+    assert_eq!(kc.len(), 2);
+    assert!(kc.contains(&EdgeKind::Heuristic.as_tag()));
+    assert!(kc.contains(&EdgeKind::Traced.as_tag()));
+
+    // Kind slices parallel the target slices.
+    assert_eq!(g.out_targets(a).len(), ka.len());
+    assert_eq!(g.out_targets(b).len(), kb.len());
+}
+
+#[test]
+fn edge_kind_dedup_keeps_max_confidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    // Same edge declared twice with different kinds: highest wins.
+    b.add_edge_kind("a", "b", EdgeKind::Heuristic);
+    b.add_edge_kind("a", "b", EdgeKind::Static);
+    let p = dir.path().join("dk.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+    let a = g.node_id("a").unwrap();
+    assert_eq!(g.n_edges(), 1);
+    assert_eq!(g.out_kinds(a).unwrap(), &[EdgeKind::Static.as_tag()]);
+}
+
+#[test]
+fn all_static_edges_write_no_kind_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = build(&[("a", "b"), ("b", "c")], &dir);
+    let g = Graph::open(&p).unwrap();
+    let a = g.node_id("a").unwrap();
+    // Pre-kind files (and all-Static builds) expose no kind table;
+    // readers treat every edge as Static.
+    assert!(g.out_kinds(a).is_none());
+}
+
+#[test]
+fn confidence_view_filters_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    // a -> b (Static), b -> c (Heuristic), a -> c (Static direct).
+    b.add_edge_kind("a", "b", EdgeKind::Static);
+    b.add_edge_kind("b", "c", EdgeKind::Heuristic);
+    b.add_edge_kind("a", "c", EdgeKind::Static);
+    let p = dir.path().join("cv.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+
+    let a = g.node_id("a").unwrap();
+    let c = g.node_id("c").unwrap();
+
+    // Unfiltered: c reachable from a in 1 hop (direct edge).
+    let all = ConfidenceView::new(&g, 0);
+    let mut reached = Vec::new();
+    all.out_edges(a, &mut |t| reached.push(t));
+    assert_eq!(reached.len(), 2);
+
+    // min=Declared: b->c is Heuristic (0 < 2) so it's cut; a->b and
+    // a->c remain. c still reachable via a->c.
+    let v = ConfidenceView::new(&g, EdgeKind::Declared.confidence());
+    let depths = strand_core::algo::bfs(&v, &[a], strand_core::algo::Dir::Out, None);
+    assert_ne!(depths[c as usize], strand_core::algo::UNVISITED);
+
+    // min=Static: only Static edges - a->c survives, a->b is Static
+    // too, but b->c cut. From a: {b, c} still (a->c direct).
+    // Check the b->c hop is gone: from b alone, c unreachable.
+    let b = g.node_id("b").unwrap();
+    let v2 = ConfidenceView::new(&g, EdgeKind::Static.confidence());
+    let depths2 = strand_core::algo::bfs(&v2, &[b], strand_core::algo::Dir::Out, None);
+    assert_eq!(depths2[c as usize], strand_core::algo::UNVISITED);
 }
 
 #[test]

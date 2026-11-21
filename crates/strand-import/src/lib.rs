@@ -29,8 +29,10 @@ pub enum Format {
     Pom,
 }
 
-/// One parsed edge: `src -> dst` ("src depends on dst"), optional weight.
-pub type EdgeList = Vec<(String, String, Option<f32>)>;
+/// One parsed edge: `src -> dst` ("src depends on dst"), optional
+/// weight, and a provenance/confidence tag ([`strand_core::EdgeKind`];
+/// parsers always emit [`strand_core::EdgeKind::Static`]).
+pub type EdgeList = Vec<(String, String, Option<f32>, strand_core::EdgeKind)>;
 
 /// Parse `text` according to `format`.
 pub fn parse(text: &str, format: Format) -> Result<EdgeList> {
@@ -84,7 +86,7 @@ pub fn detect_format(path: &std::path::Path, text: &str) -> Format {
 
 /// Feed an [`EdgeList`] into a [`strand_core::GraphBuilder`].
 pub fn fill_builder(edges: EdgeList, builder: &mut strand_core::GraphBuilder) -> Result<()> {
-    for (src, dst, w) in edges {
+    for (src, dst, w, kind) in edges {
         if src == dst {
             // Self-loops carry no dependency information; skip them so
             // `cycles` output stays meaningful (cargo dev-deps self-loop
@@ -92,8 +94,8 @@ pub fn fill_builder(edges: EdgeList, builder: &mut strand_core::GraphBuilder) ->
             continue;
         }
         match w {
-            Some(w) => builder.add_edge_weighted(src, dst, w),
-            None => builder.add_edge(src, dst),
+            Some(w) => builder.add_edge_weighted_kind(src, dst, w, kind),
+            None => builder.add_edge_kind(src, dst, kind),
         }
     }
     Ok(())

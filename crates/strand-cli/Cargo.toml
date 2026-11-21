@@ -1,6 +1,6 @@
 [package]
 name = "strand-cli"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2021"
 description = "Dependency and impact analysis CLI for memory-mapped CSR graphs"
 license = "Apache-2.0"
@@ -14,8 +14,8 @@ name = "strand"
 path = "src/main.rs"
 
 [dependencies]
-strand-core = { path = "../strand-core", version = "0.1.0" }
-strand-import = { path = "../strand-import", version = "0.10.0" }
+strand-core = { path = "../strand-core", version = "0.2.0" }
+strand-import = { path = "../strand-import", version = "0.11.0" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -61,7 +61,7 @@ pub fn parse(text: &str) -> Result<EdgeList> {
             ),
             _ => None,
         };
-        edges.push((src, dst, weight));
+        edges.push((src, dst, weight, strand_core::EdgeKind::Static));
     }
     Ok(edges)
 }

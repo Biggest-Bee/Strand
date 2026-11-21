@@ -29,7 +29,7 @@ fn print_out(out: &scan::ScanOutput) {
     let mut edges: Vec<_> = out
         .edges
         .iter()
-        .map(|(s, d, _)| (s.clone(), d.clone()))
+        .map(|(s, d, ..)| (s.clone(), d.clone()))
         .collect();
     edges.sort();
     edges.dedup();

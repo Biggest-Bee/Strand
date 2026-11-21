@@ -6,7 +6,7 @@ fn edges(text: &str, f: Format) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = strand_import::parse(text, f)
         .unwrap()
         .into_iter()
-        .map(|(a, b, _)| (a, b))
+        .map(|(a, b, ..)| (a, b))
         .collect();
     v.sort();
     v

@@ -18,11 +18,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use strand_core::{Error, Result};
+use strand_core::{EdgeKind, Error, Result};
 use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 
 use crate::EdgeList;
+
+/// Record `dep` with `kind`, keeping the highest-confidence tag when
+/// several refs resolve to the same file.
+fn note_dep(deps: &mut BTreeMap<String, EdgeKind>, dep: String, kind: EdgeKind) {
+    deps.entry(dep)
+        .and_modify(|k| *k = (*k).max(kind))
+        .or_insert(kind);
+}
 
 /// Directories never descended into: VCS internals, dependency dirs,
 /// and conventional build/tooling output (`.next`, `dist`, `out`,
@@ -124,7 +132,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
                 continue;
             }
         };
-        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
 
         // `mod foo;` declarations -> foo.rs or foo/mod.rs under this
         // file's module directory. `#[path = "..."]` comes straight from
@@ -137,7 +145,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
             };
             if let Some(dep) = dep {
                 if dep != *rel {
-                    deps.insert(dep);
+                    note_dep(&mut deps, dep, EdgeKind::Static);
                 }
             }
         }
@@ -147,7 +155,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
         for inc in &refs.includes {
             if let Some(dep) = normalize_rel(parent, inc).filter(|c| names.contains(c)) {
                 if dep != *rel {
-                    deps.insert(dep);
+                    note_dep(&mut deps, dep, EdgeKind::Static);
                 }
             }
         }
@@ -161,7 +169,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
                 .find(|c| names.contains(c));
             if let Some(dep) = dep {
                 if dep != *rel {
-                    deps.insert(dep);
+                    note_dep(&mut deps, dep, EdgeKind::Declared);
                 }
             }
         }
@@ -181,7 +189,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
                 };
                 if let Some(dep) = dep {
                     if dep != *rel {
-                        deps.insert(dep);
+                        note_dep(&mut deps, dep, EdgeKind::Static);
                     }
                 }
                 continue;
@@ -194,13 +202,13 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
             }
             if let Some(dep) = resolve(&names, &base, &rest) {
                 if dep != *rel {
-                    deps.insert(dep);
+                    note_dep(&mut deps, dep, EdgeKind::Static);
                 }
             }
         }
 
-        for dep in deps {
-            edges.push((rel.clone(), dep, None));
+        for (dep, kind) in deps {
+            edges.push((rel.clone(), dep, None, kind));
         }
     }
 
@@ -228,7 +236,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
             ));
         }
 
-        let targets: BTreeSet<&str> = edges.iter().map(|(_, d, _)| d.as_str()).collect();
+        let targets: BTreeSet<&str> = edges.iter().map(|(_, d, _, _)| d.as_str()).collect();
         let edgeless: Vec<&String> = depinfo
             .intersection(&names)
             .filter(|f| !targets.contains(f.as_str()) && !is_probable_crate_root(f))
@@ -242,7 +250,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
         let mut unresolved: Vec<&String> = Vec::new();
         for f in edgeless {
             match infer_rs_parent(&names, f) {
-                Some(parent) => edges.push((parent, f.clone(), None)),
+                Some(parent) => edges.push((parent, f.clone(), None, EdgeKind::Heuristic)),
                 None => unresolved.push(f),
             }
         }
@@ -2513,7 +2521,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                 "{rel}: {dynamic} dynamic import site(s) - edges may be incomplete"
             ));
         }
-        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
         let parent = parent_rel(rel);
 
         for r in refs {
@@ -2525,7 +2533,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                     for b in ancestor_bases(rel) {
                         if let Some(dep) = resolve_py_exact(&names, &b, &segs) {
                             if dep != *rel {
-                                deps.insert(dep);
+                                note_dep(&mut deps, dep, EdgeKind::Static);
                             }
                             break;
                         }
@@ -2542,7 +2550,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                     for pat in patterns {
                         for dep in py_glob_expand(&names, &[parent, ""], &pat) {
                             if dep != *rel {
-                                deps.insert(dep);
+                                note_dep(&mut deps, dep, EdgeKind::Resolved);
                             }
                         }
                     }
@@ -2557,7 +2565,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                             for b in ancestor_bases(rel) {
                                 if let Some(dep) = resolve_py_exact(&names, &b, &segs[..end]) {
                                     if dep != *rel {
-                                        deps.insert(dep);
+                                        note_dep(&mut deps, dep, EdgeKind::Declared);
                                     }
                                     break 'outer;
                                 }
@@ -2588,13 +2596,13 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             };
             if let Some(dep) = dep {
                 if dep != *rel {
-                    deps.insert(dep);
+                    note_dep(&mut deps, dep, EdgeKind::Declared);
                 }
             }
         }
 
-        for dep in deps {
-            edges.push((rel.clone(), dep, None));
+        for (dep, kind) in deps {
+            edges.push((rel.clone(), dep, None, kind));
         }
     }
 
@@ -2617,7 +2625,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                 format!("{dir}/conftest.py")
             };
             if names.contains(&conf) && conf != *rel {
-                edges.push((rel.clone(), conf, None));
+                edges.push((rel.clone(), conf, None, EdgeKind::Declared));
             }
             if dir.is_empty() {
                 break;
@@ -2651,7 +2659,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
         else {
             continue;
         };
-        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
         for (group, specs) in eps {
             let Some(specs) = specs.as_table() else {
                 continue;
@@ -2678,7 +2686,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                 for base in entry_bases(&rel) {
                     if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
                         if dep != rel {
-                            deps.insert(dep.clone());
+                            note_dep(&mut deps, dep.clone(), EdgeKind::Declared);
                             group_deps.insert(dep);
                         }
                         break;
@@ -2693,8 +2701,8 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             }
         }
         if !deps.is_empty() {
-            for dep in deps {
-                edges.push((rel.clone(), dep, None));
+            for (dep, kind) in deps {
+                edges.push((rel.clone(), dep, None, kind));
             }
             nodes.insert(rel);
         }
@@ -2711,13 +2719,13 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
         let Ok(text) = fs::read_to_string(&abs) else {
             continue;
         };
-        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
         for (group, module) in setup_cfg_entry_groups(&text) {
             let segs: Vec<String> = module.split('.').map(str::to_string).collect();
             for base in entry_bases(&rel) {
                 if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
                     if dep != rel {
-                        deps.insert(dep.clone());
+                        note_dep(&mut deps, dep.clone(), EdgeKind::Declared);
                         ep_targets.entry(group.clone()).or_default().insert(dep);
                     }
                     break;
@@ -2725,8 +2733,8 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             }
         }
         if !deps.is_empty() {
-            for dep in deps {
-                edges.push((rel.clone(), dep, None));
+            for (dep, kind) in deps {
+                edges.push((rel.clone(), dep, None, kind));
             }
             nodes.insert(rel);
         }
@@ -2740,7 +2748,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
         let Ok(text) = fs::read_to_string(abs) else {
             continue;
         };
-        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
         let (specs, dynamic) = setup_py_entry_groups(&text);
         if dynamic > 0 {
             warnings.push(format!(
@@ -2752,15 +2760,15 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             for base in entry_bases(rel) {
                 if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
                     if dep != *rel {
-                        deps.insert(dep.clone());
+                        note_dep(&mut deps, dep.clone(), EdgeKind::Declared);
                         ep_targets.entry(group.clone()).or_default().insert(dep);
                     }
                     break;
                 }
             }
         }
-        for dep in deps {
-            edges.push((rel.clone(), dep, None));
+        for (dep, kind) in deps {
+            edges.push((rel.clone(), dep, None, kind));
         }
     }
 
@@ -2782,7 +2790,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             }
             targets.remove(&rel);
             for dep in targets {
-                edges.push((rel.clone(), dep, None));
+                edges.push((rel.clone(), dep, None, EdgeKind::Resolved));
             }
         }
     }
@@ -3109,7 +3117,7 @@ fn add_py_from(
     level: usize,
     segs: &[String],
     imps: &[String],
-    deps: &mut BTreeSet<String>,
+    deps: &mut BTreeMap<String, EdgeKind>,
 ) {
     let mut base = parent.to_string();
     for _ in 1..level {
@@ -3129,7 +3137,7 @@ fn add_py_from(
         for b in &bases {
             if let Some(dep) = resolve_py(names, b, segs) {
                 if dep != rel {
-                    deps.insert(dep);
+                    note_dep(deps, dep, EdgeKind::Static);
                 }
                 break;
             }
@@ -3141,7 +3149,7 @@ fn add_py_from(
             for b in &bases {
                 if let Some(dep) = resolve_py(names, b, &ns) {
                     if dep != rel {
-                        deps.insert(dep);
+                        note_dep(deps, dep, EdgeKind::Static);
                     }
                     break;
                 }
@@ -3153,7 +3161,7 @@ fn add_py_from(
             for b in &bases {
                 if let Some(dep) = resolve_py(names, b, std::slice::from_ref(name)) {
                     if dep != rel {
-                        deps.insert(dep);
+                        note_dep(deps, dep, EdgeKind::Static);
                     }
                     break;
                 }
@@ -3231,7 +3239,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
                 "{rel}: {dynamic} dynamic import site(s) - edges may be incomplete"
             ));
         }
-        let mut deps: BTreeSet<String> = BTreeSet::new();
+        let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
         let parent = parent_rel(rel);
         let resolver = alias_cache.for_dir(parent);
 
@@ -3243,7 +3251,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
                 };
                 if let Some(dep) = resolve_js(&names, &norm) {
                     if dep != *rel {
-                        deps.insert(dep);
+                        note_dep(&mut deps, dep, EdgeKind::Static);
                     }
                 }
                 continue;
@@ -3253,7 +3261,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
             // else is node_modules.
             if let Some(dep) = resolve_js_alias(&resolver, &names, &spec) {
                 if dep != *rel {
-                    deps.insert(dep);
+                    note_dep(&mut deps, dep, EdgeKind::Static);
                 }
             }
         }
@@ -3264,7 +3272,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
         for pat in globs {
             for dep in js_glob_expand(&names, &[parent, ""], &pat) {
                 if dep != *rel {
-                    deps.insert(dep);
+                    note_dep(&mut deps, dep, EdgeKind::Resolved);
                 }
             }
         }
@@ -3296,13 +3304,13 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
             };
             if let Some(dep) = dep {
                 if dep != *rel {
-                    deps.insert(dep);
+                    note_dep(&mut deps, dep, EdgeKind::Declared);
                 }
             }
         }
 
-        for dep in deps {
-            edges.push((rel.clone(), dep, None));
+        for (dep, kind) in deps {
+            edges.push((rel.clone(), dep, None, kind));
         }
     }
     let nodes = names.into_iter().collect();

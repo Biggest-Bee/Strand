@@ -59,7 +59,7 @@ pub fn parse(text: &str) -> Result<EdgeList> {
             }
             if let Some(dst) = resolved {
                 if dst != src {
-                    edges.push((src.clone(), dst, None));
+                    edges.push((src.clone(), dst, None, strand_core::EdgeKind::Static));
                 }
             }
         }

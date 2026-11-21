@@ -13,7 +13,7 @@ use std::path::Path;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::format::{self, Header, N_SECTIONS};
-use crate::{Error, Result};
+use crate::{EdgeKind, Error, Result};
 
 /// How duplicate `(src, dst)` edges are merged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -32,6 +32,8 @@ pub struct Edge {
     pub src: String,
     pub dst: String,
     pub weight: f32,
+    /// Provenance/confidence tag (see [`EdgeKind`]).
+    pub kind: EdgeKind,
 }
 
 /// Statistics returned by [`GraphBuilder::build`].
@@ -56,8 +58,11 @@ pub struct GraphBuilder {
     /// large graphs from ids avoids a `String` per edge endpoint.
     arena: Vec<String>,
     arena_ids: HashMap<String, u32>,
-    idx_edges: Vec<(u32, u32, f32)>,
+    idx_edges: Vec<(u32, u32, f32, EdgeKind)>,
     weighted: bool,
+    /// True once any edge carries a non-`Static` kind - gates writing
+    /// the edge-kind tables into `node_meta`.
+    has_edge_kinds: bool,
 }
 
 impl Default for GraphBuilder {
@@ -77,6 +82,7 @@ impl GraphBuilder {
             arena_ids: HashMap::new(),
             idx_edges: Vec::new(),
             weighted: false,
+            has_edge_kinds: false,
         }
     }
 
@@ -86,6 +92,25 @@ impl GraphBuilder {
             src: src.into(),
             dst: dst.into(),
             weight: 1.0,
+            kind: EdgeKind::Static,
+        });
+    }
+
+    /// [`add_edge`](Self::add_edge) with an explicit provenance tag.
+    pub fn add_edge_kind(
+        &mut self,
+        src: impl Into<String>,
+        dst: impl Into<String>,
+        kind: EdgeKind,
+    ) {
+        if kind != EdgeKind::Static {
+            self.has_edge_kinds = true;
+        }
+        self.edges.push(Edge {
+            src: src.into(),
+            dst: dst.into(),
+            weight: 1.0,
+            kind,
         });
     }
 
@@ -102,6 +127,27 @@ impl GraphBuilder {
             src: src.into(),
             dst: dst.into(),
             weight,
+            kind: EdgeKind::Static,
+        });
+    }
+
+    /// Weighted + kinded variant of [`add_edge_kind`](Self::add_edge_kind).
+    pub fn add_edge_weighted_kind(
+        &mut self,
+        src: impl Into<String>,
+        dst: impl Into<String>,
+        weight: f32,
+        kind: EdgeKind,
+    ) {
+        self.weighted = true;
+        if kind != EdgeKind::Static {
+            self.has_edge_kinds = true;
+        }
+        self.edges.push(Edge {
+            src: src.into(),
+            dst: dst.into(),
+            weight,
+            kind,
         });
     }
 
@@ -133,13 +179,30 @@ impl GraphBuilder {
     /// Add an edge between two previously [`intern`](Self::intern)ed
     /// indices - no per-edge `String` allocation.
     pub fn add_edge_idx(&mut self, src: u32, dst: u32) {
-        self.idx_edges.push((src, dst, 1.0));
+        self.idx_edges.push((src, dst, 1.0, EdgeKind::Static));
+    }
+
+    /// [`add_edge_idx`](Self::add_edge_idx) with an explicit kind.
+    pub fn add_edge_idx_kind(&mut self, src: u32, dst: u32, kind: EdgeKind) {
+        if kind != EdgeKind::Static {
+            self.has_edge_kinds = true;
+        }
+        self.idx_edges.push((src, dst, 1.0, kind));
     }
 
     /// Weighted variant of [`add_edge_idx`](Self::add_edge_idx).
     pub fn add_edge_idx_weighted(&mut self, src: u32, dst: u32, weight: f32) {
         self.weighted = true;
-        self.idx_edges.push((src, dst, weight));
+        self.idx_edges.push((src, dst, weight, EdgeKind::Static));
+    }
+
+    /// Weighted + kinded variant of [`add_edge_idx`](Self::add_edge_idx).
+    pub fn add_edge_idx_weighted_kind(&mut self, src: u32, dst: u32, weight: f32, kind: EdgeKind) {
+        self.weighted = true;
+        if kind != EdgeKind::Static {
+            self.has_edge_kinds = true;
+        }
+        self.idx_edges.push((src, dst, weight, kind));
     }
 
     /// Assign a "kind" tag to a node (e.g. `"crate"`, `"service"`). Written
@@ -181,46 +244,53 @@ impl GraphBuilder {
             .map(|(i, n)| (*n, i as u32))
             .collect();
 
-        // 2. Resolve edges to id pairs and sort/dedupe.
-        let mut resolved: Vec<(u32, u32, f32)> =
+        // 2. Resolve edges to id pairs and sort/dedupe. Kinds merge by
+        //    max confidence: the strongest claim about an edge wins.
+        let mut resolved: Vec<(u32, u32, f32, EdgeKind)> =
             Vec::with_capacity(self.edges.len() + self.idx_edges.len());
         for e in &self.edges {
             resolved.push((
                 name_to_id[e.src.as_str()],
                 name_to_id[e.dst.as_str()],
                 e.weight,
+                e.kind,
             ));
         }
-        for &(s, d, w) in &self.idx_edges {
+        for &(s, d, w, k) in &self.idx_edges {
             resolved.push((
                 name_to_id[self.arena[s as usize].as_str()],
                 name_to_id[self.arena[d as usize].as_str()],
                 w,
+                k,
             ));
         }
         resolved.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
-        let mut deduped: Vec<(u32, u32, f32)> = Vec::with_capacity(resolved.len());
-        for (s, d, w) in resolved {
+        let mut deduped: Vec<(u32, u32, f32, EdgeKind)> = Vec::with_capacity(resolved.len());
+        for (s, d, w, k) in resolved {
             if let Some(last) = deduped.last_mut() {
                 if last.0 == s && last.1 == d {
                     last.2 = match self.merge {
                         MergeOp::Sum => last.2 + w,
                         MergeOp::Max => last.2.max(w),
                     };
+                    last.3 = last.3.max(k);
                     continue;
                 }
             }
-            deduped.push((s, d, w));
+            deduped.push((s, d, w, k));
         }
         let n_edges = deduped.len() as u64;
 
         // 3. Forward CSR: edges of node i are targets[fwd_offsets[i]..fwd_offsets[i+1]].
-        let (fwd_offsets, fwd_targets, fwd_weights) = build_csr(n_nodes as usize, &deduped);
+        let (fwd_offsets, fwd_targets, fwd_weights, fwd_kinds) =
+            build_csr(n_nodes as usize, &deduped);
 
         // 4. Reverse CSR over the same edges.
-        let rev_edges: Vec<(u32, u32, f32)> = deduped.iter().map(|&(s, d, w)| (d, s, w)).collect();
-        let (rev_offsets, rev_sources, rev_weights) = build_csr(n_nodes as usize, &rev_edges);
+        let rev_edges: Vec<(u32, u32, f32, EdgeKind)> =
+            deduped.iter().map(|&(s, d, w, k)| (d, s, w, k)).collect();
+        let (rev_offsets, rev_sources, rev_weights, rev_kinds) =
+            build_csr(n_nodes as usize, &rev_edges);
 
         // 5. Name blob + offsets. Ids are already name-sorted, so
         //    `name_index` is the identity permutation.
@@ -233,8 +303,9 @@ impl GraphBuilder {
         }
         let name_index: Vec<u32> = (0..names.len() as u32).collect();
 
-        // 6. Optional node_meta: kind tags.
-        let meta_content = self.encode_meta(n_nodes as usize, &name_to_id)?;
+        // 6. Optional node_meta: kind tags + edge-kind tables.
+        let meta_content =
+            self.encode_meta(n_nodes as usize, &name_to_id, &fwd_kinds, &rev_kinds)?;
 
         // 7. Lay out sections and assemble the body (everything after the
         //    128-byte header), padding each section to 8 bytes.
@@ -333,9 +404,21 @@ impl GraphBuilder {
     ///
     /// Layout: `[u64 payload_len][payload]` where payload is
     /// `u32 nkinds`, then `nkinds` x (`u32 len` + utf8 kind name), then
-    /// `n_nodes` x `u32 kind_index` (`u32::MAX` = no kind).
-    fn encode_meta(&self, n_nodes: usize, name_to_id: &BTreeMap<&str, u32>) -> Result<Vec<u8>> {
-        if self.kinds.is_empty() {
+    /// `n_nodes` x `u32 kind_index` (`u32::MAX` = no kind). When any
+    /// edge carries a non-`Static` kind, two trailing `u8` tables of
+    /// `n_edges` entries each follow - forward-CSR order then
+    /// reverse-CSR order. Readers that predate edge kinds stop after
+    /// the node ids and ignore the tail.
+    fn encode_meta(
+        &self,
+        n_nodes: usize,
+        name_to_id: &BTreeMap<&str, u32>,
+        fwd_kinds: &[u8],
+        rev_kinds: &[u8],
+    ) -> Result<Vec<u8>> {
+        let write_edge_kinds =
+            self.has_edge_kinds || fwd_kinds.iter().any(|&k| k != EdgeKind::Static.as_tag());
+        if self.kinds.is_empty() && !write_edge_kinds {
             return Ok(8u64.to_le_bytes().to_vec()); // payload_len = 0
         }
 
@@ -369,6 +452,10 @@ impl GraphBuilder {
             };
             payload.extend_from_slice(&idx.to_le_bytes());
         }
+        if write_edge_kinds {
+            payload.extend_from_slice(fwd_kinds);
+            payload.extend_from_slice(rev_kinds);
+        }
 
         let mut out = Vec::with_capacity(8 + payload.len());
         out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -377,11 +464,15 @@ impl GraphBuilder {
     }
 }
 
-/// Build a CSR (offsets, targets, weights) from edges already sorted by
-/// `(src, dst)`. Targets end up sorted ascending within each row.
-fn build_csr(n_nodes: usize, edges: &[(u32, u32, f32)]) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+/// Build a CSR (offsets, targets, weights, kinds) from edges already
+/// sorted by `(src, dst)`. Targets end up sorted ascending within each
+/// row; `kinds` is parallel to `targets`.
+fn build_csr(
+    n_nodes: usize,
+    edges: &[(u32, u32, f32, EdgeKind)],
+) -> (Vec<u64>, Vec<u32>, Vec<f32>, Vec<u8>) {
     let mut offsets = vec![0u64; n_nodes + 1];
-    for &(s, _, _) in edges {
+    for &(s, _, _, _) in edges {
         offsets[s as usize + 1] += 1;
     }
     for i in 0..n_nodes {
@@ -390,14 +481,16 @@ fn build_csr(n_nodes: usize, edges: &[(u32, u32, f32)]) -> (Vec<u64>, Vec<u32>, 
     let m = edges.len();
     let mut targets = vec![0u32; m];
     let mut weights = vec![0f32; m];
+    let mut kinds = vec![0u8; m];
     let mut cursor = offsets[..n_nodes].to_vec();
-    for &(s, d, w) in edges {
+    for &(s, d, w, k) in edges {
         let p = cursor[s as usize] as usize;
         targets[p] = d;
         weights[p] = w;
+        kinds[p] = k.as_tag();
         cursor[s as usize] += 1;
     }
-    (offsets, targets, weights)
+    (offsets, targets, weights, kinds)
 }
 
 fn cast_u64(v: &[u64]) -> &[u8] {

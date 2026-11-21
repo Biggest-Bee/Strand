@@ -17,12 +17,23 @@ pub enum Diagram {
 
 /// Collect the edges of `g` whose both endpoints are in `nodes`,
 /// deduplicated and capped at `max_edges`. Returns (edges, truncated).
-pub fn edges_within(g: &Graph, nodes: &BTreeSet<u32>, max_edges: usize) -> (Vec<(u32, u32)>, bool) {
+/// `min` filters edges below the confidence threshold.
+pub fn edges_within(
+    g: &Graph,
+    nodes: &BTreeSet<u32>,
+    max_edges: usize,
+    min: u8,
+) -> (Vec<(u32, u32)>, bool) {
     let mut edges = BTreeSet::new();
     let mut truncated = false;
     'outer: for &id in nodes {
-        for &dst in g.out_targets(id) {
+        let kinds = g.out_kinds(id);
+        for (j, &dst) in g.out_targets(id).iter().enumerate() {
             if nodes.contains(&dst) {
+                let tag = kinds.and_then(|ks| ks.get(j).copied()).unwrap_or(4);
+                if strand_core::EdgeKind::from_tag(tag).confidence() < min {
+                    continue;
+                }
                 if edges.len() >= max_edges {
                     truncated = true;
                     break 'outer;

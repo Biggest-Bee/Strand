@@ -1,6 +1,6 @@
 [package]
 name = "strand-import"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 description = "Importers for strand graphs: cargo metadata, CSV/TSV, lockfiles (Cargo.lock, package-lock, poetry.lock, go.mod, pom.xml), and source scanners (Rust/Python/JS)"
 license = "Apache-2.0"
@@ -10,7 +10,7 @@ keywords = ["import", "parsers", "dependency-graph", "lockfile"]
 categories = ["parser-implementations"]
 
 [dependencies]
-strand-core = { path = "../strand-core", version = "0.1.0" }
+strand-core = { path = "../strand-core", version = "0.2.0" }
 serde_json.workspace = true
 thiserror.workspace = true
 syn = { version = "3.0.10", features = ["full", "visit"] }

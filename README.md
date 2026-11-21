@@ -183,6 +183,22 @@ strand check deps.strand --rules ci.rules --json
 
 # Diff two graphs (e.g. rescan after changes, no git required):
 strand diff old.strand new.strand
+
+# Filter by edge confidence. Every edge carries a provenance tag:
+#   static     - directly parsed syntax (import, use, mod, literal require)
+#   resolved   - literal-derived: const-prop imports, glob expansions,
+#                entry-point consumer links
+#   declared   - config/comment declarations: depends-on, entry-point
+#                targets, pytest_plugins, INSTALLED_APPS, conftest
+#   traced     - runtime-observed via `strand trace`
+#   heuristic  - inferred (e.g. Rust parent module from file layout)
+# --min-confidence hides edges below the threshold from traversal
+# commands (deps, impact, why, top, order, roots, leaves, common,
+# cycles, diff, export). E.g. review only human-declared edges:
+strand impact deps.strand my-lib --min-confidence declared
+strand deps deps.strand app --min-confidence static   # literal imports only
+# (note: `why --weighted` uses a specialized CSR path and ignores the
+# filter - use unweighted `why` for confidence-scoped chains)
 ```
 
 Every command accepts `--json` for CI use.
@@ -539,10 +555,13 @@ cargo test
   renumbers nodes by name, so anything holding ids across a compaction
   (selections, cached lookups) goes stale. Use node *names* as stable
   keys - `node_id`/`node_name` re-resolve cheaply.
-- Edges have a single kind - optionally weighted (`f32`), nothing more.
-  There are no dependency-type distinctions (dev vs build vs optional,
-  import vs require); importers that know the kind (e.g. cargo
-  metadata's dep kinds) currently collapse them into one edge.
+- Edges carry an optional confidence/provenance tag (`EdgeKind`:
+  `static` > `resolved` > `declared` > `traced` > `heuristic`), stored
+  as per-edge `u8` tables inside `node_meta` only when any edge is
+  non-`static` - all-static graphs are byte-identical to the old
+  format, and old readers ignore the tail. There are still no
+  dependency-type distinctions (dev vs build vs optional, import vs
+  require); importers that know the kind collapse them into one edge.
 - Store delta is in-memory, but commits auto-compact once it passes
   `Options::compact_threshold_ops` (default 1M ops, 0 disables) - the
   delta can still spike RAM between compactions, and readers pin their

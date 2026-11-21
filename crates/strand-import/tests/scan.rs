@@ -47,7 +47,7 @@ fn fixture(root: &Path) {
 fn edges_of(out: &strand_import::scan::ScanOutput) -> Vec<(String, String)> {
     out.edges
         .iter()
-        .map(|(s, d, _)| (s.clone(), d.clone()))
+        .map(|(s, d, ..)| (s.clone(), d.clone()))
         .collect()
 }
 
@@ -93,7 +93,7 @@ fn scan_dedups_edges() {
     fixture(dir.path());
     let out = scan_rust(dir.path()).unwrap();
     let mut seen = std::collections::BTreeSet::new();
-    for (s, d, _) in &out.edges {
+    for (s, d, ..) in &out.edges {
         assert!(seen.insert((s.clone(), d.clone())), "dup edge {s} -> {d}");
     }
 }
@@ -688,10 +688,10 @@ fn scan_own_repo_is_sane() {
     assert!(out.nodes.iter().all(|n| n.ends_with(".rs")));
     // strand-gui's main.rs uses strand_core::algo/view paths, so it must
     // resolve into strand-core's module files.
-    assert!(out.edges.iter().any(|(s, d, _)| {
+    assert!(out.edges.iter().any(|(s, d, ..)| {
         s == "crates/strand-gui/src/main.rs" && d == "crates/strand-core/src/algo/mod.rs"
     }));
-    assert!(out.edges.iter().any(|(s, d, _)| {
+    assert!(out.edges.iter().any(|(s, d, ..)| {
         s == "crates/strand-gui/src/main.rs" && d == "crates/strand-store/src/lib.rs"
     }));
 }

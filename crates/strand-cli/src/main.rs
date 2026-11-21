@@ -6,7 +6,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use strand_core::algo::{self, Dir};
-use strand_core::{Graph, GraphBuilder, MergeOp};
+use strand_core::view::{ConfidenceView, GraphView};
+use strand_core::{EdgeKind, Graph, GraphBuilder, MergeOp};
 use strand_import::{self, Format};
 
 mod check;
@@ -92,6 +93,52 @@ enum TopBy {
     Pagerank,
 }
 
+/// Edge-confidence threshold names, ordered by trust.
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+enum Confidence {
+    /// Only directly parsed syntax edges.
+    Static,
+    /// Literal-derived resolutions: const-prop imports, globs,
+    /// entry-point consumer links.
+    Resolved,
+    /// Explicit declarations: manual `depends-on` comments, config
+    /// entry points, framework conventions.
+    Declared,
+    /// Runtime-observed edges (`strand trace`).
+    Traced,
+    /// Inferred edges (e.g. Rust parent modules from layout).
+    /// Accepting everything - the default.
+    Heuristic,
+}
+
+impl Confidence {
+    fn min_tag(self) -> u8 {
+        match self {
+            Confidence::Static => 4,
+            Confidence::Resolved => 3,
+            Confidence::Declared => 2,
+            Confidence::Traced => 1,
+            Confidence::Heuristic => 0,
+        }
+    }
+}
+
+/// Shared `--min-confidence` flag for graph-traversal commands.
+#[derive(clap::Args)]
+struct ConfidenceArgs {
+    /// Only traverse edges at least this confident. Edges below the
+    /// threshold are invisible to the query (useful for reviewing
+    /// only literal/static edges, or only human-declared ones).
+    #[arg(long, value_enum)]
+    min_confidence: Option<Confidence>,
+}
+
+impl ConfidenceArgs {
+    fn min(&self) -> u8 {
+        self.min_confidence.map_or(0, |c| c.min_tag())
+    }
+}
+
 #[derive(Parser)]
 struct BuildArgs {
     /// Input file(s): CSV/TSV edge lists or `cargo metadata` JSON.
@@ -162,6 +209,8 @@ struct NodesArgs {
 
 #[derive(Parser)]
 struct DiffArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     /// Older graph (the "before" side).
     old: PathBuf,
     /// Newer graph (the "after" side).
@@ -172,6 +221,8 @@ struct DiffArgs {
 
 #[derive(Parser)]
 struct DepsArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     node: String,
     #[arg(long)]
@@ -182,6 +233,8 @@ struct DepsArgs {
 
 #[derive(Parser)]
 struct ImpactArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     /// Seed node names. Optional when --git-diff is given.
     nodes: Vec<String>,
@@ -210,6 +263,8 @@ struct ImpactArgs {
 
 #[derive(Parser)]
 struct WhyArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     from: String,
     to: String,
@@ -234,6 +289,8 @@ struct WhyArgs {
 
 #[derive(Parser)]
 struct CyclesArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     #[arg(long)]
     json: bool,
@@ -241,6 +298,8 @@ struct CyclesArgs {
 
 #[derive(Parser)]
 struct TopArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     #[arg(long, value_enum)]
     by: TopBy,
@@ -265,6 +324,8 @@ struct TopArgs {
 
 #[derive(Parser)]
 struct OrderArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     /// Also print the longest dependency chain.
     #[arg(long)]
@@ -275,6 +336,8 @@ struct OrderArgs {
 
 #[derive(Parser)]
 struct RootsArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     #[arg(long)]
     json: bool,
@@ -282,6 +345,8 @@ struct RootsArgs {
 
 #[derive(Parser)]
 struct LeavesArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     #[arg(long)]
     json: bool,
@@ -297,6 +362,8 @@ enum DiagramFmt {
 
 #[derive(Parser)]
 struct ExportArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     /// Diagram syntax.
     #[arg(long, value_enum)]
@@ -336,6 +403,8 @@ struct CheckArgs {
 
 #[derive(Parser)]
 struct CommonArgs {
+    #[command(flatten)]
+    conf: ConfidenceArgs,
     file: PathBuf,
     /// `deps` = shared dependencies, `impact` = shared impact set.
     mode: String,
@@ -552,10 +621,13 @@ fn cmd_trace(a: TraceArgs) -> strand_core::Result<()> {
 
     let node_set: std::collections::BTreeSet<&str> =
         scan.nodes.iter().map(String::as_str).collect();
-    let mut seen: std::collections::BTreeSet<(String, String)> = scan
+    // Existing edge kinds: a traced edge only adds information when no
+    // equal-or-stronger edge already exists (the builder merges
+    // duplicate pairs by max kind anyway).
+    let kinds: BTreeMap<(String, String), EdgeKind> = scan
         .edges
         .iter()
-        .map(|(s, d, _)| (s.clone(), d.clone()))
+        .map(|(s, d, _, k)| ((s.clone(), d.clone()), *k))
         .collect();
     let mut edges = scan.edges;
     let mut observed = 0usize;
@@ -568,9 +640,12 @@ fn cmd_trace(a: TraceArgs) -> strand_core::Result<()> {
             continue;
         }
         observed += 1;
-        if seen.insert((i.clone(), o.clone())) {
+        let dominated = kinds
+            .get(&(i.clone(), o.clone()))
+            .is_some_and(|k| *k >= EdgeKind::Traced);
+        if !dominated {
             added += 1;
-            edges.push((i, o, None));
+            edges.push((i, o, None, EdgeKind::Traced));
         }
     }
     eprintln!("trace: {observed} runtime import edge(s) observed, {added} new");
@@ -699,14 +774,19 @@ fn cmd_nodes(a: NodesArgs) -> strand_core::Result<()> {
 }
 
 /// (node names, dependency edges as name pairs) for diffing.
-fn graph_snapshot(g: &Graph) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
+/// `min` filters edges below the confidence threshold.
+fn graph_snapshot(g: &Graph, min: u8) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
     let mut nodes = BTreeSet::new();
     let mut edges = BTreeSet::new();
     for i in 0..g.n_nodes() as u32 {
         let src = g.node_name(i).to_string();
         nodes.insert(src.clone());
-        for &t in g.out_targets(i) {
-            edges.insert((src.clone(), g.node_name(t).to_string()));
+        let kinds = g.out_kinds(i);
+        for (j, &t) in g.out_targets(i).iter().enumerate() {
+            let tag = kinds.and_then(|ks| ks.get(j).copied()).unwrap_or(4);
+            if EdgeKind::from_tag(tag).confidence() >= min {
+                edges.insert((src.clone(), g.node_name(t).to_string()));
+            }
         }
     }
     (nodes, edges)
@@ -715,8 +795,9 @@ fn graph_snapshot(g: &Graph) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
 fn cmd_diff(a: DiffArgs) -> strand_core::Result<()> {
     let old = open_graph(&a.old)?;
     let new = open_graph(&a.new)?;
-    let (on, oe) = graph_snapshot(&old);
-    let (nn, ne) = graph_snapshot(&new);
+    let min = a.conf.min();
+    let (on, oe) = graph_snapshot(&old, min);
+    let (nn, ne) = graph_snapshot(&new, min);
 
     let added_nodes: Vec<&String> = nn.difference(&on).collect();
     let removed_nodes: Vec<&String> = on.difference(&nn).collect();
@@ -793,8 +874,9 @@ fn cmd_diff(a: DiffArgs) -> strand_core::Result<()> {
 
 fn cmd_deps(a: DepsArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
+    let gv = ConfidenceView::new(&g, a.conf.min());
     let id = node_id(&g, &a.node)?;
-    let depths = algo::bfs(&g, &[id], Dir::Out, a.depth);
+    let depths = algo::bfs(&gv, &[id], Dir::Out, a.depth);
 
     // Collect reached nodes sorted by (depth, name).
     let mut rows: Vec<(u32, u32)> = depths
@@ -868,7 +950,8 @@ fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
         .iter()
         .map(|n| node_id(&g, n))
         .collect::<strand_core::Result<_>>()?;
-    let depths = algo::bfs(&g, &seeds, Dir::In, a.depth);
+    let gv = ConfidenceView::new(&g, a.conf.min());
+    let depths = algo::bfs(&gv, &seeds, Dir::In, a.depth);
     let counts = algo::depth_counts(&depths);
 
     // Kind filter applies to reported nodes (seeds always count as depth 0).
@@ -1098,10 +1181,11 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
         };
     }
 
+    let gv = ConfidenceView::new(&g, a.conf.min());
     if a.all_paths {
         let res = match a.max_depth {
-            Some(d) => algo::paths_within_depth(&g, from, to, d, a.limit),
-            None => algo::k_shortest_paths(&g, from, to, a.limit),
+            Some(d) => algo::paths_within_depth(&gv, from, to, d, a.limit),
+            None => algo::k_shortest_paths(&gv, from, to, a.limit),
         };
         let paths = &res.paths;
         if a.json {
@@ -1124,7 +1208,7 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
         return Ok(());
     }
 
-    match algo::shortest_path(&g, from, to) {
+    match algo::shortest_path(&gv, from, to) {
         Some(path) => {
             let names = names_of(&g, &path);
             if a.json {
@@ -1150,7 +1234,8 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
 
 fn cmd_cycles(a: CyclesArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
-    let sccs = algo::strongly_connected(&g);
+    let gv = ConfidenceView::new(&g, a.conf.min());
+    let sccs = algo::strongly_connected(&gv);
     // Cycles = SCCs with >1 member, or a single node with a self-loop.
     let cycles: Vec<&Vec<u32>> = sccs
         .iter()
@@ -1174,7 +1259,7 @@ fn cmd_cycles(a: CyclesArgs) -> strand_core::Result<()> {
 
 /// Exact impact scores as `f64` (`--exact` path; may be very slow on
 /// huge mostly-acyclic graphs).
-fn scores_from_exact(g: &strand_core::Graph) -> Vec<f64> {
+fn scores_from_exact<G: GraphView>(g: &G) -> Vec<f64> {
     algo::impact_sizes(g)
         .into_iter()
         .map(|x| x as f64)
@@ -1183,21 +1268,22 @@ fn scores_from_exact(g: &strand_core::Graph) -> Vec<f64> {
 
 fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
+    let gv = ConfidenceView::new(&g, a.conf.min());
     let n = g.n_nodes() as usize;
     let mut impact_approx = false;
     let mut impact_samples = 0usize;
     let mut scores: Vec<f64> = match a.by {
-        TopBy::InDegree => (0..n as u32).map(|i| g.in_degree(i) as f64).collect(),
+        TopBy::InDegree => (0..n as u32).map(|i| gv.in_degree(i) as f64).collect(),
         TopBy::Impact => {
             if a.exact {
-                scores_from_exact(&g)
+                scores_from_exact(&gv)
             } else if a.approx {
-                let (v, k) = algo::impact_sizes_force_approx(&g, a.samples);
+                let (v, k) = algo::impact_sizes_force_approx(&gv, a.samples);
                 impact_approx = true;
                 impact_samples = k;
                 v
             } else {
-                let (v, m, k) = algo::impact_sizes_auto_with(&g, a.samples);
+                let (v, m, k) = algo::impact_sizes_auto_with(&gv, a.samples);
                 impact_approx = m == algo::ImpactMethod::Approx;
                 impact_samples = k;
                 v
@@ -1205,7 +1291,7 @@ fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
         }
         // PageRank on the dependency graph: rank flows dependent ->
         // dependency, so heavily-depended-upon nodes score highest.
-        TopBy::Pagerank => algo::pagerank(&g, false, 1e-8, 100),
+        TopBy::Pagerank => algo::pagerank(&gv, false, 1e-8, 100),
     };
     // Approximate impact: rerank the top candidates exactly so printed
     // numbers are exact counts, not estimates. The rerank budget scales
@@ -1215,7 +1301,7 @@ fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
         let want = (a.count.saturating_mul(4)).clamp(32, 512).min(n);
         let e = g.n_edges().max(1) as u64;
         let cap = ((2_000_000_000u64 / e) as usize).clamp(want, 8192).min(n);
-        reranked_ids = algo::rerank_impact_exact(&g, &mut scores, want, cap);
+        reranked_ids = algo::rerank_impact_exact(&gv, &mut scores, want, cap);
     }
     let reranked = reranked_ids.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
@@ -1290,7 +1376,8 @@ fn fmt_score(v: f64) -> String {
 
 fn cmd_order(a: OrderArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
-    let bo = algo::analyze(&g);
+    let gv = ConfidenceView::new(&g, a.conf.min());
+    let bo = algo::analyze(&gv);
 
     if a.json {
         let comps: Vec<serde_json::Value> = bo
@@ -1330,9 +1417,10 @@ fn cmd_order(a: OrderArgs) -> strand_core::Result<()> {
 
 fn cmd_roots(a: RootsArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
+    let gv = ConfidenceView::new(&g, a.conf.min());
     // "Nothing depends on X" => no dependents => in_targets empty.
     let roots: Vec<u32> = (0..g.n_nodes() as u32)
-        .filter(|&i| g.in_degree(i) == 0)
+        .filter(|&i| gv.in_degree(i) == 0)
         .collect();
     emit_name_list(&g, &roots, "roots", a.json);
     Ok(())
@@ -1340,9 +1428,10 @@ fn cmd_roots(a: RootsArgs) -> strand_core::Result<()> {
 
 fn cmd_leaves(a: LeavesArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
+    let gv = ConfidenceView::new(&g, a.conf.min());
     // "X depends on nothing" => no dependencies => out_targets empty.
     let leaves: Vec<u32> = (0..g.n_nodes() as u32)
-        .filter(|&i| g.out_degree(i) == 0)
+        .filter(|&i| gv.out_degree(i) == 0)
         .collect();
     emit_name_list(&g, &leaves, "leaves", a.json);
     Ok(())
@@ -1375,9 +1464,10 @@ fn cmd_common(a: CommonArgs) -> strand_core::Result<()> {
         }
     };
     let g = open_graph(&a.file)?;
+    let gv = ConfidenceView::new(&g, a.conf.min());
     let ia = node_id(&g, &a.a)?;
     let ib = node_id(&g, &a.b)?;
-    let common = algo::common(&g, ia, ib, dir);
+    let common = algo::common(&gv, ia, ib, dir);
     if a.json {
         print_json(serde_json::json!({
             "mode": a.mode, "a": a.a, "b": a.b,
@@ -1423,7 +1513,7 @@ fn cmd_export(a: ExportArgs) -> strand_core::Result<()> {
         let path = if a.weighted {
             algo::shortest_path_weighted_csr(&g, from, to).map(|(p, _)| p)
         } else {
-            algo::shortest_path(&g, from, to)
+            algo::shortest_path(&ConfidenceView::new(&g, a.conf.min()), from, to)
         };
         let Some(path) = path else {
             return Err(strand_core::Error::Usage(format!(
@@ -1440,14 +1530,19 @@ fn cmd_export(a: ExportArgs) -> strand_core::Result<()> {
             .iter()
             .map(|n| node_id(&g, n))
             .collect::<strand_core::Result<_>>()?;
-        let depths = algo::bfs(&g, &seeds, Dir::In, a.depth);
+        let depths = algo::bfs(
+            &ConfidenceView::new(&g, a.conf.min()),
+            &seeds,
+            Dir::In,
+            a.depth,
+        );
         let nodes: std::collections::BTreeSet<u32> = depths
             .iter()
             .enumerate()
             .filter(|&(_, &d)| d != algo::UNVISITED)
             .map(|(i, _)| i as u32)
             .collect();
-        let (edges, truncated) = export::edges_within(&g, &nodes, a.max_edges);
+        let (edges, truncated) = export::edges_within(&g, &nodes, a.max_edges, a.conf.min());
         (nodes, edges, truncated)
     };
 

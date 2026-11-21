@@ -1,6 +1,6 @@
 [package]
 name = "strand-store"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Embeddable read-write graph store: immutable CSR base + WAL delta + compaction"
 license = "Apache-2.0"
@@ -10,7 +10,7 @@ keywords = ["storage", "wal", "embedded-database", "graph"]
 categories = ["database-implementations"]
 
 [dependencies]
-strand-core = { path = "../strand-core", version = "0.1.0" }
+strand-core = { path = "../strand-core", version = "0.2.0" }
 fd-lock.workspace = true
 serde.workspace = true
 serde_json.workspace = true

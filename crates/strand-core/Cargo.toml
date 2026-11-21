@@ -1,6 +1,6 @@
 [package]
 name = "strand-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Memory-mapped CSR graph engine and dependency/impact analysis algorithms"
 license = "Apache-2.0"

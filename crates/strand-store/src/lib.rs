@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use strand_core::view::GraphView;
-use strand_core::Graph;
+use strand_core::{EdgeKind, Graph};
 
 pub use delta::{Delta, EdgeOp};
 pub use view::View;
@@ -347,14 +347,14 @@ impl Store {
                 for (t, w) in view.merged_out(id) {
                     let ti = idx_of.get(t as usize).copied().unwrap_or(u32::MAX);
                     if ti != u32::MAX {
-                        builder.add_edge_idx_weighted(ai, ti, w);
+                        builder.add_edge_idx_weighted_kind(ai, ti, w, EdgeKind::Declared);
                     }
                 }
             } else {
                 view.out_edges(id, &mut |t| {
                     let ti = idx_of.get(t as usize).copied().unwrap_or(u32::MAX);
                     if ti != u32::MAX {
-                        builder.add_edge_idx(ai, ti);
+                        builder.add_edge_idx_kind(ai, ti, EdgeKind::Declared);
                     }
                 });
             }

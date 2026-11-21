@@ -32,6 +32,10 @@ pub struct Graph {
     /// Absolute `(offset, len)` byte range of each section.
     ranges: [(usize, usize); N_SECTIONS],
     kinds: Option<NodeKinds>,
+    /// Absolute mmap offsets of the edge-kind tables inside
+    /// `node_meta`: `(fwd_off, rev_off)`, each `n_edges` bytes long.
+    /// `None` for files written before edge kinds existed.
+    edge_kinds: Option<(usize, usize)>,
 }
 
 impl Graph {
@@ -101,13 +105,16 @@ impl Graph {
             header,
             ranges: [(0, 0); N_SECTIONS],
             kinds: None,
+            edge_kinds: None,
         };
         for (i, &(off, len)) in lay.iter().enumerate() {
             g.ranges[i] = (off as usize, len as usize);
         }
         g.validate_offsets()?;
         g.validate_names()?;
-        g.kinds = g.parse_kinds()?;
+        let (kinds, edge_kinds) = g.parse_meta()?;
+        g.kinds = kinds;
+        g.edge_kinds = edge_kinds;
         Ok(g)
     }
 
@@ -170,18 +177,23 @@ impl Graph {
         Ok(())
     }
 
-    /// Parse the optional `node_meta` section into an owned kind table.
-    fn parse_kinds(&self) -> Result<Option<NodeKinds>> {
+    /// Parse the optional `node_meta` section into an owned kind table
+    /// plus the edge-kind table offsets. Layout: `[u64 payload_len]
+    /// [payload]` where payload is `u32 nkinds`, `nkinds` x (`u32 len`
+    /// + utf8 name), `n_nodes` x `u32 kind_id`, then optionally
+    /// `2 * n_edges` bytes of edge-kind tags (fwd CSR order, then rev
+    /// CSR order). Files without edge kinds simply end after the ids.
+    fn parse_meta(&self) -> Result<(Option<NodeKinds>, Option<(usize, usize)>)> {
         let (off, len) = self.ranges[format::sec::NODE_META];
         if len < 8 {
-            return Ok(None);
+            return Ok((None, None));
         }
         let payload_len = read_u64(&self.mmap, off)? as usize;
         if payload_len + 8 > len {
-            return Ok(None); // trailing padding only
+            return Ok((None, None)); // trailing padding only
         }
         if payload_len == 0 {
-            return Ok(None);
+            return Ok((None, None));
         }
         let p = &self.mmap[off + 8..off + 8 + payload_len];
         let mut cur = 0usize;
@@ -217,7 +229,23 @@ impl Graph {
             }
             ids.push(v);
         }
-        Ok(Some(NodeKinds { ids, names }))
+        let kinds = Some(NodeKinds { ids, names });
+
+        // Optional edge-kind tail: exactly 2 * n_edges bytes.
+        let remaining = p.len() - cur;
+        let n_edges = self.header.n_edges as usize;
+        let edge_kinds = if remaining == 0 {
+            None
+        } else if remaining == 2 * n_edges {
+            let base = off + 8 + cur;
+            Some((base, base + n_edges))
+        } else {
+            return Err(Error::Invalid(format!(
+                "node_meta edge-kind tail is {remaining} bytes, expected {}",
+                2 * n_edges
+            )));
+        };
+        Ok((kinds, edge_kinds))
     }
 
     // ---- typed section access (bounds already validated at open) ----
@@ -341,6 +369,32 @@ impl Graph {
         let s = offs[id as usize] as usize;
         let e = offs[id as usize + 1] as usize;
         &t[s..e]
+    }
+
+    /// Kind tags parallel to [`Graph::out_targets`], if the file
+    /// carries edge kinds. `None` means "all edges are `Static`"
+    /// (pre-kind files).
+    #[inline]
+    pub fn out_kinds(&self, id: u32) -> Option<&[u8]> {
+        let (foff, _) = self.edge_kinds?;
+        let offs = self
+            .u64s(format::sec::FWD_OFFSETS)
+            .expect("validated at open");
+        let s = offs[id as usize] as usize;
+        let e = offs[id as usize + 1] as usize;
+        Some(&self.mmap[foff + s..foff + e])
+    }
+
+    /// Kind tags parallel to [`Graph::in_targets`].
+    #[inline]
+    pub fn in_kinds(&self, id: u32) -> Option<&[u8]> {
+        let (_, roff) = self.edge_kinds?;
+        let offs = self
+            .u64s(format::sec::REV_OFFSETS)
+            .expect("validated at open");
+        let s = offs[id as usize] as usize;
+        let e = offs[id as usize + 1] as usize;
+        Some(&self.mmap[roff + s..roff + e])
     }
 
     /// Weights parallel to [`Graph::in_targets`], if the file has weights.

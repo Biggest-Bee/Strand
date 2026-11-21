@@ -10,8 +10,8 @@ keywords = ["gui", "visualization", "dependency-graph"]
 categories = ["visualization"]
 
 [dependencies]
-strand-core = { path = "../strand-core", version = "0.1.0" }
-strand-store = { path = "../strand-store", version = "0.2.0" }
+strand-core = { path = "../strand-core", version = "0.2.0" }
+strand-store = { path = "../strand-store", version = "0.2.2" }
 eframe = "0.35"
 rfd = "0.15"
 egui = "0.35"

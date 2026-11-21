@@ -483,3 +483,52 @@ fn cli_trace_merges_runtime_edges() {
     let stdout = String::from_utf8_lossy(&impact.stdout);
     assert!(stdout.contains("pkg/loader.py"), "{stdout}");
 }
+
+#[test]
+fn cli_min_confidence_filters_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    // a.py statically imports b.py; the manual depends-on edge to
+    // c.py is Declared (below Static).
+    std::fs::write(root.join("a.py"), "import b\n# strand: depends-on c.py\n").unwrap();
+    std::fs::write(root.join("b.py"), "x = 1\n").unwrap();
+    std::fs::write(root.join("c.py"), "y = 2\n").unwrap();
+
+    let graph = dir.path().join("conf.strand");
+    let o = strand()
+        .args([
+            "scan",
+            root.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let g = graph.to_str().unwrap();
+    let deps_all = strand().args(["deps", g, "a.py"]).output().unwrap();
+    assert!(deps_all.status.success());
+    let all = String::from_utf8_lossy(&deps_all.stdout);
+    assert!(all.contains("b.py") && all.contains("c.py"), "{all}");
+
+    // Static-only: the Declared manual edge disappears.
+    let deps_static = strand()
+        .args(["deps", g, "a.py", "--min-confidence", "static"])
+        .output()
+        .unwrap();
+    assert!(deps_static.status.success());
+    let only = String::from_utf8_lossy(&deps_static.stdout);
+    assert!(only.contains("b.py"), "{only}");
+    assert!(!only.contains("c.py"), "{only}");
+
+    // Declared threshold keeps both (Declared <= Static, Heuristic cut).
+    let deps_decl = strand()
+        .args(["deps", g, "a.py", "--min-confidence", "declared"])
+        .output()
+        .unwrap();
+    assert!(deps_decl.status.success());
+    let decl = String::from_utf8_lossy(&deps_decl.stdout);
+    assert!(decl.contains("b.py") && decl.contains("c.py"), "{decl}");
+}

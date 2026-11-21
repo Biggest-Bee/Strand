@@ -48,7 +48,7 @@ fn quoted_first_tokens(s: &str) -> Vec<String> {
 
 fn push_edge(edges: &mut EdgeList, src: &str, dst: String) {
     if dst != src {
-        edges.push((src.to_string(), dst, None));
+        edges.push((src.to_string(), dst, None, strand_core::EdgeKind::Static));
     }
 }
 
