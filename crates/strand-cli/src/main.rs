@@ -11,6 +11,7 @@ use strand_import::{self, Format};
 
 mod check;
 mod export;
+mod trace;
 mod update_check;
 
 #[derive(Parser)]
@@ -32,6 +33,10 @@ enum Commands {
     /// Scan a directory of Rust sources and build a file-level
     /// dependency graph from `mod`/`use` statements.
     Scan(ScanArgs),
+    /// Scan a project, run a command under a Python import tracer,
+    /// and merge observed runtime edges into the graph.
+    /// Usage: `strand trace <dir> -- <command...>` (e.g. `-- pytest`).
+    Trace(TraceArgs),
     /// Show graph statistics.
     Info(InfoArgs),
     /// List every node name in the graph.
@@ -127,6 +132,18 @@ struct ScanArgs {
     /// Language(s) to scan (default: all).
     #[arg(long, value_enum, default_value_t = ScanLang::All)]
     lang: ScanLang,
+}
+
+#[derive(Parser)]
+struct TraceArgs {
+    /// Project directory to scan and trace within.
+    dir: PathBuf,
+    /// Output .strand file (default: <dir-name>.strand).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Command to run under the Python import tracer (after `--`).
+    #[arg(last = true, required = true)]
+    cmd: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -380,6 +397,7 @@ fn run(cmd: Commands) -> strand_core::Result<()> {
     match cmd {
         Commands::Build(a) => cmd_build(a),
         Commands::Scan(a) => cmd_scan(a),
+        Commands::Trace(a) => cmd_trace(a),
         Commands::Info(a) => cmd_info(a),
         Commands::Nodes(a) => cmd_nodes(a),
         Commands::Deps(a) => cmd_deps(a),
@@ -488,6 +506,83 @@ fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
     let stats = b.build(&out)?;
     eprintln!(
         "scanned {}: {} nodes, {} edges -> {}",
+        root.display(),
+        stats.n_nodes,
+        stats.n_edges,
+        stats.path.display()
+    );
+    Ok(())
+}
+
+fn cmd_trace(a: TraceArgs) -> strand_core::Result<()> {
+    let root = if a.dir.is_file() {
+        scan_root_for(&a.dir)
+    } else {
+        a.dir.clone()
+    };
+    let out = a.output.unwrap_or_else(|| {
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "trace".to_string());
+        PathBuf::from(format!("{name}.strand"))
+    });
+    use strand_import::scan::Lang;
+    let scan = strand_import::scan::scan_project(&root, &[Lang::Rust, Lang::Python, Lang::Js])?;
+    for w in &scan.warnings {
+        eprintln!("warning: {w}");
+    }
+
+    // Run the command under the import tracer, then fold observed
+    // edges into the static scan. Only .py-to-.py edges where both
+    // endpoints are scanned nodes are kept.
+    let traced = trace::traced_edges(&root, &a.cmd)?;
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let root_norm = strip_verbatim(root_canon)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let root_prefix = format!("{root_norm}/");
+    let to_rel = |p: &Path| -> Option<String> {
+        let s = p.to_string_lossy().replace('\\', "/");
+        let s = s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string();
+        s.strip_prefix(&root_prefix)
+            .filter(|r| r.ends_with(".py"))
+            .map(|r| r.to_string())
+    };
+
+    let node_set: std::collections::BTreeSet<&str> =
+        scan.nodes.iter().map(String::as_str).collect();
+    let mut seen: std::collections::BTreeSet<(String, String)> = scan
+        .edges
+        .iter()
+        .map(|(s, d, _)| (s.clone(), d.clone()))
+        .collect();
+    let mut edges = scan.edges;
+    let mut observed = 0usize;
+    let mut added = 0usize;
+    for (imp, org) in traced {
+        let (Some(i), Some(o)) = (to_rel(&imp), to_rel(&org)) else {
+            continue;
+        };
+        if !node_set.contains(i.as_str()) || !node_set.contains(o.as_str()) {
+            continue;
+        }
+        observed += 1;
+        if seen.insert((i.clone(), o.clone())) {
+            added += 1;
+            edges.push((i, o, None));
+        }
+    }
+    eprintln!("trace: {observed} runtime import edge(s) observed, {added} new");
+
+    let mut b = GraphBuilder::new();
+    for n in &scan.nodes {
+        b.add_node(n.clone());
+    }
+    strand_import::fill_builder(edges, &mut b)?;
+    let stats = b.build(&out)?;
+    eprintln!(
+        "traced {}: {} nodes, {} edges -> {}",
         root.display(),
         stats.n_nodes,
         stats.n_edges,

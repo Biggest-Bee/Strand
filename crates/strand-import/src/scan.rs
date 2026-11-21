@@ -206,22 +206,47 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
 
     // Cross-check against rustc dep-info: `cargo check`/`build` writes
     // `.d` files listing every source file the compiler actually read.
-    // Anything under the root that rustc saw but the walk didn't reach
-    // (macro-emitted paths, odd `#[path]` escapes) is worth a warning.
-    let missed = depinfo_unscanned(root, &names);
-    if !missed.is_empty() {
-        let shown: Vec<&str> = missed.iter().take(10).map(String::as_str).collect();
-        let suffix = if missed.len() > shown.len() {
-            format!(", +{} more", missed.len() - shown.len())
-        } else {
-            String::new()
-        };
-        warnings.push(format!(
-            "rustc dep-info lists {} source file(s) the scanner did not reach: {}{}",
-            missed.len(),
-            shown.join(", "),
-            suffix
-        ));
+    // Two gap classes are worth a warning:
+    //  - files rustc saw that the walk didn't reach at all
+    //  - files the walk saw, rustc compiled, but no `mod`/`#[path]`
+    //    edge points at - the signature of a macro-emitted module.
+    let depinfo = depinfo_rs_files(root);
+    if !depinfo.is_empty() {
+        let missed: Vec<&String> = depinfo.difference(&names).collect();
+        if !missed.is_empty() {
+            let shown: Vec<&str> = missed.iter().take(10).map(|s| s.as_str()).collect();
+            let suffix = if missed.len() > shown.len() {
+                format!(", +{} more", missed.len() - shown.len())
+            } else {
+                String::new()
+            };
+            warnings.push(format!(
+                "rustc dep-info lists {} source file(s) the scanner did not reach: {}{}",
+                missed.len(),
+                shown.join(", "),
+                suffix
+            ));
+        }
+
+        let targets: BTreeSet<&str> = edges.iter().map(|(_, d, _)| d.as_str()).collect();
+        let edgeless: Vec<&String> = depinfo
+            .intersection(&names)
+            .filter(|f| !targets.contains(f.as_str()) && !is_probable_crate_root(f))
+            .collect();
+        if !edgeless.is_empty() {
+            let shown: Vec<&str> = edgeless.iter().take(10).map(|s| s.as_str()).collect();
+            let suffix = if edgeless.len() > shown.len() {
+                format!(", +{} more", edgeless.len() - shown.len())
+            } else {
+                String::new()
+            };
+            warnings.push(format!(
+                "rustc compiled {} file(s) with no incoming module edge (possible macro-generated modules): {}{}",
+                edgeless.len(),
+                shown.join(", "),
+                suffix
+            ));
+        }
     }
 
     let nodes = names.into_iter().collect();
@@ -393,16 +418,17 @@ fn strip_verbatim(s: &str) -> String {
     s.strip_prefix("\\\\?\\").unwrap_or(s).to_string()
 }
 
-/// `.rs` files rustc read (per `target/**` dep-info `.d` files) that the
-/// scanner's walk didn't reach. Empty when no dep-info exists - a
+/// All `.rs` paths (root-relative, "/" separated) that rustc read per
+/// `target/**` dep-info `.d` files. Empty when no dep-info exists - a
 /// missing `target/` just means cargo hasn't run, not a coverage gap.
-fn depinfo_unscanned(root: &Path, names: &BTreeSet<String>) -> Vec<String> {
+fn depinfo_rs_files(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
     let target = root.join("target");
     if !target.is_dir() {
-        return Vec::new();
+        return out;
     }
     let Ok(root_canon) = root.canonicalize() else {
-        return Vec::new();
+        return out;
     };
     // Normalize both sides to '/'-joined strings without a verbatim
     // `\\?\` prefix so `.d` paths (plain `C:\...`) compare cleanly.
@@ -411,7 +437,6 @@ fn depinfo_unscanned(root: &Path, names: &BTreeSet<String>) -> Vec<String> {
     let mut d_files = Vec::new();
     collect_depinfo(&target, 0, &mut d_files);
 
-    let mut missed = BTreeSet::new();
     for d in d_files {
         let Ok(text) = fs::read_to_string(&d) else {
             continue;
@@ -432,12 +457,25 @@ fn depinfo_unscanned(root: &Path, names: &BTreeSet<String>) -> Vec<String> {
             if rel.split('/').any(|s| SKIP_DIRS.contains(&s)) {
                 continue;
             }
-            if !names.contains(&rel) {
-                missed.insert(rel);
-            }
+            out.insert(rel);
         }
     }
-    missed.into_iter().collect()
+    out
+}
+
+/// Files that legitimately have no incoming `mod` edge: crate roots
+/// (`lib.rs`/`main.rs`/`build.rs`), cargo auto-discovered target roots
+/// (`tests/`, `examples/`, `benches/`, `src/bin/`).
+fn is_probable_crate_root(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    if matches!(name, "lib.rs" | "main.rs" | "build.rs") {
+        return true;
+    }
+    let segs: Vec<&str> = rel.split('/').collect();
+    // Any tests/examples/benches dir component, or src/bin/ prefix.
+    segs.iter()
+        .any(|s| matches!(*s, "tests" | "examples" | "benches"))
+        || rel.starts_with("src/bin/")
 }
 
 /// Collect `*.d` dep-info files under `target/`, bounded in depth and
@@ -872,22 +910,34 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
         return (out, true, dynamic);
     };
     let had_error = tree.root_node().has_error();
+    // Names bound by import statements - `getattr` on one of these is
+    // dynamic dispatch (module __getattr__ can lazily import, so the
+    // edge is invisible). Collected in the same walk; getattr calls
+    // are resolved against the set after the walk since imports may
+    // appear textually after the call.
+    let mut bound: BTreeSet<String> = BTreeSet::new();
+    let mut getattr_objs: Vec<String> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         match node.kind() {
             "import_statement" => {
                 let mut cursor = node.walk();
                 for name in node.children_by_field_name("name", &mut cursor) {
-                    // `import a.b` or `import a.b as c`.
-                    let dotted = if name.kind() == "aliased_import" {
-                        name.child_by_field_name("name")
-                    } else {
-                        Some(name)
-                    };
-                    if let Some(d) = dotted {
-                        if let Some(segs) = dotted_segs(d, text) {
-                            out.push(PyRef::Import(segs));
+                    // `import a.b` binds `a`; `import a.b as c` binds `c`.
+                    if name.kind() == "aliased_import" {
+                        if let Some(alias) = name.child_by_field_name("alias") {
+                            if let Ok(t) = alias.utf8_text(text.as_bytes()) {
+                                bound.insert(t.to_string());
+                            }
                         }
+                        if let Some(d) = name.child_by_field_name("name") {
+                            if let Some(segs) = dotted_segs(d, text) {
+                                out.push(PyRef::Import(segs));
+                            }
+                        }
+                    } else if let Some(segs) = dotted_segs(name, text) {
+                        bound.insert(segs[0].clone());
+                        out.push(PyRef::Import(segs));
                     }
                 }
             }
@@ -899,6 +949,13 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
                 let mut cursor = node.walk();
                 for name in node.children_by_field_name("name", &mut cursor) {
                     // dotted_name, aliased_import, or wildcard_import.
+                    if name.kind() == "aliased_import" {
+                        if let Some(alias) = name.child_by_field_name("alias") {
+                            if let Ok(t) = alias.utf8_text(text.as_bytes()) {
+                                bound.insert(t.to_string());
+                            }
+                        }
+                    }
                     let dotted = if name.kind() == "aliased_import" {
                         name.child_by_field_name("name")
                     } else if name.kind() == "dotted_name" {
@@ -915,6 +972,7 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
                                 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                             {
                                 names.push(t.to_string());
+                                bound.insert(t.to_string());
                             }
                         }
                     }
@@ -933,6 +991,32 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
                     PyDynCall::Dynamic => dynamic += 1,
                     PyDynCall::NotDynamic => {}
                 }
+                // `getattr(<imported-name>, ...)` - dynamic attribute
+                // dispatch; module __getattr__ may lazily import, so
+                // edges can be invisible. First arg must be a bare
+                // identifier; resolved against `bound` after the walk.
+                if let Some(func) = node.child_by_field_name("function") {
+                    if func
+                        .utf8_text(text.as_bytes())
+                        .is_ok_and(|t| t == "getattr")
+                    {
+                        if let Some(args) = node.child_by_field_name("arguments") {
+                            let first_ident = {
+                                let mut c = args.walk();
+                                let found = args
+                                    .children(&mut c)
+                                    .find(|c| !matches!(c.kind(), "(" | ")" | ","))
+                                    .filter(|a| a.kind() == "identifier")
+                                    .and_then(|a| a.utf8_text(text.as_bytes()).ok())
+                                    .map(|t| t.to_string());
+                                found
+                            };
+                            if let Some(t) = first_ident {
+                                getattr_objs.push(t);
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -941,6 +1025,7 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
             stack.push(child);
         }
     }
+    dynamic += getattr_objs.iter().filter(|o| bound.contains(*o)).count();
     (out, had_error, dynamic)
 }
 

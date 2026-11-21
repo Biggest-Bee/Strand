@@ -142,6 +142,12 @@ strand scan ./my-project -o deps.strand
 # --lang rust|python|js restricts to one language; default scans all.
 strand scan ./my-project --lang python -o pydeps.strand
 
+# Python projects: merge runtime-observed edges. Runs your command
+# under an import hook, so computed import_module() names, getattr
+# lazy-imports, and entry points actually loaded at runtime become
+# real edges (coverage = what the command exercised):
+strand trace ./my-project -o traced.strand -- pytest
+
 # Analyze:
 strand info deps.strand
 strand nodes deps.strand          # list every node name
@@ -565,17 +571,23 @@ cargo test
   workaround for inspection, not for scanning), `include_str!` payloads,
   and dynamic language tricks - computed module names
   (`import_module('pkg.' + name)`), `entry_points` built by function
-  calls, and `getattr`-based dispatch stay invisible, so runtime-only
-  dependencies can be missed. Each such site is counted and reported
-  as a per-file warning ("N dynamic import site(s)") so incomplete
-  results are visible. For Rust, when `target/` contains cargo
-  dep-info (`.d` files from a prior `cargo check`/`build`), source
-  files rustc read but the scanner didn't reach are reported as a
-  warning - this catches macro-emitted module paths. And
+  calls, and `getattr()` dispatch on import-bound names stay
+  invisible, so runtime-only dependencies can be missed. Each such
+  site is counted and reported as a per-file warning ("N dynamic
+  import site(s)") so incomplete results are visible. For Rust, when
+  `target/` contains cargo dep-info (`.d` files from a prior
+  `cargo check`/`build`), two cross-checks run: source files rustc
+  read but the scanner didn't reach, and scanned files rustc compiled
+  with no incoming `mod` edge (the macro-generated-module signature,
+  excluding crate roots like `lib.rs`/`tests/`). And
   `# strand: depends-on <path>` /
   `// strand: depends-on <path>` comments add manual edges for the
   cases you know about (paths resolve relative to the file's dir,
-  then the project root). Nodes are file
+  then the project root). For Python, `strand trace <dir> -- <cmd>`
+  goes further: it runs the command under an import hook and merges
+  every observed `.py -> .py` import into the graph, covering the
+  computed-name and `getattr` cases for whatever the command
+  exercised (uncovered paths stay dark). Nodes are file
   paths, so it answers "what breaks if I change `src/foo.rs`?" -
   package-level questions still want `cargo metadata` input.
   Unresolvable imports and third-party packages are dropped entirely

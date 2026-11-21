@@ -420,3 +420,66 @@ fn cli_diff_graphs() {
     let v: serde_json::Value = serde_json::from_slice(&j.stdout).unwrap();
     assert_eq!(v["nodes_added"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn cli_trace_merges_runtime_edges() {
+    // `strand trace` runs a command under a Python import hook and
+    // merges observed edges - catches computed import_module names the
+    // static scanner can't see. Skips when no python is on PATH.
+    let py = ["python", "python3", "py"]
+        .iter()
+        .find(|c| {
+            Command::new(c)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .copied();
+    let Some(py) = py else { return };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(pkg.join("plugins")).unwrap();
+    std::fs::write(pkg.join("__init__.py"), "").unwrap();
+    std::fs::write(pkg.join("plugins").join("__init__.py"), "").unwrap();
+    std::fs::write(pkg.join("plugins").join("ldap.py"), "x = 1\n").unwrap();
+    std::fs::write(
+        pkg.join("loader.py"),
+        "import importlib\nname = 'ldap'\nimportlib.import_module('pkg.plugins.' + name)\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("app.py"), "import pkg.loader\n").unwrap();
+
+    let graph = root.join("traced.strand");
+    let out = strand()
+        .args([
+            "trace",
+            root.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+            "--",
+            py,
+            "app.py",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("runtime import edge(s)"), "{stderr}");
+
+    // impact on the dynamically-loaded module must reach the loader.
+    let impact = strand()
+        .args(["impact", graph.to_str().unwrap(), "pkg/plugins/ldap.py"])
+        .output()
+        .unwrap();
+    assert!(impact.status.success());
+    let stdout = String::from_utf8_lossy(&impact.stdout);
+    assert!(stdout.contains("pkg/loader.py"), "{stdout}");
+}

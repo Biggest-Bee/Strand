@@ -876,7 +876,11 @@ fn scan_python_reexport_chain() {
     // the __init__.py -> _impl.py edge.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    w(root, "pkg/__init__.py", "from ._impl import thing\nfrom . import helper\n");
+    w(
+        root,
+        "pkg/__init__.py",
+        "from ._impl import thing\nfrom . import helper\n",
+    );
     w(root, "pkg/_impl.py", "thing = 1\n");
     w(root, "pkg/helper.py", "x = 2\n");
     w(root, "app.py", "from pkg import thing\nimport pkg.helper\n");
@@ -892,4 +896,66 @@ fn scan_python_reexport_chain() {
     // `import pkg.helper` also yields the submodule edge.
     assert!(has("app.py", "pkg/helper.py"), "edges: {edges:?}");
     // Transitive: _impl -> __init__ -> app is reachable via those edges.
+}
+
+#[test]
+fn scan_python_getattr_dispatch_warning() {
+    // getattr on an import-bound name is dynamic dispatch - module
+    // __getattr__ can lazily import, hiding edges. Other getattr uses
+    // (self, locals, non-imported names) don't count.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/mod.py", "");
+    w(
+        root,
+        "app.py",
+        concat!(
+            "import pkg.mod\n",
+            "from pkg import mod as pm\n",
+            "getattr(pkg, name)\n",     // pkg bound by import: counts
+            "getattr(pm, 'handler')\n", // pm bound by from-import: counts
+            "getattr(self, name)\n",    // self: not import-bound
+            "getattr(local_var, x)\n",  // not import-bound
+            "getattr(pkg.mod, n)\n",    // attribute, not bare ident: skip
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    assert_eq!(out.warnings.len(), 1, "warnings: {:?}", out.warnings);
+    assert!(
+        out.warnings[0].contains("app.py") && out.warnings[0].contains('2'),
+        "warning: {}",
+        out.warnings[0]
+    );
+}
+
+#[test]
+fn scan_rust_depinfo_edgeless_module() {
+    // A .rs file rustc compiled, the walk found, but no mod edge points
+    // at - the macro-generated module signature. Crate roots
+    // (lib.rs, tests/) are excluded.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "src/lib.rs", "pub fn f() {}\n");
+    w(root, "src/macro_mod.rs", "pub fn g() {}\n"); // on disk, no mod decl
+    w(root, "tests/it.rs", "#[test] fn t() {}\n");
+    let canon = root.canonicalize().unwrap();
+    let canon_str = canon
+        .to_string_lossy()
+        .trim_start_matches("\\\\?\\")
+        .replace('\\', "/");
+    let d = format!(
+        "{canon_str}/target/debug/deps/proj-abc.d: {canon_str}/src/lib.rs {canon_str}/src/macro_mod.rs {canon_str}/tests/it.rs\n"
+    );
+    w(root, "target/debug/deps/proj-abc.d", &d);
+    let out = scan_rust(root).unwrap();
+    assert_eq!(out.warnings.len(), 1, "warnings: {:?}", out.warnings);
+    assert!(
+        out.warnings[0].contains("src/macro_mod.rs")
+            && out.warnings[0].contains("no incoming module edge"),
+        "warning: {}",
+        out.warnings[0]
+    );
+    assert!(!out.warnings[0].contains("lib.rs"));
+    assert!(!out.warnings[0].contains("it.rs"));
 }

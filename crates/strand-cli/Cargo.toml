@@ -1,6 +1,6 @@
 [package]
 name = "strand-cli"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 description = "Dependency and impact analysis CLI for memory-mapped CSR graphs"
 license = "Apache-2.0"
@@ -21,10 +21,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq = "3.5.2"
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
-tempfile.workspace = true
