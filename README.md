@@ -568,7 +568,11 @@ cargo test
   calls, and `getattr`-based dispatch stay invisible, so runtime-only
   dependencies can be missed. Each such site is counted and reported
   as a per-file warning ("N dynamic import site(s)") so incomplete
-  results are visible, and `# strand: depends-on <path>` /
+  results are visible. For Rust, when `target/` contains cargo
+  dep-info (`.d` files from a prior `cargo check`/`build`), source
+  files rustc read but the scanner didn't reach are reported as a
+  warning - this catches macro-emitted module paths. And
+  `# strand: depends-on <path>` /
   `// strand: depends-on <path>` comments add manual edges for the
   cases you know about (paths resolve relative to the file's dir,
   then the project root). Nodes are file

@@ -204,6 +204,26 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
         }
     }
 
+    // Cross-check against rustc dep-info: `cargo check`/`build` writes
+    // `.d` files listing every source file the compiler actually read.
+    // Anything under the root that rustc saw but the walk didn't reach
+    // (macro-emitted paths, odd `#[path]` escapes) is worth a warning.
+    let missed = depinfo_unscanned(root, &names);
+    if !missed.is_empty() {
+        let shown: Vec<&str> = missed.iter().take(10).map(String::as_str).collect();
+        let suffix = if missed.len() > shown.len() {
+            format!(", +{} more", missed.len() - shown.len())
+        } else {
+            String::new()
+        };
+        warnings.push(format!(
+            "rustc dep-info lists {} source file(s) the scanner did not reach: {}{}",
+            missed.len(),
+            shown.join(", "),
+            suffix
+        ));
+    }
+
     let nodes = names.into_iter().collect();
     Ok(ScanOutput {
         edges,
@@ -366,6 +386,125 @@ fn walk_ext(
         }
     }
     Ok(())
+}
+
+/// Drop a Windows `\\?\` verbatim prefix from a path string.
+fn strip_verbatim(s: &str) -> String {
+    s.strip_prefix("\\\\?\\").unwrap_or(s).to_string()
+}
+
+/// `.rs` files rustc read (per `target/**` dep-info `.d` files) that the
+/// scanner's walk didn't reach. Empty when no dep-info exists - a
+/// missing `target/` just means cargo hasn't run, not a coverage gap.
+fn depinfo_unscanned(root: &Path, names: &BTreeSet<String>) -> Vec<String> {
+    let target = root.join("target");
+    if !target.is_dir() {
+        return Vec::new();
+    }
+    let Ok(root_canon) = root.canonicalize() else {
+        return Vec::new();
+    };
+    // Normalize both sides to '/'-joined strings without a verbatim
+    // `\\?\` prefix so `.d` paths (plain `C:\...`) compare cleanly.
+    let root_norm = strip_verbatim(&root_canon.to_string_lossy()).replace('\\', "/");
+    let root_prefix = format!("{root_norm}/");
+    let mut d_files = Vec::new();
+    collect_depinfo(&target, 0, &mut d_files);
+
+    let mut missed = BTreeSet::new();
+    for d in d_files {
+        let Ok(text) = fs::read_to_string(&d) else {
+            continue;
+        };
+        for dep in depinfo_deps(&text) {
+            let dep = dep.replace("\\ ", " ");
+            if !dep.ends_with(".rs") {
+                continue;
+            }
+            let dep_norm = strip_verbatim(&dep).replace('\\', "/");
+            let Some(rel) = dep_norm.strip_prefix(&root_prefix) else {
+                continue; // outside the project (path deps, sysroot)
+            };
+            let rel = rel.to_string();
+            // Skip anything under an intentionally-skipped dir (target/
+            // itself holds OUT_DIR-generated sources rustc legitimately
+            // reads but the scanner deliberately ignores).
+            if rel.split('/').any(|s| SKIP_DIRS.contains(&s)) {
+                continue;
+            }
+            if !names.contains(&rel) {
+                missed.insert(rel);
+            }
+        }
+    }
+    missed.into_iter().collect()
+}
+
+/// Collect `*.d` dep-info files under `target/`, bounded in depth and
+/// count so huge target dirs stay cheap.
+fn collect_depinfo(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 5 || out.len() > 5000 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            collect_depinfo(&path, depth + 1, out);
+        } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("d") {
+            out.push(path);
+        }
+    }
+}
+
+/// Dependency paths from a Makefile-style `.d` file: `target: dep dep
+/// \`-continued lines, `\ `-escaped spaces. Returns raw dep strings.
+fn depinfo_deps(text: &str) -> Vec<String> {
+    // Join `\`-newline continuations, then take everything after the
+    // first ':' on each logical rule line.
+    let joined = text.replace("\\\r\n", " ").replace("\\\n", " ");
+    let mut out = Vec::new();
+    for line in joined.lines() {
+        // Rule colon is the first ':' followed by whitespace or EOL -
+        // `C:\` drive prefixes have ':' followed by '\'.
+        let bytes = line.as_bytes();
+        let mut split_at = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b':' && (i + 1 == bytes.len() || bytes[i + 1].is_ascii_whitespace()) {
+                split_at = Some(i);
+                break;
+            }
+        }
+        let Some(i) = split_at else {
+            continue;
+        };
+        let deps = &line[i + 1..];
+        // Split on whitespace but keep `\ `-escaped spaces inside tokens.
+        let mut cur = String::new();
+        let mut chars = deps.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' && chars.peek() == Some(&' ') {
+                cur.push('\\');
+                cur.push(' ');
+                chars.next();
+            } else if c.is_whitespace() {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            } else {
+                cur.push(c);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
 }
 
 // ---------- path math (all in root-relative "/" space) ----------

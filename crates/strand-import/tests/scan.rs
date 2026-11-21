@@ -830,3 +830,41 @@ fn scan_rust_manual_depends_on() {
         "rust manual edge missing: {edges:?}"
     );
 }
+
+#[test]
+fn scan_rust_depinfo_cross_check() {
+    // `.d` dep-info lists files rustc read. A .rs under the root that
+    // isn't on disk (or wasn't walked) surfaces as a warning; paths
+    // under target/ or outside the root are ignored.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "src/lib.rs", "pub fn f() {}\n");
+    let canon = root.canonicalize().unwrap();
+    let canon_str = canon
+        .to_string_lossy()
+        .trim_start_matches("\\\\?\\")
+        .replace('\\', "/");
+    let d = format!(
+        "{canon_str}/target/debug/deps/proj-abc.d: {canon_str}/src/lib.rs {canon_str}/src/ghost.rs {canon_str}/target/debug/build/out/gen.rs C:/outside.rs\n"
+    );
+    w(root, "target/debug/deps/proj-abc.d", &d);
+    let out = scan_rust(root).unwrap();
+    assert_eq!(out.warnings.len(), 1, "warnings: {:?}", out.warnings);
+    assert!(
+        out.warnings[0].contains("src/ghost.rs"),
+        "warning: {}",
+        out.warnings[0]
+    );
+    assert!(!out.warnings[0].contains("gen.rs"));
+    assert!(!out.warnings[0].contains("outside.rs"));
+}
+
+#[test]
+fn scan_rust_depinfo_absent_is_quiet() {
+    // No target/ dir -> no dep-info -> no warning.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "src/lib.rs", "pub fn f() {}\n");
+    let out = scan_rust(root).unwrap();
+    assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+}
