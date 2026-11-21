@@ -868,3 +868,28 @@ fn scan_rust_depinfo_absent_is_quiet() {
     let out = scan_rust(root).unwrap();
     assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
 }
+
+#[test]
+fn scan_python_reexport_chain() {
+    // pkg/__init__.py re-exports a private module; callers import from
+    // the package root. Impact on _impl.py must reach callers through
+    // the __init__.py -> _impl.py edge.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "from ._impl import thing\nfrom . import helper\n");
+    w(root, "pkg/_impl.py", "thing = 1\n");
+    w(root, "pkg/helper.py", "x = 2\n");
+    w(root, "app.py", "from pkg import thing\nimport pkg.helper\n");
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    // Caller sees the package root, not the private module directly.
+    assert!(has("app.py", "pkg/__init__.py"), "edges: {edges:?}");
+    // __init__'s relative imports reach the private modules.
+    assert!(has("pkg/__init__.py", "pkg/_impl.py"), "edges: {edges:?}");
+    assert!(has("pkg/__init__.py", "pkg/helper.py"), "edges: {edges:?}");
+    // `import pkg.helper` also yields the submodule edge.
+    assert!(has("app.py", "pkg/helper.py"), "edges: {edges:?}");
+    // Transitive: _impl -> __init__ -> app is reachable via those edges.
+}
