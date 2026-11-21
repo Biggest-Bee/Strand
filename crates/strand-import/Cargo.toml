@@ -1,6 +1,6 @@
 [package]
 name = "strand-import"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Importers for strand graphs: cargo metadata, CSV/TSV, lockfiles (Cargo.lock, package-lock, poetry.lock, go.mod, pom.xml), and source scanners (Rust/Python/JS)"
 license = "Apache-2.0"
