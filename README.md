@@ -29,12 +29,12 @@ or server databases (Neo4j). Strand's niche:
    memory-mapped CSR with forward *and* reverse adjacency. Opening is a
    header parse + validation; traversals read straight from the mapping.
 2. **Dependency/impact analysis as a first-class feature**: blast radius,
-   why-paths, cycle detection, risk ranking, build order — all deterministic
+   why-paths, cycle detection, risk ranking, build order - all deterministic
    and scriptable (`--json` everywhere).
 3. **Embeddable**: `Graph::open("x.strand")` from Rust, no server.
 
-**`strand-store`** is an embeddable read-write graph store —
-"SQLite for graphs" — with transactions, snapshots, a write-ahead log,
+**`strand-store`** is an embeddable read-write graph store -
+"SQLite for graphs" - with transactions, snapshots, a write-ahead log,
 crash-safe compaction, and the same analysis algorithms running on the
 merged view.
 
@@ -56,7 +56,7 @@ Tests live in each crate's `tests/` directory (see [Testing](#testing)).
 
 ## Install
 
-**Prebuilt binaries** — grab the archive for your platform from
+**Prebuilt binaries** - grab the archive for your platform from
 [Releases](https://github.com/Biggest-Bee/Strand/releases) and verify it
 against `SHA256SUMS.txt`. Archives cover Windows x86_64, Linux x86_64
 (glibc 2.35), macOS arm64, and macOS x86_64 (runs under Rosetta 2 on
@@ -66,7 +66,7 @@ and `strand-gui` (desktop GUI).
 > The binaries are **unsigned**: Windows SmartScreen ("Windows protected
 > your PC") and macOS Gatekeeper ("cannot be opened because the
 > developer cannot be verified") will warn on first run. That's expected
-> — right-click → Open (macOS) or *More info → Run anyway* (Windows),
+> - right-click → Open (macOS) or *More info → Run anyway* (Windows),
 > or build from source below.
 
 **From crates.io** (needs a Rust toolchain, no repo clone):
@@ -77,7 +77,7 @@ cargo install strand-cli              # CLI only (`strand`)
 cargo install strand-gui              # GUI only (`strand-gui`)
 ```
 
-Re-running any of these installs the latest published version — same
+Re-running any of these installs the latest published version - same
 command updates an existing install.
 
 **From source** (needs a Rust toolchain):
@@ -90,7 +90,7 @@ cargo install --path crates/strand-gui   # the desktop GUI
 
 Both binaries include a lightweight **version check**: at most once
 per 24h they query crates.io in the background (800ms timeout, silent
-when offline) and note it when a newer release exists — stderr for the
+when offline) and note it when a newer release exists - stderr for the
 CLI, a notice card/top-bar label for the GUI. Disable with
 `STRAND_NO_UPDATE_CHECK=1`.
 
@@ -151,7 +151,7 @@ strand leaves deps.strand
 strand common deps.strand deps a b
 
 # Impact of everything changed vs a git ref (CI use):
-# maps `git diff --name-only <ref>` paths onto graph nodes — exact path
+# maps `git diff --name-only <ref>` paths onto graph nodes - exact path
 # for file-level scan graphs, directory/package segment for cargo graphs.
 strand impact deps.strand --git-diff origin/main --max-impact 25
 # exits non-zero when the blast radius exceeds --max-impact
@@ -204,21 +204,21 @@ db.compact()?;   // fold delta into a fresh base-<epoch>.strand, atomic manifest
 //
 // Heads-up on delta RAM: each applied op costs ~100+ bytes in the
 // in-memory delta maps, so 1M ops ≈ ~120MB. The effective threshold is
-// max(compact_threshold_ops, base_edges/10) — on a 50M-edge base the
+// max(compact_threshold_ops, base_edges/10) - on a 50M-edge base the
 // delta can reach ~5M ops (~580MB) before auto-compaction kicks in.
 // Lower compact_threshold_ops if that spike matters.
 ```
 
 - **Durability**: each commit is one WAL record `[len][crc][ops]`, fsynced
   before `commit()` returns. On open, replay stops at the first bad
-  checksum — torn tail writes lose at most the uncommitted tail.
+  checksum - torn tail writes lose at most the uncommitted tail.
 - **Reads**: with an empty delta, neighbor iteration *is* the pure CSR fast
   path; with a small delta, untouched nodes still take it (per-node merge
   only where the delta has ops).
 - **Compaction**: rebuilds a new immutable base, fsyncs, atomically swaps
   `manifest.json`, reclaims old epoch files lazily. Live snapshots keep
   their pinned `Arc`s, so readers are never blocked. Measured on a
-  50M-edge base with a 1k-op delta: ~3 min and ~1.2 GB peak — it
+  50M-edge base with a 1k-op delta: ~3 min and ~1.2 GB peak - it
   rebuilds the whole file, so keep GUI auto-compaction off (it is, by
   default) and let the ratio threshold keep it rare. A streaming
   merge is the planned fix.
@@ -244,7 +244,7 @@ also works from any directory.
 
 - **Open .strand…** loads an immutable graph; **Open store…** loads a
   `.strandb` directory (read-write if the lock is free, read-only
-  otherwise — analyses work identically on the merged view); **Close**
+  otherwise - analyses work identically on the merged view); **Close**
   unloads the current graph; **Instructions** opens a full reference of
   every button and canvas gesture.
 - First launch shows a short **card tutorial** (right arrow or Next to
@@ -256,10 +256,10 @@ also works from any directory.
   (same click/shift+click rules). Then run **Deps of A/B**,
   **Impact of A/B**, **Why A->B** or **Why B->A**, **swap A/B**,
   **Cycles**, **Build order**, **Roots**, **Leaves**,
-  **Top** (in-degree / impact / pagerank), and **Common deps/impact** —
+  **Top** (in-degree / impact / pagerank), and **Common deps/impact** -
   all with an optional depth limit.
-- The bottom report panel lists full results — even ones too large to
-  draw — with a **filter box** (case-insensitive substring, shows
+- The bottom report panel lists full results - even ones too large to
+  draw - with a **filter box** (case-insensitive substring, shows
   "shown of total") and clickable rows: click re-selects a node as A,
   right-click re-selects it as B.
 - The canvas draws the graph and supports **scroll/pinch zoom** (up to
@@ -274,15 +274,15 @@ also works from any directory.
 - Edges are tiered: edges touching your A/B selection draw bright yellow
   with a black outline on top, highlight-set edges amber, everything
   else dim. On huge highlight sets the middle tier is skipped so the
-  canvas stays readable — the report list still has every node.
+  canvas stays readable - the report list still has every node.
   Edges incident to A/B are always drawn (up to 96 neighbors each way),
-  even when they fall outside the sampled edge set — neighbors beyond
+  even when they fall outside the sampled edge set - neighbors beyond
   the node cap appear as small dots ringing the selected node.
 - It handles up to 100k nodes / 300k edges: past 8k nodes it switches to
   cheap square markers, and opening a larger file shows a warning that
   the canvas is a partial sample (analyses always cover the full graph).
 - Analyses, the name index, node focusing, and the organic layout all
-  run on **worker threads** — the window stays responsive while they
+  run on **worker threads** - the window stays responsive while they
   compute. Very large graphs may still show "analyzing…" for a while;
   the canvas itself is capped (see warning above) since hit-testing
   and repaints scale with drawn nodes.
@@ -297,7 +297,7 @@ also works from any directory.
 ### Opening `.strand` files by double-click
 
 `.strand` is a binary memory-mapped format, so editors/IDEs can't
-render it — the GUI is the viewer. To make double-clicking a `.strand`
+render it - the GUI is the viewer. To make double-clicking a `.strand`
 file open Strand:
 
 - **Windows**: right-click the file → *Open with* → *Choose another
@@ -354,14 +354,14 @@ Notes:
   UTF-8 names, xxh64 checksum over the whole file), so its cost scales with
   file size. Measured on a 790MB / 50M-edge file (below): ~0.5s warm,
   ~1.8s cold.
-  The mapping itself is zero-copy — traversals touch only the pages they
+  The mapping itself is zero-copy - traversals touch only the pages they
   need.
 - petgraph has no on-disk CSR format; the comparison above is in-memory
   construction + BFS, not open+query. Strand's advantage is that the "open"
   cost is paid once and queries then run directly on the mapped file with
   no per-query deserialization.
 - `impact_sizes` (used by `top --by impact`) collapses the graph to its
-  SCC condensation DAG and computes ancestor sets with bitsets —
+  SCC condensation DAG and computes ancestor sets with bitsets -
   `O(E·C/64)` word-ops, memory-blocked to ~256MB. On graphs whose
   component count makes that too expensive it falls back to a
   per-node reverse BFS (fine for small/medium graphs; see Limitations).
@@ -381,12 +381,12 @@ i5-1335U (12 threads, 8GB RAM); page cache warm unless noted:
 | `Graph::open` (mmap + validation + xxh64 over 790MB) | ~0.5 s warm / ~1.8 s cold |
 | forward BFS visiting all 10M nodes / 50M edges | ~1.3 s |
 | Tarjan SCC (iterative) | ~9 s |
-| PageRank (~0.12 s/iter, rayon) | ~0.25 s — converged in ~2 iters |
+| PageRank (~0.12 s/iter, rayon) | ~0.25 s - converged in ~2 iters |
 | `top --by impact` (SCC condensation + bitsets) | ~17 s total incl. open+SCC |
 
 Caveat: the synthetic graph is near-regular (every node has exactly 5
 out-edges) *and* collapses into one giant SCC, so the condensation has a
-single component and the bitsets are tiny — the ~17 s `top --by impact`
+single component and the bitsets are tiny - the ~17 s `top --by impact`
 row does not represent a large mostly-acyclic graph (that's what the
 sampling path covers, e.g. the 300k-node run). PageRank also converges
 unusually fast here. Real dependency graphs are skewed with a few hub
@@ -395,9 +395,9 @@ bound and should transfer to skewed graphs.
 
 ### Real-world graph (npm lockfiles)
 
-Merged the committed `package-lock.json` files from three public repos —
+Merged the committed `package-lock.json` files from three public repos -
 [axios](https://github.com/axios/axios), [lodash](https://github.com/lodash/lodash),
-[microsoft/TypeScript](https://github.com/microsoft/TypeScript) — into one
+[microsoft/TypeScript](https://github.com/microsoft/TypeScript) - into one
 graph (1,778 nodes / 3,790 edges / 105KB):
 
 ```console
@@ -415,7 +415,7 @@ top 5 by Impact:
 ```
 
 `top --by impact` completes in ~0.13s and correctly surfaces the classic
-npm hub packages. `impact semver` reports 182 affected packages — the
+npm hub packages. `impact semver` reports 182 affected packages - the
 kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
 
 ## Testing
@@ -488,10 +488,10 @@ cargo test
 
 ## Limitations (honest list)
 
-- No query language — Rust API + CLI + desktop GUI.
+- No query language - Rust API + CLI + desktop GUI.
 - The GUI canvas caps at 100k nodes / 300k edges with level-of-detail
   rendering; beyond that use the CLI. Store edits are limited to
-  node/edge add/remove — no batch import or schema changes from the GUI.
+  node/edge add/remove - no batch import or schema changes from the GUI.
 - `top --by impact` uses SCC condensation + bitset ancestor sets
   (`O(E·C/64)` word-ops, processed in ~256MB column blocks) when the op
   count fits the budget. On huge mostly-acyclic graphs (`C` ≈ V) it
@@ -499,16 +499,16 @@ cargo test
   (`impact_sizes_approx`, ~2G edge visits). The estimate is unbiased
   but *not* uniform-accuracy: high-impact nodes (the top of the
   ranking) are accurate, low-impact nodes are noisy and often estimate
-  as 0 — fine for ranking, near-ties can misorder. The CLI reranks the
+  as 0 - fine for ranking, near-ties can misorder. The CLI reranks the
   top candidates with exact per-node BFS (boundary ties included,
   budget-capped), prints the landmark count, marks approximate rows
   with `~`, and reports per-node `exact` flags in `--json`.
   `--samples N` overrides the landmark count; `--approx` forces
   sampling even when exact is affordable (benchmarking/validation);
   `--exact` forces the exact algorithm even over budget (per-node BFS
-  fallback — can be very slow on huge DAGs). Estimates are clamped to
+  fallback - can be very slow on huge DAGs). Estimates are clamped to
   `n-1`. The library function `impact_sizes()` itself falls back to
-  exact per-node BFS for *any* graph over the bitset budget — which can
+  exact per-node BFS for *any* graph over the bitset budget - which can
   run for hours on a large mostly-acyclic DAG; use `impact_sizes_auto`
   for the sampling path.
 - `why --all-paths` enumerates alternative *shortest* chains (cap via
@@ -518,19 +518,19 @@ cargo test
   (unweighted graphs count every edge as 1.0). The store preserves
   weights through compaction.
 - The store is single-writer per directory (one process holds the write
-  lock); scale-out means one store per shard — e.g. one `.strandb` per
+  lock); scale-out means one store per shard - e.g. one `.strandb` per
   top-level subtree or per service, queried independently. Cross-shard
   queries are not supported yet.
 - Store node ids are **not stable across compaction**: the new base
   renumbers nodes by name, so anything holding ids across a compaction
   (selections, cached lookups) goes stale. Use node *names* as stable
-  keys — `node_id`/`node_name` re-resolve cheaply.
-- Edges have a single kind — optionally weighted (`f32`), nothing more.
+  keys - `node_id`/`node_name` re-resolve cheaply.
+- Edges have a single kind - optionally weighted (`f32`), nothing more.
   There are no dependency-type distinctions (dev vs build vs optional,
   import vs require); importers that know the kind (e.g. cargo
   metadata's dep kinds) currently collapse them into one edge.
 - Store delta is in-memory, but commits auto-compact once it passes
-  `Options::compact_threshold_ops` (default 1M ops, 0 disables) — the
+  `Options::compact_threshold_ops` (default 1M ops, 0 disables) - the
   delta can still spike RAM between compactions, and readers pin their
   snapshot's delta until they drop it.
 - Crash safety covers WAL commits and manifest swaps; orphaned
@@ -538,8 +538,8 @@ cargo test
   (writers only publish via rename).
 - mmap assumes files aren't truncated while open (inherent SIGBUS risk);
   the write path always writes-then-renames.
-- `strand scan` parses sources with real parsers — `syn` for Rust,
-  tree-sitter for Python and JS/TS — so comments, string literals, and
+- `strand scan` parses sources with real parsers - `syn` for Rust,
+  tree-sitter for Python and JS/TS - so comments, string literals, and
   grouped `use` trees (`use a::{b, c::d}`) are handled by the grammar,
   not text matching. It handles `mod`/`use`/`#[path]`/`include!` (Rust),
   `import`/`from` incl. relative imports (Python), and
@@ -550,10 +550,10 @@ cargo test
   Files that fail to parse are skipped with a warning (the scan may be
   incomplete). It misses
   macro-generated modules (a real parser can't see
-  them either without expanding macros — `cargo expand` output is a
+  them either without expanding macros - `cargo expand` output is a
   workaround for inspection, not for scanning), `include_str!` payloads,
   and dynamic language tricks. Nodes are file
-  paths, so it answers "what breaks if I change `src/foo.rs`?" —
+  paths, so it answers "what breaks if I change `src/foo.rs`?" -
   package-level questions still want `cargo metadata` input.
   Unresolvable imports and third-party packages are dropped entirely
   (they are not nodes); the node set is exactly the source files found
@@ -561,6 +561,6 @@ cargo test
 
 ## License
 
-[Apache-2.0](LICENSE) — permissive, patent-granting, and it explicitly
+[Apache-2.0](LICENSE) - permissive, patent-granting, and it explicitly
 allows creating content about the software (reviews, videos, tutorials)
 without permission.

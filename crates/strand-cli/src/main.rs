@@ -1,4 +1,4 @@
-//! `strand` — dependency and impact analysis on memory-mapped CSR graphs.
+//! `strand` - dependency and impact analysis on memory-mapped CSR graphs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -233,7 +233,7 @@ struct TopArgs {
     #[arg(long)]
     samples: Option<usize>,
     /// For --by impact: force the exact algorithm even when it exceeds
-    /// the bitset budget (per-node BFS fallback — can be very slow on
+    /// the bitset budget (per-node BFS fallback - can be very slow on
     /// huge mostly-acyclic graphs).
     #[arg(long)]
     exact: bool,

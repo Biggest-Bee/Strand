@@ -39,7 +39,7 @@ pub struct Delta {
 }
 
 impl Delta {
-    /// True when the delta contributes nothing — readers can then take the
+    /// True when the delta contributes nothing - readers can then take the
     /// pure-CSR fast path.
     pub fn is_noop(&self) -> bool {
         self.out.is_empty()

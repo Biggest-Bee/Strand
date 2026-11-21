@@ -1,11 +1,11 @@
 //! PageRank by power iteration, parallelized with rayon.
 //!
-//! `reverse = false`: PageRank on the dependency graph itself — rank flows
+//! `reverse = false`: PageRank on the dependency graph itself - rank flows
 //! from a node to the things it depends on, so heavily-depended-upon
 //! libraries accumulate rank. This is the "risk" ranking used by
 //! `strand top --by pagerank`.
 //!
-//! `reverse = true`: PageRank on the reversed graph — rank flows from a
+//! `reverse = true`: PageRank on the reversed graph - rank flows from a
 //! dependency toward its dependents (useful for "influence" queries).
 
 use rayon::prelude::*;

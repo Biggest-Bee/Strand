@@ -46,7 +46,7 @@ pub fn depth_counts(depths: &[u32]) -> std::collections::BTreeMap<u32, usize> {
 /// itself) for every node.
 ///
 /// Strategy: collapse the graph to its SCC condensation DAG, then compute
-/// ancestor sets with bitsets in topological order — `O(E_dag * C/64)`
+/// ancestor sets with bitsets in topological order - `O(E_dag * C/64)`
 /// word-ops where `C` is the component count. Nodes in the same SCC share
 /// an impact set, so this is exact and much faster than per-node BFS
 /// whenever large cycles exist.
@@ -102,7 +102,7 @@ pub fn impact_sizes_auto_with<G: GraphView>(
 }
 
 /// Exact impact count of a single node: number of distinct dependents
-/// (reverse-reachable nodes) excluding the node itself. One BFS — cheap
+/// (reverse-reachable nodes) excluding the node itself. One BFS - cheap
 /// enough to rerank a few hundred top candidates on huge graphs.
 pub fn impact_size_exact<G: GraphView>(graph: &G, node: u32) -> u32 {
     let depths = bfs(graph, &[node], Dir::In, None);
@@ -114,7 +114,7 @@ pub fn impact_size_exact<G: GraphView>(graph: &G, node: u32) -> u32 {
 /// reranked; ties at the boundary score are *all* included (up to
 /// `cap`) so saturated estimates can't leak approximate values into
 /// printed output. Ties break by lower node id, keeping the selection
-/// deterministic. `cap` bounds total candidates — pass a value scaled
+/// deterministic. `cap` bounds total candidates - pass a value scaled
 /// to the edge budget on huge graphs. Returns the reranked node ids
 /// (sorted); `scores` outside that set keeps its estimates.
 pub fn rerank_impact_exact<G: GraphView>(
@@ -130,7 +130,7 @@ pub fn rerank_impact_exact<G: GraphView>(
     }
     let want = m.min(n).min(cap);
     let mut idx: Vec<u32> = (0..n as u32).collect();
-    // Partial sort: only the top `want` need ordering — O(n) instead of
+    // Partial sort: only the top `want` need ordering - O(n) instead of
     // O(n log n) on 10M-node graphs. total_cmp is a total order (NaN-safe).
     let cmp = |&a: &u32, &b: &u32| {
         scores[b as usize]
@@ -193,10 +193,10 @@ fn default_approx_samples<G: GraphView>(graph: &G) -> usize {
 /// dependency closure with a forward BFS, and counts how many sampled
 /// dependents reach every node. `estimate(X) ≈ n/k × count(X)` is an
 /// unbiased estimator of the true impact size. Error is *not* uniform:
-/// nodes reached by many landmarks (high-impact nodes — the ones that
+/// nodes reached by many landmarks (high-impact nodes - the ones that
 /// matter for ranking) have small relative error, while low-impact
 /// nodes are noisy and often estimate as 0. Near-ties, especially in
-/// the middle of the ranking, can be misordered — use
+/// the middle of the ranking, can be misordered - use
 /// [`rerank_impact_exact`] for the printed top rows. Self-hits from
 /// landmark nodes are subtracted so estimates exclude the node itself
 /// like the exact path.
@@ -218,7 +218,7 @@ pub fn impact_sizes_approx_detail<G: GraphView>(
     if n == 0 || samples == 0 {
         return (vec![0.0; n], 0);
     }
-    // Cap landmarks: samples >= n would make every node a landmark —
+    // Cap landmarks: samples >= n would make every node a landmark -
     // that's n full BFS passes (exact-cost) under an "approx" label.
     let samples = samples.min(n).min(1024);
 

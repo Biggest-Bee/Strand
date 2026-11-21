@@ -13,7 +13,7 @@ pub struct PathList {
     /// The enumerated paths, in deterministic discovery order.
     pub paths: Vec<Vec<u32>>,
     /// True when enumeration stopped before exhausting the search space
-    /// (hit `k`/`limit` or the internal step budget) — more paths may
+    /// (hit `k`/`limit` or the internal step budget) - more paths may
     /// exist that were not returned.
     pub truncated: bool,
 }
@@ -75,7 +75,7 @@ pub fn k_shortest_paths<G: GraphView>(graph: &G, from: u32, to: u32, k: usize) -
         };
     }
     if from == to {
-        // The only simple chain is the trivial one — enumeration is exact.
+        // The only simple chain is the trivial one - enumeration is exact.
         return PathList {
             paths: vec![vec![from]],
             truncated: false,
@@ -168,7 +168,7 @@ pub fn k_shortest_paths<G: GraphView>(graph: &G, from: u32, to: u32, k: usize) -
 /// Up to `limit` distinct *simple* dependency chains from `from` to `to`
 /// whose hop count is at most `max_depth`.
 ///
-/// Unlike [`k_shortest_paths`] this is not restricted to shortest chains —
+/// Unlike [`k_shortest_paths`] this is not restricted to shortest chains -
 /// it enumerates every simple path within the depth bound via iterative
 /// DFS. Deterministic: neighbors are visited in view order. Bounded by
 /// `limit` results and an internal step budget so dense graphs cannot
@@ -220,7 +220,7 @@ pub fn paths_within_depth<G: GraphView>(
         out
     };
     // Precompute each node's allowed out-neighbors once: neighbors that
-    // can still reach `to` within the depth bound from *some* position —
+    // can still reach `to` within the depth bound from *some* position -
     // the tight per-position check happens during DFS.
     let mut paths: Vec<Vec<u32>> = Vec::new();
     let mut path: Vec<u32> = vec![from];
@@ -339,7 +339,7 @@ where
 }
 
 /// Weighted shortest path (Dijkstra) specialized for [`crate::Graph`]:
-/// zips `out_targets` with `out_weights` directly — O(E log V), no
+/// zips `out_targets` with `out_weights` directly - O(E log V), no
 /// per-edge weight lookups. Returns `None` if `to` is unreachable.
 /// Unweighted graphs are treated as all-ones weights.
 pub fn shortest_path_weighted_csr(

@@ -29,7 +29,7 @@ pub enum Error {
     Invalid(String),
 
     /// Generic usage/input error (CLI args, parse failures, rule
-    /// violations) — not a corrupt graph file.
+    /// violations) - not a corrupt graph file.
     #[error("{0}")]
     Usage(String),
 

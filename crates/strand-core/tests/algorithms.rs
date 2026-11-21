@@ -167,7 +167,7 @@ fn scc_and_cycles() {
     assert!(sizes.contains(&2), "sizes: {sizes:?}");
     assert!(sizes.contains(&1), "sizes: {sizes:?}");
 
-    // order: dependencies first — f depends on a-cycle; d/e cycle: d->e,e->d
+    // order: dependencies first - f depends on a-cycle; d/e cycle: d->e,e->d
     // and c->d. Emission order must place {d,e} before {a,b,c} before f? f->a
     // means f depends on a,b,c cycle. c->d means abc depends on de.
     // deps-first: de, abc, f? but f->a edge: f depends on abc → abc before f.
@@ -417,7 +417,7 @@ fn impact_sizes_approx_tracks_exact() {
     assert!(a1[hub] < 900.0, "hub estimate {} too high", a1[hub]);
 
     // Estimates can never exceed n-1 (a node affects at most every
-    // other node) — sampling overshoot is clamped.
+    // other node) - sampling overshoot is clamped.
     let n = g.n_nodes() as f64;
     assert!(a1.iter().all(|&v| v <= n - 1.0 + f64::EPSILON));
 

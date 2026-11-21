@@ -21,7 +21,7 @@ pub struct View<'a> {
     pub(crate) base_n: u64,
     pub(crate) delta: &'a Delta,
     pub(crate) n_nodes: usize,
-    /// Precomputed `delta.is_noop()` — checked on every neighbor call.
+    /// Precomputed `delta.is_noop()` - checked on every neighbor call.
     pub(crate) noop: bool,
     /// Precomputed `delta.removed.is_empty()`.
     pub(crate) no_removed: bool,

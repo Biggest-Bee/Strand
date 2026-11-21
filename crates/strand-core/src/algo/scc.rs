@@ -8,7 +8,7 @@ use crate::view::GraphView;
 /// Returns components in reverse topological order of the condensation:
 /// if component C has an edge to component D, D is emitted before C.
 /// Since `A -> B` means "A depends on B", emission order is therefore
-/// *dependencies-first* — exactly build order.
+/// *dependencies-first* - exactly build order.
 pub fn strongly_connected<G: GraphView>(graph: &G) -> Vec<Vec<u32>> {
     let n = graph.n_nodes();
     let mut index = vec![u32::MAX; n]; // discovery index

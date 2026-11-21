@@ -7,7 +7,7 @@
 //! deterministic across platforms and names unique.
 //!
 //! All three languages are parsed with real parsers: `syn` for Rust,
-//! tree-sitter for Python and JS/TS — comments, string literals, and
+//! tree-sitter for Python and JS/TS - comments, string literals, and
 //! broken-code recovery are handled by the grammars, not text matching.
 //! `#[path]` attributes, `include!("...")`, `tsconfig`/`jsconfig`
 //! aliases, and `package.json` `"imports"` are resolved on top.
@@ -26,7 +26,7 @@ use crate::EdgeList;
 
 /// Directories never descended into: VCS internals, dependency dirs,
 /// and conventional build/tooling output (`.next`, `dist`, `out`,
-/// `coverage`, framework caches). `build` is deliberately absent —
+/// `coverage`, framework caches). `build` is deliberately absent -
 /// some projects keep real sources there.
 const SKIP_DIRS: &[&str] = &[
     "target",
@@ -114,7 +114,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
         // Real parse via syn: comments, string/char/raw literals, and
         // grouped `use` trees are handled by the grammar, not text
         // matching. A file that fails to parse contributes no edges and
-        // is reported in `warnings` — the graph may be incomplete.
+        // is reported in `warnings` - the graph may be incomplete.
         let refs = match parse_rs_refs(&text) {
             Ok(r) => r,
             Err(e) => {
@@ -128,7 +128,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
 
         // `mod foo;` declarations -> foo.rs or foo/mod.rs under this
         // file's module directory. `#[path = "..."]` comes straight from
-        // the item's attributes — no proximity guessing.
+        // the item's attributes - no proximity guessing.
         let mdir = module_dir_rel(rel);
         for (seg, custom) in &refs.mods {
             let dep = match custom {
@@ -274,7 +274,7 @@ fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
 }
 
 /// Flatten a `use` tree into full segment paths. `self`/`super`/`crate`
-/// are ordinary idents here — the resolver interprets them.
+/// are ordinary idents here - the resolver interprets them.
 fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
     match tree {
         syn::UseTree::Path(p) => {
@@ -371,7 +371,7 @@ fn join_rel(base: &str, segs: &[String]) -> String {
 
 /// Longest-prefix resolution: for k from `segs.len()` down to 1, try
 /// `base/s0/.../sk.rs` then `base/s0/.../sk/mod.rs`. Returns the first
-/// match — so `use crate::a::b::Item` resolves to `a/b.rs` if it exists,
+/// match - so `use crate::a::b::Item` resolves to `a/b.rs` if it exists,
 /// else to `a.rs`/`a/mod.rs` (treating `b` as an item inside module `a`).
 fn resolve(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Option<String> {
     for k in (1..=segs.len()).rev() {
@@ -419,7 +419,7 @@ fn resolve_use_base(
 
 /// Map of importable crate names (both `foo-bar` and `foo_bar` forms) to
 /// `(src_dir_rel, root_file_rel)` for every `Cargo.toml` under `root`.
-/// Crude `[package] name` parsing — first `name = "..."` wins.
+/// Crude `[package] name` parsing - first `name = "..."` wins.
 fn crate_map(root: &Path, names: &BTreeSet<String>) -> BTreeMap<String, (String, String)> {
     let mut manifests = Vec::new();
     collect_manifests(root, root, &mut manifests);
@@ -597,7 +597,7 @@ fn ts_call_spec(call: tree_sitter::Node, src: &str) -> Option<String> {
 }
 
 /// All module specifiers in JS/TS source, via tree-sitter.
-/// Returns `(specs, had_error)` — `had_error` means the tree contains
+/// Returns `(specs, had_error)` - `had_error` means the tree contains
 /// ERROR nodes, so the spec list may be incomplete.
 fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, bool) {
     let mut specs = Vec::new();
@@ -634,7 +634,7 @@ const PY_EXTS: &[&str] = &["py"];
 
 /// One import found by the tree-sitter Python parse.
 enum PyRef {
-    /// `import a.b.c` — full dotted path segments.
+    /// `import a.b.c` - full dotted path segments.
     Import(Vec<String>),
     /// `from <dots><mod> import <names>`: leading-dot count (0 =
     /// absolute), module segments (empty for `from . import x`), and
@@ -815,7 +815,7 @@ fn add_py_from(
         base = parent_rel(&base).to_string();
     }
     // Absolute imports (`from x.y import`, level 0) resolve against
-    // every ancestor dir of this file, like Python's sys.path —
+    // every ancestor dir of this file, like Python's sys.path -
     // the package root may be a subdirectory (e.g. `repo/pkg/pkg/`).
     // Relative imports keep their computed base only.
     let bases: Vec<String> = if level == 0 {
@@ -847,7 +847,7 @@ fn add_py_from(
             }
         }
     } else {
-        // `from . import x, y` — names are modules under base.
+        // `from . import x, y` - names are modules under base.
         for name in imps {
             for b in &bases {
                 if let Some(dep) = resolve_py(names, b, std::slice::from_ref(name)) {
@@ -863,7 +863,7 @@ fn add_py_from(
 
 /// Ancestor directories of `rel` (root-relative file path), deepest
 /// first, ending with `""` (the scan root). Candidate package roots for
-/// absolute Python imports — mirrors how `sys.path` can contain any
+/// absolute Python imports - mirrors how `sys.path` can contain any
 /// ancestor of the importing file (e.g. `repo/pkg/pkg/` layouts where
 /// the top-level package lives one level down).
 fn ancestor_bases(rel: &str) -> Vec<String> {
@@ -1035,7 +1035,7 @@ struct TsAliases {
     /// Root-relative dir that `paths` targets and `baseUrl`-relative
     /// bare specifiers resolve against.
     base: String,
-    /// `baseUrl` was explicitly set — unmatched bare specifiers fall
+    /// `baseUrl` was explicitly set - unmatched bare specifiers fall
     /// back to `base/spec` (classic baseUrl resolution).
     has_base_url: bool,
     patterns: Vec<PathPattern>,

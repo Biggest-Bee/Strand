@@ -1,4 +1,4 @@
-//! Dump scan edges as sorted `src -> dst` lines — for diffing scanner
+//! Dump scan edges as sorted `src -> dst` lines - for diffing scanner
 //! implementations and debugging resolution.
 //!
 //! Usage: cargo run -p strand-import --example edges -- <dir> [--lang rust|python|js|all]

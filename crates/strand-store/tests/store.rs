@@ -319,7 +319,7 @@ impl Model {
 
 #[test]
 fn model_based_random_ops() {
-    // Deterministic PRNG (xorshift) — no external deps.
+    // Deterministic PRNG (xorshift) - no external deps.
     let mut seed = 0x12345678u64;
     let mut rnd = move || {
         seed ^= seed << 13;
@@ -366,7 +366,7 @@ fn model_based_random_ops() {
         }
         // Compare after every step.
         let got = adj_of(&store.begin_read().unwrap());
-        // Store keeps removed nodes as isolated ids — filter to live model
+        // Store keeps removed nodes as isolated ids - filter to live model
         // nodes plus any store node that still has edges.
         let want = model.adj();
         for (n, deps) in &want {
@@ -480,7 +480,7 @@ fn crash_consistency(iters: usize) {
         }
 
         // Phase 3: reopen and verify the store state equals EXACTLY some
-        // prefix of the committed transactions — no partial tx, no lost
+        // prefix of the committed transactions - no partial tx, no lost
         // committed prefix beyond the torn tail.
         let store = Store::open(&path).unwrap();
         let snap = store.begin_read().unwrap();
@@ -498,7 +498,7 @@ fn crash_consistency(iters: usize) {
             "iter {it}: store edge set matches no committed prefix"
         );
         // The matched prefix must be the longest one consistent with the
-        // surviving WAL — i.e., we never see edges from *beyond* the last
+        // surviving WAL - i.e., we never see edges from *beyond* the last
         // good record combined with missing earlier ones. Check monotonic:
         // there must exist k in matches with k == number of fully-intact
         // records. We can't know that count directly, but any match is a
@@ -511,7 +511,7 @@ fn crash_consistency(iters: usize) {
 }
 
 /// Corruption in the MIDDLE of the log (not the tail): flipping a byte
-/// inside an early record's payload must make open fail loudly — never
+/// inside an early record's payload must make open fail loudly - never
 /// silently drop that record and every later commit.
 #[test]
 fn wal_mid_log_corruption_refuses_open() {
@@ -545,7 +545,7 @@ fn wal_mid_log_corruption_refuses_open() {
 }
 
 /// A garbage length field (0x3FFFFFFF ≈ 1 GiB) at a record boundary must
-/// return an error — not be mistaken for a torn tail (which would
+/// return an error - not be mistaken for a torn tail (which would
 /// silently truncate every later commit) and not trigger a giant alloc.
 #[test]
 fn wal_garbage_length_errors() {
@@ -577,7 +577,7 @@ fn wal_garbage_length_errors() {
 
 /// A compaction that fails BEFORE the manifest swap must leave the old
 /// base + WAL fully intact: the store reopens with every earlier commit.
-/// (Post-swap code is infallible by construction — all fallible work,
+/// (Post-swap code is infallible by construction - all fallible work,
 /// including the manifest write, happens before the in-memory swap.)
 #[test]
 fn compact_failure_preserves_committed_state() {
@@ -602,7 +602,7 @@ fn compact_failure_preserves_committed_state() {
     });
     drop(store);
 
-    // Reopen: every commit — including post-failure ones — is present.
+    // Reopen: every commit - including post-failure ones - is present.
     let store = Store::open(&path).unwrap();
     let snap = store.begin_read().unwrap();
     let adj = adj_of(&snap);
@@ -660,7 +660,7 @@ fn auto_compact_threshold() {
 fn torn_tail_then_new_commit_survives_reopen() {
     // Regression: a torn WAL tail used to leave garbage in the file;
     // commits made after reopening landed *behind* it, and the next
-    // replay stopped at the garbage — silently losing those commits.
+    // replay stopped at the garbage - silently losing those commits.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.strandb");
     {
@@ -698,7 +698,7 @@ fn torn_tail_then_new_commit_survives_reopen() {
 
 #[test]
 fn mid_log_corruption_is_an_error() {
-    // A bad record followed by more data is corruption, not a torn tail —
+    // A bad record followed by more data is corruption, not a torn tail -
     // replay must fail loudly instead of dropping later transactions.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.strandb");

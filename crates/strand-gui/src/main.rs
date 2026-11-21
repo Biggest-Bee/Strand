@@ -34,7 +34,7 @@ enum StoreOp {
 }
 
 /// Assign through a pointer so `unused_assignments` can't prove the store
-/// dead — callers may legitimately overwrite `status` right after.
+/// dead - callers may legitimately overwrite `status` right after.
 fn set_status(status: &mut String, msg: String) {
     *status = msg;
 }
@@ -74,7 +74,7 @@ enum JobView {
 }
 
 /// Run `$body` with `$v` bound to the concrete view inside a `JobView`.
-/// The body must compile for both `&Graph` and `&View` — it does,
+/// The body must compile for both `&Graph` and `&View` - it does,
 /// because every algo/view call is generic over `GraphView`.
 macro_rules! job_view {
     ($jv:expr, |$v:ident| $body:expr) => {
@@ -132,7 +132,7 @@ struct StrandApp {
     /// Substring filter applied to the report list.
     report_filter: String,
 
-    /// All node names, sorted — powers the A/B autocomplete.
+    /// All node names, sorted - powers the A/B autocomplete.
     names: Vec<String>,
 
     // Graph canvas state.
@@ -143,7 +143,7 @@ struct StrandApp {
     /// (src, dst) id pairs for drawing (capped).
     edge_ids: Vec<(u32, u32)>,
     /// Edges incident to sel_a/sel_b that fell outside the sampled edge
-    /// set — (selected node, neighbor) pairs, always drawn tier-2.
+    /// set - (selected node, neighbor) pairs, always drawn tier-2.
     sel_nbr_edges: Vec<(u32, u32)>,
     /// Neighbors with no canvas position: (neighbor id, anchor sel id).
     sel_nbr_extra: Vec<(u32, u32)>,
@@ -346,7 +346,7 @@ const TUTORIAL: &[(&str, &str)] = &[
         "Welcome to Strand",
         "Strand draws dependency graphs and answers \"what breaks if this\n\
          changes?\" questions. This card tour takes 30 seconds.\n\n\
-         You'll need a .strand file — build one with the `strand` CLI,\n\
+         You'll need a .strand file - build one with the `strand` CLI,\n\
          or open a .strandb store for read-write editing.",
     ),
     (
@@ -370,7 +370,7 @@ const TUTORIAL: &[(&str, &str)] = &[
          or B->A (a path between two nodes), swap A/B, Cycles,
 \n         Build order, Roots, Leaves,\n\
          Top, and Common deps/impact. \"max depth\" limits hops.\n\n\
-         Results appear in the bottom panel — type in its filter\n\
+         Results appear in the bottom panel - type in its filter\n\
          box to search thousands of rows.",
     ),
     (
@@ -381,20 +381,20 @@ const TUTORIAL: &[(&str, &str)] = &[
          Scroll to zoom (up to 200x), drag to pan, double-click to\n\
          reset. \"Clear highlight\" wipes selections and colors.\n\n\
          The \"organic layout\" checkbox runs a force-directed\n\
-         layout on the neighborhood — uncheck for pure rings.",
+         layout on the neighborhood - uncheck for pure rings.",
     ),
     (
         "You're ready",
         "Click a row in the report to re-select that node and keep\n\
          exploring. Stuck? The \"Instructions\" button (top bar)\n\
          opens a full reference of every button.\n\n\
-         This tour only shows once — enjoy Strand!",
+         This tour only shows once - enjoy Strand!",
     ),
 ];
 
 /// Reference text for the Instructions window.
 const INSTRUCTIONS: &str = "\
-STRAND — button reference
+STRAND - button reference
 ==========================
 
 TOP BAR
@@ -405,7 +405,7 @@ TOP BAR
   Instructions      This window.
 
 NODES (left panel)
-  A / B boxes       Type a node name; suggestions appear below —
+  A / B boxes       Type a node name; suggestions appear below -
                     click one to select it. The \"select\" button
                     resolves the typed name.
   Browse nodes      Lists every node name (filterable). Click = pick
@@ -421,7 +421,7 @@ ANALYZE
   Why A->B / B->A   A shortest path between the two nodes.
   swap A/B          Exchange the A and B selections.
   Cycles            Circular dependency chains (needs both A and B
-                    unset, or scoped — see report).
+                    unset, or scoped - see report).
   Build order       Topological order of the graph.
   Roots             Nodes nothing depends on.
   Leaves            Nodes that depend on nothing.
@@ -432,7 +432,7 @@ ANALYZE
 
 GRAPH
   Rebuild view      Force the canvas to re-layout.
-  Clear highlight   Reset selections, rings, and layout — back to
+  Clear highlight   Reset selections, rings, and layout - back to
                     the plain scatter view.
   organic layout    Force-directed layout of the selected
                     neighborhood (deterministic; runs on a worker).
@@ -457,7 +457,7 @@ EDIT STORE (only when a writable store is open)
 
 TIPS
   Very large graphs (>100k nodes / >300k edges) show a partial canvas
-  sample with a warning — analyses always cover the whole graph.
+  sample with a warning - analyses always cover the whole graph.
   On huge result sets the middle edge tier is skipped so the canvas
   stays readable; the report still lists everything.
 ";
@@ -634,7 +634,7 @@ impl StrandApp {
         self.viz_dirty = true;
     }
 
-    /// Warn when the graph exceeds canvas caps — the view is then only a
+    /// Warn when the graph exceeds canvas caps - the view is then only a
     /// sample (queries still cover the full graph).
     fn cap_warning(&mut self) -> Option<String> {
         with_view!(self, |v| {
@@ -643,7 +643,7 @@ impl StrandApp {
             if n > MAX_VIZ_NODES || e > MAX_VIZ_EDGES {
                 Some(format!(
                     "warning: {n} nodes / {e} edges exceeds canvas caps \
-                     ({MAX_VIZ_NODES} nodes / {MAX_VIZ_EDGES} edges) — \
+                     ({MAX_VIZ_NODES} nodes / {MAX_VIZ_EDGES} edges) - \
                      canvas shows a partial sample; analyses cover everything"
                 ))
             } else {
@@ -655,7 +655,7 @@ impl StrandApp {
     /// Snapshot every node name (sorted, deduped) for autocomplete. Skipped
     /// on very large graphs where the index would cost too much memory.
     /// Snapshot every node name (sorted, deduped) for autocomplete.
-    /// Runs on a worker thread — on big graphs this is a full scan.
+    /// Runs on a worker thread - on big graphs this is a full scan.
     /// Skipped entirely over 200k nodes (autocomplete falls back off).
     fn collect_names(&mut self) {
         let Some(jv) = self.job_view() else { return };
@@ -900,7 +900,7 @@ impl StrandApp {
 
     /// Re-layout around the selected node: BFS a few hops in both
     /// directions so its neighborhood clusters into view. Runs on a
-    /// worker thread (depths only — does not touch the report).
+    /// worker thread (depths only - does not touch the report).
     fn focus_a(&mut self) {
         let Some(a) = self.sel_a else { return };
         let Some(jv) = self.job_view() else { return };
@@ -1257,10 +1257,10 @@ impl StrandApp {
         }
     }
 
-    /// Fold the delta into a fresh base. Runs on the UI thread — fine for
+    /// Fold the delta into a fresh base. Runs on the UI thread - fine for
     /// typical deltas; very large ones will pause the window briefly.
     fn store_compact(&mut self) {
-        // Compaction renumbers node ids — capture selection names first.
+        // Compaction renumbers node ids - capture selection names first.
         let name_a = self.sel_a.map(|id| with_view!(self, |v| nm(v, id)));
         let name_b = self.sel_b.map(|id| with_view!(self, |v| nm(v, id)));
         let res = match &self.backend {
@@ -1315,7 +1315,7 @@ impl StrandApp {
             }
             self.viz_edges = self.edge_ids.len();
 
-            // Always pull in edges incident to the A/B selection — the
+            // Always pull in edges incident to the A/B selection - the
             // sampled edge set can miss them entirely on big graphs.
             // Each direction gets its own budget so a hub's out-edges
             // can't starve its dependents (the impact direction).
@@ -1353,7 +1353,7 @@ impl StrandApp {
         });
 
         // Edge tiers depend only on sel/highlight, which always dirty the
-        // viz — compute once here instead of per frame.
+        // viz - compute once here instead of per frame.
         self.edge_tiers = self
             .edge_ids
             .iter()
@@ -1675,7 +1675,7 @@ impl StrandApp {
         let tiers = &self.edge_tiers;
         debug_assert_eq!(tiers.len(), self.edge_ids.len());
         // If the highlighted set touches too many edges, drawing them all
-        // just repaints the hairball — skip tier 1 entirely (nodes stay
+        // just repaints the hairball - skip tier 1 entirely (nodes stay
         // highlighted; only selection edges remain). Tier 2 always draws.
         let draw_tier1 = self.tier1_draw;
         // Batch into a handful of Shape::Vec draws instead of one painter
@@ -1768,7 +1768,7 @@ impl StrandApp {
             }
         }
 
-        // Dots for selection neighbors that have no canvas node —
+        // Dots for selection neighbors that have no canvas node -
         // they sit on the deterministic ring around their anchor.
         for &(nid, anchor) in &self.sel_nbr_extra {
             let Some(&as_) = self.pos.get(anchor as usize) else {
@@ -1934,7 +1934,7 @@ impl eframe::App for StrandApp {
                     self.resolve(1);
                 }
                 ui.add_space(4.0);
-                // Browse every node name — click picks A, shift+click B.
+                // Browse every node name - click picks A, shift+click B.
                 ui.collapsing("Browse nodes", |ui| {
                     ui.text_edit_singleline(&mut self.node_filter);
                     let q = self.node_filter.trim().to_lowercase();
@@ -1962,7 +1962,7 @@ impl eframe::App for StrandApp {
                             }
                         });
                     if shown >= 1000 {
-                        ui.label("… first 1000 matches — refine the filter");
+                        ui.label("… first 1000 matches - refine the filter");
                     }
                     if let Some((name, to_b)) = picked {
                         let id = with_view!(self, |v| v.node_id(name.as_str()));
@@ -2188,7 +2188,7 @@ impl eframe::App for StrandApp {
             let mut advance = false;
             let mut finish = false;
             egui::Window::new(format!(
-                "Welcome to Strand — {} of {}",
+                "Welcome to Strand - {} of {}",
                 i + 1,
                 TUTORIAL.len()
             ))
@@ -2213,7 +2213,7 @@ impl eframe::App for StrandApp {
                     } else if ui.button("Next >").clicked() {
                         advance = true;
                     }
-                    ui.label("— or press → (right arrow) to proceed");
+                    ui.label("- or press → (right arrow) to proceed");
                 });
             });
             // Right arrow advances, but not while a text field has focus

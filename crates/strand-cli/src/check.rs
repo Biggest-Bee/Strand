@@ -1,4 +1,4 @@
-//! `strand check` — architecture rules over a graph.
+//! `strand check` - architecture rules over a graph.
 //!
 //! Rules live in `strand.rules` (or `--rules <path>`), one per line:
 //!

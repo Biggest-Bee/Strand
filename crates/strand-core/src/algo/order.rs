@@ -20,7 +20,7 @@ pub struct BuildOrder {
 /// Compute SCCs, their dependencies-first order, and the critical path.
 ///
 /// Tarjan emits SCCs in reverse topological order of the condensation,
-/// which — given `A -> B` = "A depends on B" — is already dependencies-first.
+/// which - given `A -> B` = "A depends on B" - is already dependencies-first.
 pub fn analyze<G: GraphView>(graph: &G) -> BuildOrder {
     let sccs = strongly_connected(graph);
     let dag = condensation(graph, &sccs);

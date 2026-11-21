@@ -8,7 +8,7 @@
 //! - **Delta**: recent writes held in memory behind an `Arc`, persisted
 //!   through an append-only **write-ahead log** (`wal-N.log`).
 //! - **Reads** see the merged view via [`View`], which implements
-//!   [`strand_core::view::GraphView`] — every Phase-1 analysis algorithm
+//!   [`strand_core::view::GraphView`] - every Phase-1 analysis algorithm
 //!   runs on a snapshot unchanged. With an empty delta, iteration is the
 //!   pure base CSR fast path.
 //! - **Compaction** periodically folds base+delta into a new base file and
@@ -377,7 +377,7 @@ impl Store {
 
         // Do ALL fallible work before the manifest swap: create+validate
         // the new WAL handle and open the new base. After the swap only
-        // infallible in-memory updates remain — a failure here used to
+        // infallible in-memory updates remain - a failure here used to
         // leave the store appending to a WAL the manifest no longer
         // referenced (and gc would delete).
         let new_wal_file = OpenOptions::new()
@@ -388,7 +388,7 @@ impl Store {
         let new_base = Arc::new(Graph::open(&base_path)?);
         let new_base_n = new_base.n_nodes();
 
-        // The only remaining fallible ops are the mutex locks — take them
+        // The only remaining fallible ops are the mutex locks - take them
         // before the swap too.
         let mut st = self.state.lock().map_err(|_| Error::Poisoned)?;
         let mut wf = self.wal_file.lock().map_err(|_| Error::Poisoned)?;
@@ -458,7 +458,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The merged view — pass `&view` to any `strand_core::algo` function.
+    /// The merged view - pass `&view` to any `strand_core::algo` function.
     pub fn view(&self) -> View<'_> {
         View::new(
             self.base.as_deref(),
@@ -575,7 +575,7 @@ impl<'a> WriteTx<'a> {
         }
 
         // 2. Apply to in-memory delta. `Arc::make_mut` copies only when a
-        //    live snapshot pins the old delta — steady-state commits on an
+        //    live snapshot pins the old delta - steady-state commits on an
         //    unread store mutate in place instead of cloning the delta.
         let (delta_ops, base_edges) = {
             let mut st = self.store.state.lock().map_err(|_| Error::Poisoned)?;
@@ -593,7 +593,7 @@ impl<'a> WriteTx<'a> {
         //    takes write_mutex itself), then fold the delta into a fresh
         //    base. Threshold is the larger of the configured op count and
         //    10% of base edges, so the delta stays proportional to the
-        //    graph it sits on. Best-effort — the commit above is already
+        //    graph it sits on. Best-effort - the commit above is already
         //    durable, so a compaction failure must not fail it (it will
         //    be retried on the next commit).
         let WriteTx {

@@ -2,7 +2,7 @@
 //! plus a petgraph comparison on the same edge list.
 //!
 //! Size is controlled by env vars `STRAND_BENCH_NODES` and
-//! `STRAND_BENCH_EDGES` (defaults: 200k nodes, 1M edges — large enough to be
+//! `STRAND_BENCH_EDGES` (defaults: 200k nodes, 1M edges - large enough to be
 //! meaningful, small enough to run in CI).
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -86,7 +86,7 @@ fn bench_graph(c: &mut Criterion) {
             // BFS from node 0 over the reversed graph ("who depends on me")
             // approximated by BFS on the transpose built on the fly:
             // petgraph has no CSR transpose, so we BFS over all edges is
-            // too slow — instead time just the construction + one BFS.
+            // too slow - instead time just the construction + one BFS.
             let mut visited = vec![false; n_nodes];
             let mut q = std::collections::VecDeque::new();
             visited[0] = true;

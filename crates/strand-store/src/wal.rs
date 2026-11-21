@@ -5,7 +5,7 @@
 //! payload holds all of the transaction's ops, so a commit is atomic: either
 //! the whole record is durable or none of it is.
 //!
-//! Replay reads records until EOF or the first bad checksum/length — a torn
+//! Replay reads records until EOF or the first bad checksum/length - a torn
 //! tail write (crash mid-append) simply truncates the log there.
 
 use std::io::{Read, Write};
@@ -140,7 +140,7 @@ pub fn decode_tx(payload: &[u8]) -> Result<Vec<Op>> {
     Ok(ops)
 }
 
-/// Append one framed record to `w` as a single write. Does not fsync —
+/// Append one framed record to `w` as a single write. Does not fsync -
 /// caller decides. On error the caller should roll back to the pre-append
 /// file length (`set_len`) so no torn record is left behind.
 pub fn append_record(w: &mut impl Write, payload: &[u8]) -> Result<()> {
@@ -158,7 +158,7 @@ pub fn append_record(w: &mut impl Write, payload: &[u8]) -> Result<()> {
 const MAX_RECORD_LEN: u64 = 256 << 20; // 256 MiB
 
 /// Replay a WAL file: returns `(transactions, valid_len)` where `valid_len`
-/// is the byte offset just past the last good record — i.e. where a torn or
+/// is the byte offset just past the last good record - i.e. where a torn or
 /// corrupt tail should be truncated before appending again.
 ///
 /// A bad record is a *torn tail* only when nothing follows it; a bad record

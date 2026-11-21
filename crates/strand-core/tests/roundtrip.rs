@@ -154,7 +154,7 @@ fn corrupt_files_error_not_crash() {
     let bytes = std::fs::read(&p).unwrap();
 
     // Truncations at many lengths must all produce Err (or at worst a clean
-    // open of a shorter valid file — but truncation always breaks checksum
+    // open of a shorter valid file - but truncation always breaks checksum
     // or length checks, so all must Err).
     for len in [0usize, 10, 64, 127, 128, 200, bytes.len() / 2, bytes.len() - 1] {
         let tmp = dir.path().join(format!("t{len}.strand"));

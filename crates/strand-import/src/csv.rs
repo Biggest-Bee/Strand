@@ -4,7 +4,7 @@
 //! (tab if the first data line contains a tab, else comma). Blank lines and
 //! lines starting with `#` are ignored. A header row whose first cell is a
 //! common source-column name (`src`, `source`, `from`, `package`,
-//! `name`) is skipped — deliberately not `a`, which is a plausible node
+//! `name`) is skipped - deliberately not `a`, which is a plausible node
 //! name and would silently drop a real `a -> b` edge. Fields may be
 //! wrapped in double quotes.
 

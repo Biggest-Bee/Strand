@@ -257,7 +257,7 @@ pub fn pom_xml(text: &str) -> Result<EdgeList> {
     // Strip parent block so its coords don't leak into project coords.
     let no_parent = strip_section(text, "parent");
     // Project coords live in the header, before any dependency/build
-    // section — searching the whole doc would hit a dependency's
+    // section - searching the whole doc would hit a dependency's
     // <groupId> when the project inherits its groupId from <parent>.
     let header_end = [
         "<dependencies",
@@ -447,7 +447,7 @@ fn package_lock_v2(
     let root_name = root["name"].as_str().unwrap_or("(root)").to_string();
 
     // Multiple installed versions of one package (nested node_modules)
-    // would collide under a bare name — disambiguate as `name@version`.
+    // would collide under a bare name - disambiguate as `name@version`.
     let mut name_counts: BTreeMap<String, usize> = BTreeMap::new();
     for path in pkgs.keys() {
         if !path.is_empty() {

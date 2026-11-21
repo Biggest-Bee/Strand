@@ -99,7 +99,7 @@ jobs:
           name: strand-${{ matrix.target }}
           path: dist/*
 
-  # Download each archive back and actually run the binary — proves the
+  # Download each archive back and actually run the binary - proves the
   # artifact launches on its target OS, not just that it compiled.
   # strand-gui is a GUI and can't run headless; the CLI covers the
   # shared strand-core/strand-import code paths.
@@ -117,13 +117,13 @@ jobs:
             artifact: strand-x86_64-unknown-linux-gnu
             archive: strand-x86_64-unknown-linux-gnu.tar.gz
             binary: strand
-          # macOS x86_64 runs under Rosetta on the ARM runner — avoids
+          # macOS x86_64 runs under Rosetta on the ARM runner - avoids
           # the tiny/slow Intel runner pool (macos-13 queues for ages).
-          # Both macOS archives smoke on ONE runner — hosted macOS
+          # Both macOS archives smoke on ONE runner - hosted macOS
           # runners are scarce; two legs doubled the queue wait.
           - os: macos-latest
             artifact: strand-aarch64-apple-darwin
-            # Space-separated, single line — a multi-line value breaks
+            # Space-separated, single line - a multi-line value breaks
             # the `for a in ...` word list in the extract step.
             archives: strand-aarch64-apple-darwin.tar.gz strand-x86_64-apple-darwin.tar.gz
             rosetta: x86_64
@@ -143,7 +143,7 @@ jobs:
         run: |
           set -e
           cd dist
-          # Each archive extracts into its own dir — the macOS job tests
+          # Each archive extracts into its own dir - the macOS job tests
           # two tarballs whose binaries are both named `strand`.
           for a in ${{ matrix.archives || format('"{0}"', matrix.archive) }}; do
             d="x/$(basename "$a" | sed 's/\.[^.]*$//')"
@@ -181,7 +181,7 @@ jobs:
 
   release:
     needs: [build, smoke]
-    # Only publish when the run was triggered by a version tag —
+    # Only publish when the run was triggered by a version tag -
     # workflow_dispatch runs stop after smoke.
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
@@ -200,7 +200,7 @@ jobs:
         working-directory: artifacts
         run: sha256sum * > SHA256SUMS.txt
 
-      # softprops/action-gh-release is archived and stuck on Node 20 —
+      # softprops/action-gh-release is archived and stuck on Node 20 -
       # use the preinstalled gh CLI instead.
       - name: Create GitHub release
         env:

@@ -1,9 +1,9 @@
 //! Compaction memory probe.
 //!
-//! Mode 1 (synthetic): `compact_mem [edges] [nodes]` — builds a fresh
+//! Mode 1 (synthetic): `compact_mem [edges] [nodes]` - builds a fresh
 //! store, commits `edges` ops in one tx, compacts.
 //!
-//! Mode 2 (existing store): `compact_mem --store DIR [ops]` — opens a
+//! Mode 2 (existing store): `compact_mem --store DIR [ops]` - opens a
 //! store directory (manifest.json + base-N.strand + wal-N.log),
 //! commits `ops` small edits (default 1000), then compacts. This is
 //! the large-base/small-delta case.

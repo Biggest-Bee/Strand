@@ -374,7 +374,7 @@ fn scan_handles_literals_and_lifetimes() {
 
 #[test]
 fn scan_rust_grouped_use_trees() {
-    // `use a::{b, c::d}` must yield edges for every leaf — the old
+    // `use a::{b, c::d}` must yield edges for every leaf - the old
     // text scanner stopped at `{` and saw only `a`.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -436,7 +436,7 @@ fn scan_rust_parse_failure_warns_not_drops() {
 #[test]
 fn scan_python_ignores_docstring_imports() {
     // `from x import y` inside a docstring/comment/string is not an
-    // import — tree-sitter only emits real import statements.
+    // import - tree-sitter only emits real import statements.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     w(root, "pkg/__init__.py", "");
@@ -458,7 +458,7 @@ fn scan_python_ignores_docstring_imports() {
     let out = scan_lang(root, Lang::Python).unwrap();
     let edges = edges_of(&out);
     // `from pkg import util` depends on the package itself
-    // (__init__.py) and on pkg/util.py — exactly two edges; nothing
+    // (__init__.py) and on pkg/util.py - exactly two edges; nothing
     // from the docstring, comment, or string literal.
     assert_eq!(
         edges,

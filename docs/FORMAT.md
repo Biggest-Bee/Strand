@@ -1,7 +1,7 @@
 # Strand file format v1
 
 This document specifies the `.strand` binary format exactly. It is the
-normative reference for `strand-core::format` — keep them in sync.
+normative reference for `strand-core::format` - keep them in sync.
 
 ## Big picture
 
@@ -30,7 +30,7 @@ normative reference for `strand-core::format` — keep them in sync.
 
 Section lengths are **not** stored; they are derived from `n_nodes`,
 `n_edges`, `flags`, and the name blob (see below). The stored offsets must
-equal the deterministic layout computed from those fields — readers verify
+equal the deterministic layout computed from those fields - readers verify
 this.
 
 ## Sections
@@ -67,7 +67,7 @@ Both offsets arrays are monotonic non-decreasing and end at `n_edges`.
 
 `name_bytes` is the concatenation of all node names in id order (which is
 lexicographic order). `name_offsets[i]..name_offsets[i+1]` is the byte
-range of node `i`'s name. `name_index` lists node ids sorted by name — with
+range of node `i`'s name. `name_index` lists node ids sorted by name - with
 this format it is the identity permutation `[0, 1, ..., n-1]`, written
 anyway for format stability.
 
@@ -103,7 +103,7 @@ length prefix.
 
 `GraphBuilder::encode` produces the full file image in memory;
 `GraphBuilder::build` writes it to `<path>.tmp`, fsyncs, then renames to
-`<path>` — an atomic publish.
+`<path>` - an atomic publish.
 
 ---
 
@@ -146,7 +146,7 @@ The WAL is a sequence of records:
 - `crc` = `xxh32(payload, seed 0)`.
 - One record = **one committed transaction** (atomic commit unit).
 - Replay reads records until EOF or the first bad length/checksum/undecodable
-  payload, and stops there — this absorbs torn tail writes from crashes.
+  payload, and stops there - this absorbs torn tail writes from crashes.
 - A commit is durable once the record is appended and `sync_all()`'d
   (configurable via `Options::fsync_on_commit`).
 

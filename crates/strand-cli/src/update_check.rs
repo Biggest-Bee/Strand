@@ -5,7 +5,7 @@
 //!
 //! "Installed" versions come from the Cargo.lock embedded at build
 //! time (written to OUT_DIR by build.rs). Crates that aren't
-//! dependencies — the sibling binary — fall back to FALLBACK_VERSIONS,
+//! dependencies - the sibling binary - fall back to FALLBACK_VERSIONS,
 //! which must be bumped alongside Cargo.toml versions each release.
 
 use std::sync::mpsc::{channel, Receiver};

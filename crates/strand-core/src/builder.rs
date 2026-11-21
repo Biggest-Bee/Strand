@@ -131,7 +131,7 @@ impl GraphBuilder {
     }
 
     /// Add an edge between two previously [`intern`](Self::intern)ed
-    /// indices — no per-edge `String` allocation.
+    /// indices - no per-edge `String` allocation.
     pub fn add_edge_idx(&mut self, src: u32, dst: u32) {
         self.idx_edges.push((src, dst, 1.0));
     }
