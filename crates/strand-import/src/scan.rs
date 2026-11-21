@@ -930,7 +930,201 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             nodes.insert(rel);
         }
     }
+
+    // `setup.cfg` [options.entry_points] - the setuptools-era
+    // equivalent of pyproject entry points.
+    let mut cfgs: Vec<(String, PathBuf)> = Vec::new();
+    walk_ext(root, root, &["cfg"], &mut cfgs)?;
+    for (rel, abs) in cfgs {
+        if Path::new(&rel).file_name().and_then(|s| s.to_str()) != Some("setup.cfg") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&abs) else {
+            continue;
+        };
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        for module in setup_cfg_entry_specs(&text) {
+            let segs: Vec<String> = module.split('.').map(str::to_string).collect();
+            for base in entry_bases(&rel) {
+                if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
+                    if dep != rel {
+                        deps.insert(dep);
+                    }
+                    break;
+                }
+            }
+        }
+        if !deps.is_empty() {
+            for dep in deps {
+                edges.push((rel.clone(), dep, None));
+            }
+            nodes.insert(rel);
+        }
+    }
+
+    // `setup.py` `entry_points={...}` dict literals.
+    for (rel, abs) in &files {
+        if Path::new(rel).file_name().and_then(|s| s.to_str()) != Some("setup.py") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(abs) else {
+            continue;
+        };
+        let mut deps: BTreeSet<String> = BTreeSet::new();
+        for module in setup_py_entry_specs(&text) {
+            let segs: Vec<String> = module.split('.').map(str::to_string).collect();
+            for base in entry_bases(rel) {
+                if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
+                    if dep != *rel {
+                        deps.insert(dep);
+                    }
+                    break;
+                }
+            }
+        }
+        for dep in deps {
+            edges.push((rel.clone(), dep, None));
+        }
+    }
     Ok(ScanOutput { edges, nodes: nodes.into_iter().collect(), warnings })
+}
+
+/// `name = module.path:attr` spec -> `module.path`, or `None`.
+/// Validates every segment is an identifier.
+fn entry_spec_module(spec: &str) -> Option<String> {
+    let rhs = spec.split_once('=')?.1.trim();
+    let module = rhs.split(':').next()?.trim();
+    let valid = !module.is_empty()
+        && module.split('.').all(|s| {
+            !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    valid.then(|| module.to_string())
+}
+
+/// `setup.cfg` `[options.entry_points]` section -> entry-point module
+/// paths. Group headers (`group =`) yield nothing; spec lines are
+/// `name = module.path:attr`.
+fn setup_cfg_entry_specs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t.eq_ignore_ascii_case("[options.entry_points]");
+            continue;
+        }
+        if !in_section || t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+        if let Some(m) = entry_spec_module(t) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// `setup.py` `entry_points={...}` dict literal -> entry-point module
+/// paths. Only literal dicts are seen; programmatically built dicts
+/// stay invisible.
+fn setup_py_entry_specs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(tree) = parse_ts(text, tree_sitter_python::LANGUAGE.into()) else {
+        return out;
+    };
+    // Alias map: `NAME = <expr>` assignments, so
+    // `setup(entry_points=NAME)` resolves to the assigned dict.
+    let mut aliases: Vec<(String, tree_sitter::Node)> = Vec::new();
+    {
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "assignment" {
+                if let (Some(l), Some(r)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if l.kind() == "identifier" {
+                        if let Ok(name) = l.utf8_text(text.as_bytes()) {
+                            aliases.push((name.to_string(), r));
+                        }
+                    }
+                }
+            }
+            let mut c = node.walk();
+            for child in node.children(&mut c) {
+                stack.push(child);
+            }
+        }
+    }
+    let resolve_expr = |expr: tree_sitter::Node, out: &mut Vec<String>| {
+        // Follow identifier aliases (bounded) then collect literal
+        // "name = module:attr" strings from whatever expression remains.
+        let mut cur = expr;
+        for _ in 0..8 {
+            if cur.kind() != "identifier" {
+                break;
+            }
+            let Ok(name) = cur.utf8_text(text.as_bytes()) else {
+                break;
+            };
+            match aliases.iter().find(|(n, _)| n == name) {
+                Some((_, rhs)) => cur = *rhs,
+                None => return,
+            }
+        }
+        collect_entry_strings(cur, text, out);
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call" {
+            let is_setup = node
+                .child_by_field_name("function")
+                .and_then(|f| f.utf8_text(text.as_bytes()).ok())
+                .is_some_and(|t| t == "setup");
+            if is_setup {
+                // keyword_argument nodes live inside argument_list.
+                let mut inner = vec![node];
+                while let Some(n) = inner.pop() {
+                    if n.kind() == "keyword_argument" {
+                        let named = n
+                            .child_by_field_name("name")
+                            .and_then(|x| x.utf8_text(text.as_bytes()).ok())
+                            .is_some_and(|x| x == "entry_points");
+                        if named {
+                            if let Some(value) = n.child_by_field_name("value") {
+                                resolve_expr(value, &mut out);
+                            }
+                        }
+                    }
+                    let mut c = n.walk();
+                    for child in n.children(&mut c) {
+                        inner.push(child);
+                    }
+                }
+            }
+        }
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+/// Collect `"name = module.path:attr"` strings anywhere inside a node
+/// (dict values, lists, nested groups).
+fn collect_entry_strings(node: tree_sitter::Node, text: &str, out: &mut Vec<String>) {
+    if node.kind() == "string" {
+        if let Some(inner) = py_string_inner(node, text) {
+            if let Some(m) = entry_spec_module(&inner) {
+                out.push(m);
+            }
+        }
+        return;
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        collect_entry_strings(child, text, out);
+    }
 }
 
 /// Candidate package roots for entry-point module resolution:

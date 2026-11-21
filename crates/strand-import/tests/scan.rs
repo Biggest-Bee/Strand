@@ -545,6 +545,63 @@ fn scan_python_entry_points() {
 }
 
 #[test]
+fn scan_python_setup_entry_points() {
+    // setup.cfg [options.entry_points] and setup.py entry_points={}
+    // dict literals get the same treatment as pyproject entry points.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/a.py", "");
+    w(root, "pkg/b.py", "");
+    w(
+        root,
+        "setup.cfg",
+        concat!(
+            "[metadata]\nname = pkg\n\n",
+            "[options.entry_points]\n",
+            "myapp.plugins =\n",
+            "    ldap = pkg.a:Plugin\n",
+            "    oauth = pkg.b:Plugin\n",
+        ),
+    );
+    w(root, "pkg/c.py", "");
+    w(root, "pkg/d.py", "");
+    w(
+        root,
+        "setup.py",
+        concat!(
+            "from setuptools import setup\n",
+            "EPS = {\n",
+            "    \"myapp.plugins\": [\"ldap = pkg.a:Plugin\"],\n",
+            "}\n",
+            "MORE = dict(group=[\"oauth = pkg.b:Plugin\"])\n",
+            "ALIAS = EPS\n",
+            "setup(entry_points={\n",
+            "    \"myapp.plugins\": [\"ldap = pkg.a:Plugin\"],\n",
+            "    \"extra\": [\"c = pkg.c:Plugin\"],\n",
+            "})\n",
+            "setup(entry_points=EPS)\n",      // variable ref
+            "setup(entry_points=ALIAS)\n",    // chained alias
+            "setup(entry_points=MORE)\n",     // dict() call
+            "setup(entry_points=build_eps())\n", // dynamic: invisible
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+
+    assert!(has("setup.cfg", "pkg/a.py"));
+    assert!(has("setup.cfg", "pkg/b.py"));
+    assert!(has("setup.py", "pkg/a.py")); // literal dict
+    assert!(has("setup.py", "pkg/c.py")); // second setup() call
+    assert!(has("setup.py", "pkg/b.py")); // via dict() call alias
+    // pkg/d.py is only reachable through build_eps() - stays invisible.
+    assert!(!has("setup.py", "pkg/d.py"));
+    assert!(out.nodes.contains(&"setup.cfg".to_string()));
+    assert!(out.nodes.contains(&"setup.py".to_string()));
+}
+
+#[test]
 fn scan_js_ignores_strings_and_comments() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

@@ -1,1 +1,1 @@
-Version 2026-11-20.4 is out. Check the regularly for updates.
+Version 2026-11-21.1 is out. Check the regularly for updates.
