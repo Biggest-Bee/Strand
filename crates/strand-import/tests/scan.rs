@@ -932,12 +932,16 @@ fn scan_python_getattr_dispatch_warning() {
 #[test]
 fn scan_rust_depinfo_edgeless_module() {
     // A .rs file rustc compiled, the walk found, but no mod edge points
-    // at - the macro-generated module signature. Crate roots
-    // (lib.rs, tests/) are excluded.
+    // at - the macro-generated module signature. When the layout lets
+    // us infer the parent (`src/x.rs` -> crate root, `a/b/c.rs` ->
+    // `a/b.rs`/`a/b/mod.rs`), the edge is added; only files with no
+    // inferable parent stay warnings. Crate roots (lib.rs, tests/)
+    // are excluded.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     w(root, "src/lib.rs", "pub fn f() {}\n");
     w(root, "src/macro_mod.rs", "pub fn g() {}\n"); // on disk, no mod decl
+    w(root, "src/deep/x/y.rs", "pub fn h() {}\n"); // no parent candidate
     w(root, "tests/it.rs", "#[test] fn t() {}\n");
     let canon = root.canonicalize().unwrap();
     let canon_str = canon
@@ -945,17 +949,25 @@ fn scan_rust_depinfo_edgeless_module() {
         .trim_start_matches("\\\\?\\")
         .replace('\\', "/");
     let d = format!(
-        "{canon_str}/target/debug/deps/proj-abc.d: {canon_str}/src/lib.rs {canon_str}/src/macro_mod.rs {canon_str}/tests/it.rs\n"
+        "{canon_str}/target/debug/deps/proj-abc.d: {canon_str}/src/lib.rs {canon_str}/src/macro_mod.rs {canon_str}/src/deep/x/y.rs {canon_str}/tests/it.rs\n"
     );
     w(root, "target/debug/deps/proj-abc.d", &d);
     let out = scan_rust(root).unwrap();
+    let edges = edges_of(&out);
+    // macro_mod.rs's deterministic parent is the crate root.
+    assert!(
+        edges.contains(&("src/lib.rs".to_string(), "src/macro_mod.rs".to_string())),
+        "missing inferred parent edge: {edges:?}"
+    );
+    // y.rs has no `src/deep/x.rs`/`mod.rs` candidate - stays a warning.
     assert_eq!(out.warnings.len(), 1, "warnings: {:?}", out.warnings);
     assert!(
-        out.warnings[0].contains("src/macro_mod.rs")
+        out.warnings[0].contains("src/deep/x/y.rs")
             && out.warnings[0].contains("no incoming module edge"),
         "warning: {}",
         out.warnings[0]
     );
+    assert!(!out.warnings[0].contains("macro_mod.rs"));
     assert!(!out.warnings[0].contains("lib.rs"));
     assert!(!out.warnings[0].contains("it.rs"));
 }
@@ -1180,4 +1192,62 @@ fn scan_js_glob_expansion() {
     assert!(!has("other/e.ts"), "phantom glob edge: {edges:?}");
     // `import(someVar)` has no anchor - warns, no edges.
     assert!(out.warnings.iter().any(|w| w.contains("loader.ts")));
+}
+
+#[test]
+fn scan_python_entry_point_consumers() {
+    // entry_points(group="x") callers link to every target declared
+    // in that group across pyproject/setup.cfg/setup.py; no group
+    // selects all.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "myapp/__init__.py", "");
+    w(root, "myapp/cli.py", "def main(): pass\n");
+    w(root, "myapp/hooks.py", "def hook(): pass\n");
+    w(root, "myapp/extra.py", "def extra(): pass\n");
+    w(root, "consumer.py", "");
+    w(
+        root,
+        "pyproject.toml",
+        concat!(
+            "[project.entry-points.\"myapp.commands\"]\n",
+            "run = \"myapp.cli:main\"\n",
+            "[project.entry-points.\"myapp.hooks\"]\n",
+            "pre = \"myapp.hooks:hook\"\n",
+        ),
+    );
+    w(
+        root,
+        "setup.cfg",
+        concat!(
+            "[options.entry_points]\n",
+            "myapp.extra =\n",
+            "    go = myapp.extra:extra\n",
+        ),
+    );
+    w(
+        root,
+        "consumer.py",
+        concat!(
+            "from importlib.metadata import entry_points\n",
+            "def load():\n",
+            "    eps = entry_points(group='myapp.commands')\n",
+            "    all_eps = entry_points()\n",
+            "    dyn = entry_points(group=compute())\n", // dynamic -> warns
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |d: &str| edges.contains(&("consumer.py".to_string(), d.to_string()));
+    // group='myapp.commands' -> cli.py target.
+    assert!(has("myapp/cli.py"), "missing group edge: {edges:?}");
+    // entry_points() with no group -> all declared targets.
+    for d in ["myapp/cli.py", "myapp/hooks.py", "myapp/extra.py"] {
+        assert!(has(d), "missing all-groups edge to {d}: {edges:?}");
+    }
+    // Config files still point at their declared targets.
+    assert!(edges.contains(&("pyproject.toml".to_string(), "myapp/cli.py".to_string())));
+    assert!(edges.contains(&("setup.cfg".to_string(), "myapp/extra.py".to_string())));
+    // Computed group warns.
+    assert!(out.warnings.iter().any(|w| w.contains("consumer.py")));
 }

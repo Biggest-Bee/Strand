@@ -590,7 +590,15 @@ cargo test
   `cargo check`/`build`), two cross-checks run: source files rustc
   read but the scanner didn't reach, and scanned files rustc compiled
   with no incoming `mod` edge (the macro-generated-module signature,
-  excluding crate roots like `lib.rs`/`tests/`). And
+  excluding crate roots like `lib.rs`/`tests/`). For the edgeless
+  files, Rust's deterministic module layout (`a/b/c.rs` is declared
+  by `a/b.rs` or `a/b/mod.rs`, `src/x.rs` by the crate root) lets the
+  scanner infer and add the parent edge; only files with no existing
+  candidate stay warnings. `entry_points(group="x")` and
+  `entry_points().select(group="x")` callers link to every target
+  declared in that group across `pyproject.toml`, `setup.cfg`, and
+  `setup.py`; a bare `entry_points()` links to all declared targets.
+  And
   `# strand: depends-on <path>` /
   `// strand: depends-on <path>` comments add manual edges for the
   cases you know about (paths resolve relative to the file's dir,

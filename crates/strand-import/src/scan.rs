@@ -233,16 +233,29 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
             .intersection(&names)
             .filter(|f| !targets.contains(f.as_str()) && !is_probable_crate_root(f))
             .collect();
-        if !edgeless.is_empty() {
-            let shown: Vec<&str> = edgeless.iter().take(10).map(|s| s.as_str()).collect();
-            let suffix = if edgeless.len() > shown.len() {
-                format!(", +{} more", edgeless.len() - shown.len())
+        // Rust's module-to-file layout is deterministic, so an
+        // edgeless compiled file almost always has an inferable
+        // parent: `a/b/c.rs` is declared by `a/b.rs` or `a/b/mod.rs`,
+        // `a/b/mod.rs` by `a.rs`/`a/mod.rs`, and `src/x.rs` by the
+        // crate root. Add the edge rather than only warning; files
+        // with no existing candidate stay warnings.
+        let mut unresolved: Vec<&String> = Vec::new();
+        for f in edgeless {
+            match infer_rs_parent(&names, f) {
+                Some(parent) => edges.push((parent, f.clone(), None)),
+                None => unresolved.push(f),
+            }
+        }
+        if !unresolved.is_empty() {
+            let shown: Vec<&str> = unresolved.iter().take(10).map(|s| s.as_str()).collect();
+            let suffix = if unresolved.len() > shown.len() {
+                format!(", +{} more", unresolved.len() - shown.len())
             } else {
                 String::new()
             };
             warnings.push(format!(
-                "rustc compiled {} file(s) with no incoming module edge (possible macro-generated modules): {}{}",
-                edgeless.len(),
+                "rustc compiled {} file(s) with no incoming module edge and no inferable parent (possible macro-generated modules): {}{}",
+                unresolved.len(),
                 shown.join(", "),
                 suffix
             ));
@@ -476,6 +489,33 @@ fn is_probable_crate_root(rel: &str) -> bool {
     segs.iter()
         .any(|s| matches!(*s, "tests" | "examples" | "benches"))
         || rel.starts_with("src/bin/")
+}
+
+/// Infer the module file that would declare `rel` per Rust's
+/// layout rules, returning it only if it exists in `names`.
+/// `a/b/c.rs` -> `a/b.rs` or `a/b/mod.rs`; `a/b/mod.rs` -> `a.rs` or
+/// `a/mod.rs`; `src/x.rs` -> `src/lib.rs`/`src/main.rs` (crate root).
+fn infer_rs_parent(names: &BTreeSet<String>, rel: &str) -> Option<String> {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    let parent_dir = parent_rel(rel);
+    // `mod.rs` files *are* the directory's module - the parent is one
+    // level up.
+    let container = if base == "mod.rs" {
+        parent_rel(parent_dir).to_string()
+    } else {
+        parent_dir.to_string()
+    };
+    if container.is_empty() {
+        return None;
+    }
+    let mut candidates = vec![format!("{container}.rs"), format!("{container}/mod.rs")];
+    // Files directly under a `src/` dir are declared by the crate
+    // root, not by `src.rs`.
+    if container.rsplit('/').next() == Some("src") {
+        candidates.push(format!("{container}/lib.rs"));
+        candidates.push(format!("{container}/main.rs"));
+    }
+    candidates.into_iter().find(|c| names.contains(c))
 }
 
 /// Collect `*.d` dep-info files under `target/`, bounded in depth and
@@ -1186,6 +1226,9 @@ enum PyRef {
     /// `INSTALLED_APPS`): dotted strings resolved as module paths,
     /// dropping trailing segments for `module:Class`-style entries.
     Convention(Vec<String>),
+    /// `entry_points(group="x")` consumer lookups - group names
+    /// resolved via const-prop; empty vec means "all groups".
+    EpGroup(Vec<String>),
 }
 
 // ---------- Python constant propagation ----------
@@ -2202,6 +2245,61 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
                         }
                     }
                 }
+                // `entry_points(group="x")` and
+                // `entry_points().select(group="x")` - consumer side
+                // of declared entry points; resolved by the caller
+                // once the group->targets map is known. No `group`
+                // kwarg selects all groups (empty vec). `.select`
+                // only counts when it has a group kwarg - a bare
+                // `entry_points().select(name=...)` selects by entry
+                // name, not group, and stays unresolved.
+                if let Some(func) = node.child_by_field_name("function") {
+                    let is_ep_call = func
+                        .utf8_text(text.as_bytes())
+                        .is_ok_and(|t| t == "entry_points" || t.ends_with(".entry_points"));
+                    let is_ep_select = func
+                        .utf8_text(text.as_bytes())
+                        .is_ok_and(|t| t.ends_with(".select"));
+                    if is_ep_call || is_ep_select {
+                        if let Some(args) = node.child_by_field_name("arguments") {
+                            let groups = {
+                                let mut c = args.walk();
+                                let found = args
+                                    .children(&mut c)
+                                    .filter(|ch| ch.kind() == "keyword_argument")
+                                    .find_map(|kw| {
+                                        let name = kw
+                                            .child_by_field_name("name")
+                                            .and_then(|n| n.utf8_text(text.as_bytes()).ok())?;
+                                        if name != "group" {
+                                            return None;
+                                        }
+                                        let value = kw.child_by_field_name("value")?;
+                                        Some(value)
+                                    })
+                                    .map(|v| {
+                                        py_eval_strset(&env, v, text, 0)
+                                            .map(|s| s.into_iter().collect::<Vec<_>>())
+                                    });
+                                found
+                            };
+                            match groups {
+                                // group= literal/const -> those groups.
+                                Some(Some(gs)) => out.push(PyRef::EpGroup(gs)),
+                                // group= computed -> dynamic site.
+                                Some(None) => dynamic += 1,
+                                // entry_points() with no group -> all
+                                // groups; bare .select() has no group
+                                // semantics - ignore it.
+                                None => {
+                                    if is_ep_call {
+                                        out.push(PyRef::EpGroup(Vec::new()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // `getattr(<imported-name>, ...)` - dynamic attribute
                 // dispatch; module __getattr__ may lazily import, so
                 // edges can be invisible. First arg must be a bare
@@ -2399,6 +2497,9 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
     let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
     let mut edges: EdgeList = Vec::new();
     let mut warnings = Vec::new();
+    // `entry_points(group=...)` consumer lookups, resolved after the
+    // config files below build the group -> targets map.
+    let mut ep_lookups: Vec<(String, Vec<String>)> = Vec::new();
 
     for (rel, abs) in &files {
         let text =
@@ -2464,6 +2565,9 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                         }
                     }
                 }
+                PyRef::EpGroup(groups) => {
+                    ep_lookups.push((rel.clone(), groups));
+                }
             }
         }
 
@@ -2524,7 +2628,9 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
 
     // `pyproject.toml` [project.entry-points] registers plugins at
     // runtime. The config file becomes the edge source so impact
-    // analysis can see entry-point targets.
+    // analysis can see entry-point targets; the group -> targets map
+    // also resolves `entry_points(group=...)` consumer lookups below.
+    let mut ep_targets: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut tomls: Vec<(String, PathBuf)> = Vec::new();
     walk_ext(root, root, &["toml"], &mut tomls)?;
     let mut nodes: BTreeSet<String> = names.iter().cloned().collect();
@@ -2546,10 +2652,11 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             continue;
         };
         let mut deps: BTreeSet<String> = BTreeSet::new();
-        for (_group, specs) in eps {
+        for (group, specs) in eps {
             let Some(specs) = specs.as_table() else {
                 continue;
             };
+            let mut group_deps: BTreeSet<String> = BTreeSet::new();
             for (_name, spec) in specs {
                 let Some(spec) = spec.as_str() else {
                     continue;
@@ -2571,11 +2678,18 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                 for base in entry_bases(&rel) {
                     if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
                         if dep != rel {
-                            deps.insert(dep);
+                            deps.insert(dep.clone());
+                            group_deps.insert(dep);
                         }
                         break;
                     }
                 }
+            }
+            if !group_deps.is_empty() {
+                ep_targets
+                    .entry(group.to_string())
+                    .or_default()
+                    .extend(group_deps);
             }
         }
         if !deps.is_empty() {
@@ -2598,12 +2712,13 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             continue;
         };
         let mut deps: BTreeSet<String> = BTreeSet::new();
-        for module in setup_cfg_entry_specs(&text) {
+        for (group, module) in setup_cfg_entry_groups(&text) {
             let segs: Vec<String> = module.split('.').map(str::to_string).collect();
             for base in entry_bases(&rel) {
                 if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
                     if dep != rel {
-                        deps.insert(dep);
+                        deps.insert(dep.clone());
+                        ep_targets.entry(group.clone()).or_default().insert(dep);
                     }
                     break;
                 }
@@ -2626,18 +2741,19 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             continue;
         };
         let mut deps: BTreeSet<String> = BTreeSet::new();
-        let (specs, dynamic) = setup_py_entry_specs(&text);
+        let (specs, dynamic) = setup_py_entry_groups(&text);
         if dynamic > 0 {
             warnings.push(format!(
                 "{rel}: {dynamic} computed entry_points value(s) - edges may be incomplete"
             ));
         }
-        for module in specs {
+        for (group, module) in specs {
             let segs: Vec<String> = module.split('.').map(str::to_string).collect();
             for base in entry_bases(rel) {
                 if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
                     if dep != *rel {
-                        deps.insert(dep);
+                        deps.insert(dep.clone());
+                        ep_targets.entry(group.clone()).or_default().insert(dep);
                     }
                     break;
                 }
@@ -2645,6 +2761,29 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
         }
         for dep in deps {
             edges.push((rel.clone(), dep, None));
+        }
+    }
+
+    // `entry_points(group="x")` callers depend on every target
+    // declared in that group; no group selects all declared targets.
+    if !ep_lookups.is_empty() && !ep_targets.is_empty() {
+        for (rel, groups) in ep_lookups {
+            let mut targets: BTreeSet<String> = BTreeSet::new();
+            if groups.is_empty() {
+                for t in ep_targets.values() {
+                    targets.extend(t.iter().cloned());
+                }
+            } else {
+                for g in &groups {
+                    if let Some(t) = ep_targets.get(g) {
+                        targets.extend(t.iter().cloned());
+                    }
+                }
+            }
+            targets.remove(&rel);
+            for dep in targets {
+                edges.push((rel.clone(), dep, None));
+            }
         }
     }
     Ok(ScanOutput {
@@ -2666,12 +2805,13 @@ fn entry_spec_module(spec: &str) -> Option<String> {
     valid.then(|| module.to_string())
 }
 
-/// `setup.cfg` `[options.entry_points]` section -> entry-point module
-/// paths. Group headers (`group =`) yield nothing; spec lines are
-/// `name = module.path:attr`.
-fn setup_cfg_entry_specs(text: &str) -> Vec<String> {
+/// `setup.cfg` `[options.entry_points]` section -> `(group, module)`
+/// pairs. Group headers (`group =` with empty value) set the current
+/// group; spec lines are `name = module.path:attr`.
+fn setup_cfg_entry_groups(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut in_section = false;
+    let mut cur_group = String::new();
     for line in text.lines() {
         let t = line.trim();
         if t.starts_with('[') {
@@ -2681,17 +2821,25 @@ fn setup_cfg_entry_specs(text: &str) -> Vec<String> {
         if !in_section || t.is_empty() || t.starts_with('#') || t.starts_with(';') {
             continue;
         }
-        if let Some(m) = entry_spec_module(t) {
-            out.push(m);
+        // `group =` (empty RHS) opens a group; `name = module:attr`
+        // lines belong to it.
+        if let Some((lhs, rhs)) = t.split_once('=') {
+            if rhs.trim().is_empty() {
+                cur_group = lhs.trim().to_string();
+                continue;
+            }
+            if let Some(m) = entry_spec_module(t) {
+                out.push((cur_group.clone(), m));
+            }
         }
     }
     out
 }
 
-/// `setup.py` `entry_points={...}` dict literal -> entry-point module
-/// paths. Also returns a count of `entry_points=` values resolved to a
+/// `setup.py` `entry_points={...}` dict literal -> `(group, module)`
+/// pairs. Also returns a count of `entry_points=` values resolved to a
 /// function call (e.g. `build_eps()`) - computed dicts stay invisible.
-fn setup_py_entry_specs(text: &str) -> (Vec<String>, usize) {
+fn setup_py_entry_groups(text: &str) -> (Vec<(String, String)>, usize) {
     let mut out = Vec::new();
     let mut dynamic = 0usize;
     let Some(tree) = parse_ts(text, tree_sitter_python::LANGUAGE.into()) else {
@@ -2721,9 +2869,9 @@ fn setup_py_entry_specs(text: &str) -> (Vec<String>, usize) {
             }
         }
     }
-    let mut resolve_expr = |expr: tree_sitter::Node, out: &mut Vec<String>| {
-        // Follow identifier aliases (bounded) then collect literal
-        // "name = module:attr" strings from whatever expression remains.
+    let mut resolve_expr = |expr: tree_sitter::Node, out: &mut Vec<(String, String)>| {
+        // Follow identifier aliases (bounded) then read group -> specs
+        // pairs from whatever dict expression remains.
         let mut cur = expr;
         for _ in 0..8 {
             if cur.kind() != "identifier" {
@@ -2739,16 +2887,49 @@ fn setup_py_entry_specs(text: &str) -> (Vec<String>, usize) {
         }
         // A non-`dict(...)` call means the dict is computed - count it
         // as a dynamic site so the scan can warn.
+        let mut is_dict_call = false;
         if cur.kind() == "call" {
             let fname = cur
                 .child_by_field_name("function")
                 .and_then(|f| f.utf8_text(text.as_bytes()).ok())
                 .unwrap_or("");
-            if !fname.ends_with("dict") {
+            if fname.ends_with("dict") {
+                is_dict_call = true;
+            } else {
                 dynamic += 1;
             }
         }
-        collect_entry_strings(cur, text, out);
+        if cur.kind() != "dictionary" {
+            // `dict(...)` calls can't be grouped reliably - keep the
+            // config->target edges under an empty group.
+            if is_dict_call {
+                let mut mods = Vec::new();
+                collect_entry_strings(cur, text, &mut mods);
+                for m in mods {
+                    out.push((String::new(), m));
+                }
+            }
+            return;
+        }
+        // Top-level pairs are group -> specs; each value may be a
+        // dict of name->spec, a list, or a bare spec string.
+        let mut c = cur.walk();
+        for pair in cur.children(&mut c).filter(|ch| ch.kind() == "pair") {
+            let Some(group) = pair
+                .child_by_field_name("key")
+                .and_then(|k| py_string_inner(k, text))
+            else {
+                continue;
+            };
+            let Some(value) = pair.child_by_field_name("value") else {
+                continue;
+            };
+            let mut mods = Vec::new();
+            collect_entry_strings(value, text, &mut mods);
+            for m in mods {
+                out.push((group.clone(), m));
+            }
+        }
     };
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
