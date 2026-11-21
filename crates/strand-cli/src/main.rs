@@ -605,6 +605,14 @@ fn cmd_trace(a: TraceArgs) -> strand_core::Result<()> {
     // Run the command under the import tracer, then fold observed
     // edges into the static scan. Only .py-to-.py edges where both
     // endpoints are scanned nodes are kept.
+    let flags = trace::isolation_flags(&a.cmd);
+    if !flags.is_empty() {
+        eprintln!(
+            "warning: traced command uses {} - the import shim may not \
+             load (sitecustomize is skipped), so traced edges may be empty",
+            flags.join(" ")
+        );
+    }
     let traced = trace::traced_edges(&root, &a.cmd)?;
     let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
     let root_norm = strip_verbatim(root_canon)
@@ -632,7 +640,17 @@ fn cmd_trace(a: TraceArgs) -> strand_core::Result<()> {
     let mut edges = scan.edges;
     let mut observed = 0usize;
     let mut added = 0usize;
-    for (imp, org) in traced {
+    // Files the interpreter actually loaded (seen set plus both edge
+    // endpoints - an importer that only re-exports still counts).
+    let mut exercised: std::collections::BTreeSet<String> =
+        traced.seen.iter().filter_map(|p| to_rel(p)).collect();
+    for (imp, org) in &traced.edges {
+        if let (Some(i), Some(o)) = (to_rel(imp), to_rel(org)) {
+            exercised.insert(i);
+            exercised.insert(o);
+        }
+    }
+    for (imp, org) in traced.edges {
         let (Some(i), Some(o)) = (to_rel(&imp), to_rel(&org)) else {
             continue;
         };
@@ -649,6 +667,41 @@ fn cmd_trace(a: TraceArgs) -> strand_core::Result<()> {
         }
     }
     eprintln!("trace: {observed} runtime import edge(s) observed, {added} new");
+
+    // Coverage report: scanned .py files the command never loaded are
+    // the "dark" set - their edges (static or dynamic) are unverified
+    // by this run. Listed so silent gaps stay visible.
+    let py_nodes: Vec<&str> = scan
+        .nodes
+        .iter()
+        .map(String::as_str)
+        .filter(|n| n.ends_with(".py"))
+        .collect();
+    if !py_nodes.is_empty() {
+        let dark: Vec<&&str> = py_nodes
+            .iter()
+            .filter(|n| !exercised.contains(**n))
+            .collect();
+        if dark.is_empty() {
+            eprintln!(
+                "trace coverage: all {} .py file(s) exercised",
+                py_nodes.len()
+            );
+        } else {
+            eprintln!(
+                "trace coverage: {} of {} .py file(s) exercised; {} never loaded",
+                py_nodes.len() - dark.len(),
+                py_nodes.len(),
+                dark.len()
+            );
+            for n in dark.iter().take(10) {
+                eprintln!("  dark: {n}");
+            }
+            if dark.len() > 10 {
+                eprintln!("  ... and {} more", dark.len() - 10);
+            }
+        }
+    }
 
     let mut b = GraphBuilder::new();
     for n in &scan.nodes {

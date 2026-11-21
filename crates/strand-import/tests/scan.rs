@@ -1251,3 +1251,60 @@ fn scan_python_entry_point_consumers() {
     // Computed group warns.
     assert!(out.warnings.iter().any(|w| w.contains("consumer.py")));
 }
+
+#[test]
+fn scan_python_callsite_literal_propagation() {
+    // `def load(name): import_module(name)` resolves through literal
+    // call-site arguments in the same file.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "plugins/__init__.py", "");
+    w(root, "plugins/ldap.py", "");
+    w(root, "plugins/sql.py", "");
+    w(
+        root,
+        "loader.py",
+        concat!(
+            "from importlib import import_module\n",
+            "def load(name):\n",
+            "    import_module('plugins.' + name)\n",
+            "load('ldap')\n",
+            "load(name='sql')\n",
+            "def other(x):\n",
+            "    import_module(x)\n", // param, no literal call sites
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |d: &str| edges.contains(&("loader.py".to_string(), d.to_string()));
+    assert!(has("plugins/ldap.py"), "edges: {edges:?}");
+    assert!(has("plugins/sql.py"), "edges: {edges:?}");
+    // `other`'s param never gets a literal call site -> still warns.
+    assert!(out.warnings.iter().any(|w| w.contains("loader.py")));
+}
+
+#[test]
+fn scan_python_env_config_warning_hint() {
+    // Dynamic sites fed by env vars/config are still warned, now with
+    // a hint naming the likely source.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "a.py", "");
+    w(
+        root,
+        "loader.py",
+        concat!(
+            "import os\n",
+            "from importlib import import_module\n",
+            "import_module(os.environ['PLUGIN'])\n",
+            "import_module(os.getenv('PLUGIN_NAME'))\n",
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let w = out
+        .warnings
+        .iter()
+        .find(|w| w.contains("loader.py"))
+        .expect("expected dynamic warning");
+    assert!(w.contains("env vars/config"), "{w}");
+}

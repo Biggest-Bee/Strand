@@ -451,6 +451,8 @@ fn cli_trace_merges_runtime_edges() {
     )
     .unwrap();
     std::fs::write(root.join("app.py"), "import pkg.loader\n").unwrap();
+    // Never imported by app.py - must show up in the dark-file report.
+    std::fs::write(pkg.join("never_loaded.py"), "z = 3\n").unwrap();
 
     let graph = root.join("traced.strand");
     let out = strand()
@@ -473,6 +475,9 @@ fn cli_trace_merges_runtime_edges() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("runtime import edge(s)"), "{stderr}");
+    // Coverage report names files the run never loaded.
+    assert!(stderr.contains("trace coverage:"), "{stderr}");
+    assert!(stderr.contains("dark: pkg/never_loaded.py"), "{stderr}");
 
     // impact on the dynamically-loaded module must reach the loader.
     let impact = strand()

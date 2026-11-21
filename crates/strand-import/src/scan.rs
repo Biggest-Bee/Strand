@@ -2098,11 +2098,14 @@ fn py_dict_values(
 /// degrade to ERROR nodes rather than wrong guesses. The third return
 /// value counts dynamic import sites (non-literal `import_module` /
 /// `__import__` args) so callers can warn that edges may be incomplete.
-fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
+fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize) {
     let mut out = Vec::new();
     let mut dynamic = 0usize;
+    // Subset of `dynamic` whose argument reads env vars or config -
+    // reported separately so warnings can say *why* it's invisible.
+    let mut env_cfg = 0usize;
     let Some(tree) = parse_ts(text, tree_sitter_python::LANGUAGE.into()) else {
-        return (out, true, dynamic);
+        return (out, true, dynamic, env_cfg);
     };
     let had_error = tree.root_node().has_error();
     // Const-prop environment for computed dynamic imports - built in
@@ -2211,7 +2214,30 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
                             out.push(PyRef::Import(segs));
                         }
                     }
-                    PyDynCall::Dynamic => dynamic += 1,
+                    PyDynCall::Dynamic => {
+                        // Same-file call-site propagation: `def f(n):
+                        // import_module(n)` called with literals
+                        // resolves through the parameter.
+                        let resolved = py_first_arg(node).and_then(|arg| {
+                            py_dyn_callsite_paths(tree.root_node(), arg, text, &env)
+                        });
+                        match resolved {
+                            Some((paths, unresolved)) => {
+                                for segs in paths {
+                                    out.push(PyRef::Import(segs));
+                                }
+                                if unresolved {
+                                    dynamic += 1;
+                                }
+                            }
+                            None => {
+                                dynamic += 1;
+                                if py_first_arg(node).is_some_and(|a| py_source_hint(a, text)) {
+                                    env_cfg += 1;
+                                }
+                            }
+                        }
+                    }
                     PyDynCall::NotDynamic => {}
                 }
                 // glob.glob/iglob/Path.glob with a literal or
@@ -2343,7 +2369,7 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
         }
     }
     dynamic += getattr_objs.iter().filter(|o| bound.contains(*o)).count();
-    (out, had_error, dynamic)
+    (out, had_error, dynamic, env_cfg)
 }
 
 /// `a.b.c` node text -> segments, or `None` if not a plain dotted path.
@@ -2450,6 +2476,232 @@ fn py_dyn_call_kind(call: tree_sitter::Node, text: &str, env: &PyEnv) -> PyDynCa
     }
 }
 
+/// First real argument of a call - skips "(", ",", ")" punctuation.
+fn py_first_arg(call: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let found = args
+        .children(&mut cursor)
+        .find(|c| !matches!(c.kind(), "(" | ")" | ","));
+    found
+}
+
+/// Heuristic: does this dynamic-import argument read from the
+/// environment or a config file? Substring scan of the arg's source -
+/// good enough for a warning hint, not for resolution.
+fn py_source_hint(arg: tree_sitter::Node, text: &str) -> bool {
+    let Ok(src) = arg.utf8_text(text.as_bytes()) else {
+        return false;
+    };
+    let s = src.to_lowercase();
+    [
+        "environ",
+        "getenv",
+        "config",
+        "setting",
+        "dotenv",
+        "configparser",
+        "json.load",
+        "yaml",
+        "toml",
+        "argv",
+        "secret",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
+}
+
+/// Same-file call-site propagation for `def load(name): import_module(name)`.
+/// When a dynamic-import argument references parameters of the
+/// enclosing function, literal arguments at call sites of that
+/// function (same file) are overlaid onto a cloned const-prop env as
+/// synthetic assignments, then the argument is re-evaluated - so
+/// `'plugins.' + name` resolves through `load('ldap')`.
+/// Returns `(module paths, had_unresolved_callsite)` or `None` when
+/// the pattern doesn't apply (arg isn't inside a function, or no
+/// parameter of that function has any call site).
+fn py_dyn_callsite_paths(
+    root: tree_sitter::Node,
+    arg: tree_sitter::Node,
+    text: &str,
+    env: &PyEnv,
+) -> Option<(Vec<Vec<String>>, bool)> {
+    // Enclosing function definition.
+    let mut anc = arg.parent();
+    let fdef = loop {
+        match anc {
+            Some(n) if n.kind() == "function_definition" => break n,
+            Some(n) => anc = n.parent(),
+            None => return None,
+        }
+    };
+    let func_name = fdef
+        .child_by_field_name("name")?
+        .utf8_text(text.as_bytes())
+        .ok()?
+        .to_string();
+    // Ordered parameters: (name, default value node).
+    let params_node = fdef.child_by_field_name("parameters")?;
+    let mut params: Vec<(String, Option<tree_sitter::Node>)> = Vec::new();
+    let mut pc = params_node.walk();
+    for p in params_node.children(&mut pc) {
+        match p.kind() {
+            "identifier" => {
+                if let Ok(t) = p.utf8_text(text.as_bytes()) {
+                    params.push((t.to_string(), None));
+                }
+            }
+            "default_parameter" => {
+                let name = p
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+                    .unwrap_or("")
+                    .to_string();
+                let default = p.child_by_field_name("value");
+                if !name.is_empty() {
+                    params.push((name, default));
+                }
+            }
+            "typed_parameter" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+                let mut sc = p.walk();
+                for d in p.children(&mut sc) {
+                    if d.kind() == "identifier" {
+                        if let Ok(t) = d.utf8_text(text.as_bytes()) {
+                            params.push((t.to_string(), None));
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if params.is_empty() {
+        return None;
+    }
+    // Only parameters the argument expression actually references
+    // need call-site coverage - unrelated params can't affect it.
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    {
+        let mut st = vec![arg];
+        while let Some(n) = st.pop() {
+            if n.kind() == "identifier" {
+                if let Ok(t) = n.utf8_text(text.as_bytes()) {
+                    used.insert(t.to_string());
+                }
+            }
+            let mut c = n.walk();
+            st.extend(n.children(&mut c));
+        }
+    }
+    let needed: Vec<usize> = params
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, _))| used.contains(p))
+        .map(|(i, _)| i)
+        .collect();
+    if needed.is_empty() {
+        return None;
+    }
+
+    // Collect call-site argument nodes per parameter. A call site
+    // that omits the parameter falls back to its default; one that
+    // can't supply it at all marks the result unresolved.
+    let mut site_args: Vec<Vec<tree_sitter::Node>> = vec![Vec::new(); params.len()];
+    let mut unresolved = false;
+    let mut any_site = false;
+    let mut sites = 0usize;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call" {
+            let is_target = node
+                .child_by_field_name("function")
+                .filter(|f| f.kind() == "identifier")
+                .and_then(|f| f.utf8_text(text.as_bytes()).ok())
+                == Some(func_name.as_str());
+            if is_target {
+                sites += 1;
+                if sites > 64 {
+                    unresolved = true;
+                    break;
+                }
+                any_site = true;
+                let Some(args) = node.child_by_field_name("arguments") else {
+                    unresolved = true;
+                    continue;
+                };
+                let mut positional: Vec<tree_sitter::Node> = Vec::new();
+                let mut keywords: Vec<(String, tree_sitter::Node)> = Vec::new();
+                let mut ac = args.walk();
+                for ch in args.children(&mut ac) {
+                    match ch.kind() {
+                        "keyword_argument" => {
+                            if let (Some(n), Some(v)) = (
+                                ch.child_by_field_name("name"),
+                                ch.child_by_field_name("value"),
+                            ) {
+                                if let Ok(t) = n.utf8_text(text.as_bytes()) {
+                                    keywords.push((t.to_string(), v));
+                                }
+                            }
+                        }
+                        "(" | ")" | "," => {}
+                        _ => positional.push(ch),
+                    }
+                }
+                for i in &needed {
+                    let (pname, default) = &params[*i];
+                    let supplied = keywords
+                        .iter()
+                        .find(|(n, _)| n == pname)
+                        .map(|(_, v)| *v)
+                        .or_else(|| positional.get(*i).copied());
+                    match supplied {
+                        Some(v) => site_args[*i].push(v),
+                        None => match default {
+                            Some(d) => site_args[*i].push(*d),
+                            None => unresolved = true,
+                        },
+                    }
+                }
+            }
+        }
+        let mut c = node.walk();
+        stack.extend(node.children(&mut c));
+    }
+    if !any_site {
+        return None;
+    }
+
+    // Overlay: clone the env, bind each parameter to its call-site
+    // argument expressions, and un-mark it as a function parameter.
+    let mut env2 = PyEnv {
+        assigns: env.assigns.clone(),
+        verbind: env.verbind.clone(),
+        bad: env.bad.clone(),
+        memo: std::cell::RefCell::new(HashMap::new()),
+        visiting: std::cell::RefCell::new(BTreeSet::new()),
+    };
+    for (i, (pname, _)) in params.iter().enumerate() {
+        if !site_args[i].is_empty() {
+            env2.bad.remove(pname);
+            env2.assigns.insert(pname.clone(), site_args[i].clone());
+        }
+    }
+
+    // Re-evaluate the import argument under the overlaid env.
+    let Some(vals) = py_eval_strset(&env2, arg, text, 0) else {
+        return Some((Vec::new(), true));
+    };
+    let mut paths = Vec::new();
+    for v in &vals {
+        if let PyDynCall::Literal(mut p) = py_module_path_call(v.clone()) {
+            paths.append(&mut p);
+        }
+    }
+    Some((paths, unresolved))
+}
+
 /// Validate a dotted module string -> segment list (single path).
 fn py_module_path_call(module: String) -> PyDynCall {
     let segs: Vec<String> = module
@@ -2512,13 +2764,18 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
     for (rel, abs) in &files {
         let text =
             fs::read_to_string(abs).map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        let (refs, had_error, dynamic) = py_import_refs(&text);
+        let (refs, had_error, dynamic, env_cfg) = py_import_refs(&text);
         if had_error {
             warnings.push(format!("{rel}: parse errors (partial scan)"));
         }
         if dynamic > 0 {
+            let hint = if env_cfg > 0 {
+                format!(" ({env_cfg} read env vars/config)")
+            } else {
+                String::new()
+            };
             warnings.push(format!(
-                "{rel}: {dynamic} dynamic import site(s) - edges may be incomplete"
+                "{rel}: {dynamic} dynamic import site(s){hint} - edges may be incomplete"
             ));
         }
         let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();

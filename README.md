@@ -585,7 +585,12 @@ cargo test
   constant: a per-file set-of-strings pass folds `+`, f-strings,
   `%`, `.format`, `"".join`, ternaries, dict subscripts, and loops over
   literal collections (set size capped at 64; mutations and unknown
-  values stay dynamic). Literal glob patterns expand against the
+  values stay dynamic). The same pass also propagates literal call-site
+  arguments one hop: `def load(name): import_module(name)` called as
+  `load('ldap')` in the same file resolves through the parameter.
+  Sites that still can't resolve are counted per file and reported as
+  warnings - with a "(N read env vars/config)" hint when the argument
+  mentions `environ`/`getenv`/config-style sources. Literal glob patterns expand against the
   scanned files: Python `glob.glob`/`iglob`/`Path.glob`, JS
   `require.context`, `import.meta.glob`, and template/`+`-concat
   dynamic imports with a static directory anchor. Framework
@@ -623,7 +628,11 @@ cargo test
   goes further: it runs the command under an import hook and merges
   every observed `.py -> .py` import into the graph, covering the
   computed-name and `getattr` cases for whatever the command
-  exercised (uncovered paths stay dark). Nodes are file
+  exercised. It then prints a coverage report - scanned `.py` files
+  the command never loaded are listed as `dark:`, so untested paths
+  stay visible instead of silently absent. Interpreter flags that
+  bypass the hook (`python -S`, `-I`, `-E`) are detected up front and
+  warned about. Nodes are file
   paths, so it answers "what breaks if I change `src/foo.rs`?" -
   package-level questions still want `cargo metadata` input.
   Unresolvable imports and third-party packages are dropped entirely
