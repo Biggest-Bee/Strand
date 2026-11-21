@@ -227,8 +227,7 @@ pub fn paths_within_depth<G: GraphView>(
     let mut on_path = vec![false; n];
     on_path[from as usize] = true;
     // (node, neighbors, next neighbor index, node depth in `path`)
-    let mut stack: Vec<(u32, Vec<u32>, usize, u32)> =
-        vec![(from, neighbors_of(from), 0, 0)];
+    let mut stack: Vec<(u32, Vec<u32>, usize, u32)> = vec![(from, neighbors_of(from), 0, 0)];
     let mut steps = 0usize;
     let step_budget = 4_000_000usize;
 

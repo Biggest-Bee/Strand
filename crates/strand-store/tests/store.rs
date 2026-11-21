@@ -613,7 +613,9 @@ fn compact_failure_preserves_committed_state() {
             "missing edge n{i} -> dep after failed compaction"
         );
     }
-    assert!(adj.get("after").is_some_and(|d| d.contains(&"dep".to_string())));
+    assert!(adj
+        .get("after")
+        .is_some_and(|d| d.contains(&"dep".to_string())));
 
     // Cleanup so a later compact can succeed.
     std::fs::remove_dir(path.join("base-1.strand")).unwrap();

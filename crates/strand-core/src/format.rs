@@ -142,11 +142,7 @@ fn section_len(idx: usize, h: &Header, name_bytes_len: u64, node_meta_len: u64) 
 /// `name_bytes_len` is the length of the name blob; `node_meta_len` is the
 /// length of the node-meta section *including* its internal length prefix.
 /// Offsets are absolute file offsets and every section starts 8-byte aligned.
-pub fn layout(
-    h: &Header,
-    name_bytes_len: u64,
-    node_meta_len: u64,
-) -> [(u64, u64); N_SECTIONS] {
+pub fn layout(h: &Header, name_bytes_len: u64, node_meta_len: u64) -> [(u64, u64); N_SECTIONS] {
     let mut out = [(0u64, 0u64); N_SECTIONS];
     let mut pos = HEADER_LEN as u64;
     for (i, slot) in out.iter_mut().enumerate() {

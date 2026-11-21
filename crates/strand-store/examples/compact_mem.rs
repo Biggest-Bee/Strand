@@ -26,14 +26,8 @@ fn main() {
         return;
     }
 
-    let edges: usize = args
-        .first()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300_000);
-    let nodes: usize = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20_000);
+    let edges: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(300_000);
+    let nodes: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20_000);
     synthetic(edges, nodes);
 }
 

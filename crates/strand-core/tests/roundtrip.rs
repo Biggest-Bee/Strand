@@ -53,7 +53,12 @@ fn roundtrip_neighbors() {
 fn determinism_byte_identical() {
     let dir = tempfile::tempdir().unwrap();
     let edges = [
-        ("z", "y"), ("y", "x"), ("x", "w"), ("a", "b"), ("b", "c"), ("a", "c"),
+        ("z", "y"),
+        ("y", "x"),
+        ("x", "w"),
+        ("a", "b"),
+        ("b", "c"),
+        ("a", "c"),
     ];
     let p1 = dir.path().join("g1.strand");
     let p2 = dir.path().join("g2.strand");
@@ -101,7 +106,10 @@ fn duplicate_edges_merge() {
     let p2 = dir.path().join("w2.strand");
     b.build(&p2).unwrap();
     let g2 = Graph::open(&p2).unwrap();
-    assert_eq!(g2.out_weights(g2.node_id("a").unwrap()), Some(&[5.0f32][..]));
+    assert_eq!(
+        g2.out_weights(g2.node_id("a").unwrap()),
+        Some(&[5.0f32][..])
+    );
 }
 
 #[test]
@@ -156,7 +164,16 @@ fn corrupt_files_error_not_crash() {
     // Truncations at many lengths must all produce Err (or at worst a clean
     // open of a shorter valid file - but truncation always breaks checksum
     // or length checks, so all must Err).
-    for len in [0usize, 10, 64, 127, 128, 200, bytes.len() / 2, bytes.len() - 1] {
+    for len in [
+        0usize,
+        10,
+        64,
+        127,
+        128,
+        200,
+        bytes.len() / 2,
+        bytes.len() - 1,
+    ] {
         let tmp = dir.path().join(format!("t{len}.strand"));
         std::fs::write(&tmp, &bytes[..len]).unwrap();
         assert!(Graph::open(&tmp).is_err(), "truncated to {len} opened");

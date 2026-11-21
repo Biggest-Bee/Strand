@@ -127,10 +127,7 @@ pub fn poetry_lock(text: &str) -> Result<EdgeList> {
             continue;
         }
         if t.starts_with('[') {
-            in_deps = matches!(
-                t,
-                "[package.dependencies]" | "[package.dev-dependencies]"
-            );
+            in_deps = matches!(t, "[package.dependencies]" | "[package.dev-dependencies]");
             depth = 0;
             continue;
         }
@@ -296,8 +293,7 @@ pub fn pom_xml(text: &str) -> Result<EdgeList> {
     let clean = strip_section(&strip_section(&no_parent, "dependencyManagement"), "build");
     for block in xml_blocks(&clean, "dependencies") {
         for dep in xml_blocks(&block, "dependency") {
-            let g = first_tag_text(&dep, "groupId")
-                .or_else(|| Some(proj_group.clone()));
+            let g = first_tag_text(&dep, "groupId").or_else(|| Some(proj_group.clone()));
             let Some(a) = first_tag_text(&dep, "artifactId") else {
                 continue;
             };
@@ -330,7 +326,9 @@ fn strip_section(text: &str, tag: &str) -> String {
         }
         out.push_str(&rest[..start]);
         // skip past this open tag
-        let Some(gt) = after_open.find('>') else { break };
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
         let inner_start = start + gt + 1;
         let inner = &rest[inner_start..];
         match inner.find(&close) {
@@ -421,7 +419,9 @@ pub fn package_lock(text: &str) -> Result<EdgeList> {
     } else if v["dependencies"].is_object() {
         package_lock_v1(&v)
     } else {
-        Err(err("package-lock.json: neither 'packages' nor 'dependencies' found"))
+        Err(err(
+            "package-lock.json: neither 'packages' nor 'dependencies' found",
+        ))
     }
 }
 

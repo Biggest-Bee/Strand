@@ -15,7 +15,10 @@ struct Ref {
 
 impl Ref {
     fn add(&mut self, s: &str, d: &str) {
-        self.adj.entry(s.to_string()).or_default().insert(d.to_string());
+        self.adj
+            .entry(s.to_string())
+            .or_default()
+            .insert(d.to_string());
         self.adj.entry(d.to_string()).or_default();
     }
     fn deps_of(&self, n: &str) -> &BTreeSet<String> {

@@ -61,8 +61,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use strand_core::Graph;
 use strand_core::view::GraphView;
+use strand_core::Graph;
 
 pub use delta::{Delta, EdgeOp};
 pub use view::View;
@@ -234,21 +234,20 @@ impl Store {
             if !wal_path.exists() {
                 File::create(&wal_path)?;
             }
-            wal_file = Some(
-                OpenOptions::new()
-                    .append(true)
-                    .open(&wal_path)?,
-            );
+            wal_file = Some(OpenOptions::new().append(true).open(&wal_path)?);
             if !mpath.exists() {
-                write_manifest(&dir, &Manifest {
-                    version: 1,
-                    epoch: state.epoch,
-                    base: state
-                        .base
-                        .as_ref()
-                        .map(|_| format!("base-{}.strand", state.epoch)),
-                    wal: wal_name.clone(),
-                })?;
+                write_manifest(
+                    &dir,
+                    &Manifest {
+                        version: 1,
+                        epoch: state.epoch,
+                        base: state
+                            .base
+                            .as_ref()
+                            .map(|_| format!("base-{}.strand", state.epoch)),
+                        wal: wal_name.clone(),
+                    },
+                )?;
             }
         }
 
@@ -278,10 +277,7 @@ impl Store {
     /// Ops applied to the live delta since it was last reset. Useful for
     /// sizing the delta before compaction.
     pub fn delta_op_count(&self) -> usize {
-        self.state
-            .lock()
-            .map(|st| st.delta.op_count)
-            .unwrap_or(0)
+        self.state.lock().map(|st| st.delta.op_count).unwrap_or(0)
     }
 
     /// Begin a write transaction. Only one may be open at a time; it holds
@@ -290,10 +286,7 @@ impl Store {
         if !self.writable {
             return Err(Error::ReadOnly);
         }
-        let guard = self
-            .write_mutex
-            .lock()
-            .map_err(|_| Error::Poisoned)?;
+        let guard = self.write_mutex.lock().map_err(|_| Error::Poisoned)?;
         Ok(WriteTx {
             store: self,
             ops: Vec::new(),
@@ -336,8 +329,7 @@ impl Store {
         // Collect merged edges. Every live node is interned once so
         // isolated nodes survive compaction; edges reference interned
         // ids, avoiding a `String` alloc per edge endpoint.
-        let weighted =
-            base.as_ref().map(|b| b.has_weights()).unwrap_or(false) || delta.weighted;
+        let weighted = base.as_ref().map(|b| b.has_weights()).unwrap_or(false) || delta.weighted;
         let mut builder = strand_core::GraphBuilder::new();
         let mut idx_of = vec![u32::MAX; n_nodes];
         for id in 0..n_nodes as u32 {
@@ -670,8 +662,16 @@ fn apply_ops_inner(
                 let s = get_or_create(base, delta, base_n, src);
                 let d = get_or_create(base, delta, base_n, dst);
                 delta.weighted = true;
-                delta.out.entry(s).or_default().insert(d, EdgeOp::Set(*weight));
-                delta.inn.entry(d).or_default().insert(s, EdgeOp::Set(*weight));
+                delta
+                    .out
+                    .entry(s)
+                    .or_default()
+                    .insert(d, EdgeOp::Set(*weight));
+                delta
+                    .inn
+                    .entry(d)
+                    .or_default()
+                    .insert(s, EdgeOp::Set(*weight));
             }
             Op::RemoveEdge { src, dst } => {
                 let s = resolve(base, delta, src);
@@ -694,12 +694,7 @@ fn apply_ops_inner(
     Ok(())
 }
 
-fn get_or_create(
-    base: &Option<Arc<Graph>>,
-    delta: &mut Delta,
-    base_n: u64,
-    name: &str,
-) -> u32 {
+fn get_or_create(base: &Option<Arc<Graph>>, delta: &mut Delta, base_n: u64, name: &str) -> u32 {
     // A removed id is dead forever: re-adding the name creates a new
     // generation with a fresh delta id. Old incident edges stay hidden
     // because they point at the tombstoned id.

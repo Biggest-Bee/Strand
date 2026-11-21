@@ -410,7 +410,9 @@ fn node_id(graph: &Graph, name: &str) -> strand_core::Result<u32> {
 }
 
 fn names_of(graph: &Graph, ids: &[u32]) -> Vec<String> {
-    ids.iter().map(|&i| graph.node_name(i).to_string()).collect()
+    ids.iter()
+        .map(|&i| graph.node_name(i).to_string())
+        .collect()
 }
 
 fn print_json(v: serde_json::Value) {
@@ -638,11 +640,7 @@ fn cmd_diff(a: DiffArgs) -> strand_core::Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{} -> {}",
-        a.old.display(),
-        a.new.display()
-    );
+    println!("{} -> {}", a.old.display(), a.new.display());
     println!(
         "nodes: +{} added, -{} removed",
         added_nodes.len(),
@@ -669,11 +667,17 @@ fn cmd_diff(a: DiffArgs) -> strand_core::Result<()> {
     };
     show(
         "added nodes",
-        &added_nodes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &added_nodes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
     );
     show(
         "removed nodes",
-        &removed_nodes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &removed_nodes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
     );
     show(
         "added edges",
@@ -704,14 +708,15 @@ fn cmd_deps(a: DepsArgs) -> strand_core::Result<()> {
         .filter(|&(_, &d)| d != algo::UNVISITED && d != 0)
         .map(|(i, &d)| (i as u32, d))
         .collect();
-    rows.sort_by(|x, y| x.1.cmp(&y.1).then_with(|| g.node_name(x.0).cmp(g.node_name(y.0))));
+    rows.sort_by(|x, y| {
+        x.1.cmp(&y.1)
+            .then_with(|| g.node_name(x.0).cmp(g.node_name(y.0)))
+    });
 
     if a.json {
         let deps: Vec<serde_json::Value> = rows
             .iter()
-            .map(|&(id, d)| {
-                serde_json::json!({"name": g.node_name(id), "depth": d})
-            })
+            .map(|&(id, d)| serde_json::json!({"name": g.node_name(id), "depth": d}))
             .collect();
         print_json(serde_json::json!({
             "node": a.node,
@@ -794,9 +799,7 @@ fn cmd_impact(a: ImpactArgs) -> strand_core::Result<()> {
             for &(id, d) in &affected {
                 m.entry(d).or_default().push(g.node_name(id).to_string());
             }
-            m.into_iter()
-                .map(|(d, v)| (d.to_string(), v))
-                .collect()
+            m.into_iter().map(|(d, v)| (d.to_string(), v)).collect()
         };
         print_json(serde_json::json!({
             "seeds": seed_names,
@@ -872,11 +875,7 @@ fn git_diff_seeds(
     use std::process::Command;
 
     let git = |dir: &Path, args: &[&str]| -> strand_core::Result<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()?;
+        let out = Command::new("git").arg("-C").arg(dir).args(args).output()?;
         if !out.status.success() {
             return Err(strand_core::Error::Usage(format!(
                 "git {} failed: {}",
@@ -905,8 +904,7 @@ fn git_diff_seeds(
     // Lazily built basename -> ids index for path-node suffix matching.
     let mut by_base: Option<std::collections::HashMap<String, Vec<u32>>> = None;
 
-    let mut matched: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut matched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut unmatched: Vec<String> = Vec::new();
 
     for file in &files {
@@ -1012,10 +1010,7 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
         };
         let paths = &res.paths;
         if a.json {
-            let ps: Vec<Vec<String>> = paths
-                .iter()
-                .map(|p| names_of(&g, p))
-                .collect();
+            let ps: Vec<Vec<String>> = paths.iter().map(|p| names_of(&g, p)).collect();
             print_json(serde_json::json!({
                 "from": a.from, "to": a.to, "paths": ps,
                 "truncated": res.truncated,
@@ -1064,16 +1059,11 @@ fn cmd_cycles(a: CyclesArgs) -> strand_core::Result<()> {
     // Cycles = SCCs with >1 member, or a single node with a self-loop.
     let cycles: Vec<&Vec<u32>> = sccs
         .iter()
-        .filter(|c| {
-            c.len() > 1 || g.out_targets(c[0]).contains(&c[0])
-        })
+        .filter(|c| c.len() > 1 || g.out_targets(c[0]).contains(&c[0]))
         .collect();
 
     if a.json {
-        let cs: Vec<Vec<String>> = cycles
-            .iter()
-            .map(|c| names_of(&g, c))
-            .collect();
+        let cs: Vec<Vec<String>> = cycles.iter().map(|c| names_of(&g, c)).collect();
         print_json(serde_json::json!({"cycles": cs, "count": cs.len()}));
     } else if cycles.is_empty() {
         println!("no cycles");
@@ -1090,7 +1080,10 @@ fn cmd_cycles(a: CyclesArgs) -> strand_core::Result<()> {
 /// Exact impact scores as `f64` (`--exact` path; may be very slow on
 /// huge mostly-acyclic graphs).
 fn scores_from_exact(g: &strand_core::Graph) -> Vec<f64> {
-    algo::impact_sizes(g).into_iter().map(|x| x as f64).collect()
+    algo::impact_sizes(g)
+        .into_iter()
+        .map(|x| x as f64)
+        .collect()
 }
 
 fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
@@ -1139,8 +1132,7 @@ fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
     });
     order.truncate(a.count);
 
-    let reranked_set: std::collections::BTreeSet<u32> =
-        reranked_ids.iter().copied().collect();
+    let reranked_set: std::collections::BTreeSet<u32> = reranked_ids.iter().copied().collect();
     if a.json {
         let rows: Vec<serde_json::Value> = order
             .iter()
@@ -1181,7 +1173,12 @@ fn cmd_top(a: TopArgs) -> strand_core::Result<()> {
             } else {
                 ""
             };
-            println!("  {:>12}{}  {}", fmt_score(scores[i as usize]), exact_mark, g.node_name(i));
+            println!(
+                "  {:>12}{}  {}",
+                fmt_score(scores[i as usize]),
+                exact_mark,
+                g.node_name(i)
+            );
         }
     }
     Ok(())
@@ -1294,7 +1291,13 @@ fn cmd_common(a: CommonArgs) -> strand_core::Result<()> {
     } else {
         let mut names = names_of(&g, &common);
         names.sort();
-        println!("common {} of {} and {} ({}):", a.mode, a.a, a.b, names.len());
+        println!(
+            "common {} of {} and {} ({}):",
+            a.mode,
+            a.a,
+            a.b,
+            names.len()
+        );
         for n in names {
             println!("  {n}");
         }
@@ -1396,18 +1399,31 @@ fn cmd_check(a: CheckArgs) -> strand_core::Result<()> {
             "results": rules_json,
         }));
     } else {
-        println!("strand check: {} rule(s), {} violation(s)", rules.len(), total);
+        println!(
+            "strand check: {} rule(s), {} violation(s)",
+            rules.len(),
+            total
+        );
         for (r, viols) in rules.iter().zip(&results) {
             if viols.is_empty() {
                 continue;
             }
-            println!("rule `forbid {} -> {}`: {} violation(s)", r.forbid, r.ban, viols.len());
+            println!(
+                "rule `forbid {} -> {}`: {} violation(s)",
+                r.forbid,
+                r.ban,
+                viols.len()
+            );
             for v in viols {
                 if let Some(chain) = &v.chain {
                     let names = names_of(&g, chain);
                     println!("  {}", names.join(" -> "));
                 } else {
-                    println!("  {} (transitively depends on `{}`)", g.node_name(v.a), r.ban);
+                    println!(
+                        "  {} (transitively depends on `{}`)",
+                        g.node_name(v.a),
+                        r.ban
+                    );
                 }
             }
         }

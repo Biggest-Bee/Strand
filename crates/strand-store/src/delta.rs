@@ -58,6 +58,8 @@ impl Delta {
         if id < base_n as u32 {
             return None;
         }
-        self.added_names.get(id as usize - base_n as usize).map(|s| s.as_str())
+        self.added_names
+            .get(id as usize - base_n as usize)
+            .map(|s| s.as_str())
     }
 }

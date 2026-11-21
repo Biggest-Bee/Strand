@@ -2,8 +2,8 @@
 //! Implements [`strand_core::view::GraphView`] so every Phase-1 algorithm
 //! runs on it unchanged.
 
-use std::collections::BTreeSet;
 use std::collections::btree_map::Iter as BTreeIter;
+use std::collections::BTreeSet;
 use std::iter::Peekable;
 
 use strand_core::graph::Graph;
@@ -62,10 +62,7 @@ impl<'a, 'b> Merger<'a, 'b> {
     fn next_edge(&mut self) -> Option<(u32, f32)> {
         // Fast path: no pending delta ops -> drain the sorted base slice
         // directly (this is every node untouched by the delta).
-        let delta_pending = self
-            .delta
-            .as_mut()
-            .map_or(false, |it| it.peek().is_some());
+        let delta_pending = self.delta.as_mut().map_or(false, |it| it.peek().is_some());
         if !delta_pending {
             while self.bi < self.base.len() {
                 let t = self.base[self.bi];
@@ -79,10 +76,7 @@ impl<'a, 'b> Merger<'a, 'b> {
         }
         loop {
             let bv = self.base.get(self.bi).copied();
-            let dv = self
-                .delta
-                .as_mut()
-                .and_then(|it| it.peek().map(|e| *e.0));
+            let dv = self.delta.as_mut().and_then(|it| it.peek().map(|e| *e.0));
             let take_base = match (bv, dv) {
                 (Some(_), Some(_)) => bv <= dv,
                 (Some(_), None) => true,
@@ -150,15 +144,31 @@ impl<'a> View<'a> {
         let (base, base_w, dmap) = match (self.base, out_dir) {
             (Some(b), true) if is_base_node => (
                 b.out_targets(id),
-                if b.has_weights() { b.out_weights(id) } else { None },
+                if b.has_weights() {
+                    b.out_weights(id)
+                } else {
+                    None
+                },
                 self.delta.out.get(&id),
             ),
             (Some(b), false) if is_base_node => (
                 b.in_targets(id),
-                if b.has_weights() { b.in_weights(id) } else { None },
+                if b.has_weights() {
+                    b.in_weights(id)
+                } else {
+                    None
+                },
                 self.delta.inn.get(&id),
             ),
-            _ => (&[][..], None, if out_dir { self.delta.out.get(&id) } else { self.delta.inn.get(&id) }),
+            _ => (
+                &[][..],
+                None,
+                if out_dir {
+                    self.delta.out.get(&id)
+                } else {
+                    self.delta.inn.get(&id)
+                },
+            ),
         };
         Some(Merger {
             base,
@@ -200,10 +210,7 @@ impl<'a> GraphView for View<'a> {
         }
         // Per-node fast path: delta has no ops for this node and nothing
         // was removed, so its adjacency is exactly the base slice.
-        if self.no_removed
-            && !self.delta.out.contains_key(&id)
-            && (id as u64) < self.base_n
-        {
+        if self.no_removed && !self.delta.out.contains_key(&id) && (id as u64) < self.base_n {
             if let Some(b) = self.base {
                 for &t in b.out_targets(id) {
                     f(t);
@@ -229,10 +236,7 @@ impl<'a> GraphView for View<'a> {
             }
             return;
         }
-        if self.no_removed
-            && !self.delta.inn.contains_key(&id)
-            && (id as u64) < self.base_n
-        {
+        if self.no_removed && !self.delta.inn.contains_key(&id) && (id as u64) < self.base_n {
             if let Some(b) = self.base {
                 for &t in b.in_targets(id) {
                     f(t);

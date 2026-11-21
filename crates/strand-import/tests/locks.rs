@@ -238,7 +238,10 @@ fn pom_xml_project_and_deps() {
     assert_eq!(
         edges(text, Format::Pom),
         vec![
-            ("com.example:child".to_string(), "com.example:lib".to_string()),
+            (
+                "com.example:child".to_string(),
+                "com.example:lib".to_string()
+            ),
             ("com.example:child".to_string(), "junit:junit".to_string()),
         ]
     );

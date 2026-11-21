@@ -57,12 +57,8 @@ fn bfs_depths() {
 fn shortest_path() {
     let (_d, p) = diamond();
     let g = Graph::open(&p).unwrap();
-    let path = algo::shortest_path(
-        &g,
-        g.node_id("app").unwrap(),
-        g.node_id("util").unwrap(),
-    )
-    .unwrap();
+    let path =
+        algo::shortest_path(&g, g.node_id("app").unwrap(), g.node_id("util").unwrap()).unwrap();
     let names: Vec<&str> = path.iter().map(|&i| g.node_name(i)).collect();
     // app->liba->core->util or app->libb->core->util (both length 3)
     assert_eq!(names.len(), 4);
@@ -72,12 +68,9 @@ fn shortest_path() {
     assert_eq!(names[2], "core");
 
     // unreachable
-    assert!(algo::shortest_path(
-        &g,
-        g.node_id("util").unwrap(),
-        g.node_id("app").unwrap()
-    )
-    .is_none());
+    assert!(
+        algo::shortest_path(&g, g.node_id("util").unwrap(), g.node_id("app").unwrap()).is_none()
+    );
 }
 
 #[test]
@@ -98,12 +91,7 @@ fn k_shortest_paths_counts() {
     }
 
     // k=1 gives one path, flagged truncated (more shortest chains exist)
-    let one = algo::k_shortest_paths(
-        &g,
-        g.node_id("app").unwrap(),
-        g.node_id("util").unwrap(),
-        1,
-    );
+    let one = algo::k_shortest_paths(&g, g.node_id("app").unwrap(), g.node_id("util").unwrap(), 1);
     assert_eq!(one.paths.len(), 1);
     assert!(one.truncated);
 }
@@ -122,10 +110,7 @@ fn paths_within_depth_finds_nonshortest() {
     let g = Graph::open(&p).unwrap();
     let (from, to) = (g.node_id("a").unwrap(), g.node_id("d").unwrap());
 
-    assert_eq!(
-        algo::paths_within_depth(&g, from, to, 1, 10).paths.len(),
-        0
-    );
+    assert_eq!(algo::paths_within_depth(&g, from, to, 1, 10).paths.len(), 0);
     let d2 = algo::paths_within_depth(&g, from, to, 2, 10);
     assert_eq!(d2.paths.len(), 2);
     assert!(!d2.truncated);
@@ -152,7 +137,13 @@ fn scc_and_cycles() {
     let dir = tempfile::tempdir().unwrap();
     let mut b = GraphBuilder::new();
     for (s, d) in [
-        ("a", "b"), ("b", "c"), ("c", "a"), ("c", "d"), ("d", "e"), ("e", "d"), ("f", "a"),
+        ("a", "b"),
+        ("b", "c"),
+        ("c", "a"),
+        ("c", "d"),
+        ("d", "e"),
+        ("e", "d"),
+        ("f", "a"),
     ] {
         b.add_edge(s, d);
     }
@@ -207,7 +198,12 @@ fn critical_path() {
     // chain: top->mid->bot->leaf  plus shortcut top->leaf
     let dir = tempfile::tempdir().unwrap();
     let mut b = GraphBuilder::new();
-    for (s, d) in [("top", "mid"), ("mid", "bot"), ("bot", "leaf"), ("top", "leaf")] {
+    for (s, d) in [
+        ("top", "mid"),
+        ("mid", "bot"),
+        ("bot", "leaf"),
+        ("top", "leaf"),
+    ] {
         b.add_edge(s, d);
     }
     let p = dir.path().join("g.strand");
@@ -264,13 +260,7 @@ fn impact_sizes_match_bfs_on_cycles() {
     // Exercises the condensation-DAG path in impact_sizes.
     let dir = tempfile::tempdir().unwrap();
     let mut b = GraphBuilder::new();
-    for (s, d) in [
-        ("a", "b"),
-        ("b", "a"),
-        ("b", "c"),
-        ("d", "a"),
-        ("e", "d"),
-    ] {
+    for (s, d) in [("a", "b"), ("b", "a"), ("b", "c"), ("d", "a"), ("e", "d")] {
         b.add_edge(s, d);
     }
     let p = dir.path().join("g.strand");
@@ -328,28 +318,19 @@ fn weighted_dijkstra() {
     let w = |u: u32, v: u32| -> Option<f64> {
         let ts = g.out_targets(u);
         let ws = g.out_weights(u)?;
-        ts.iter()
-            .position(|&t| t == v)
-            .map(|i| ws[i] as f64)
+        ts.iter().position(|&t| t == v).map(|i| ws[i] as f64)
     };
-    let (path, cost) = algo::shortest_path_weighted(
-        &g,
-        g.node_id("a").unwrap(),
-        g.node_id("b").unwrap(),
-        w,
-    )
-    .unwrap();
+    let (path, cost) =
+        algo::shortest_path_weighted(&g, g.node_id("a").unwrap(), g.node_id("b").unwrap(), w)
+            .unwrap();
     assert_eq!(cost, 2.0);
     let names: Vec<&str> = path.iter().map(|&i| g.node_name(i)).collect();
     assert_eq!(names, vec!["a", "c", "b"]);
 
     // CSR-specialized variant agrees.
-    let (path2, cost2) = algo::shortest_path_weighted_csr(
-        &g,
-        g.node_id("a").unwrap(),
-        g.node_id("b").unwrap(),
-    )
-    .unwrap();
+    let (path2, cost2) =
+        algo::shortest_path_weighted_csr(&g, g.node_id("a").unwrap(), g.node_id("b").unwrap())
+            .unwrap();
     assert_eq!(cost2, 2.0);
     assert_eq!(path2, path);
 }
@@ -412,7 +393,12 @@ fn impact_sizes_approx_tracks_exact() {
     // ~1/sqrt(k) noise; 128 samples on ~504 nodes is noisy but the hub
     // dominates every closure so it must rank first and stay positive).
     let top_id = g.node_id("top").unwrap() as usize;
-    assert!(a1[hub] > a1[top_id], "hub {} should exceed top {}", a1[hub], a1[top_id]);
+    assert!(
+        a1[hub] > a1[top_id],
+        "hub {} should exceed top {}",
+        a1[hub],
+        a1[top_id]
+    );
     assert!(a1[hub] > 200.0, "hub estimate {} too low", a1[hub]);
     assert!(a1[hub] < 900.0, "hub estimate {} too high", a1[hub]);
 
@@ -488,10 +474,7 @@ fn impact_approx_tracks_exact_on_random_dag() {
     let e20: std::collections::BTreeSet<u32> = top_k(&exact, 20).into_iter().collect();
     let a20: std::collections::BTreeSet<u32> = top_k(&approx, 20).into_iter().collect();
     let overlap = e20.intersection(&a20).count();
-    assert!(
-        overlap >= 14,
-        "top-20 overlap {overlap}/20 too low"
-    );
+    assert!(overlap >= 14, "top-20 overlap {overlap}/20 too low");
 
     // Spearman rank correlation over the exact top-200 (the region
     // that matters for `top` output).
@@ -512,7 +495,10 @@ fn impact_approx_tracks_exact_on_random_dag() {
     };
     let re = rank(&exact, &e200);
     let ra = rank(&approx, &e200);
-    let pairs: Vec<(f64, f64)> = e200.iter().map(|&i| (re[i as usize], ra[i as usize])).collect();
+    let pairs: Vec<(f64, f64)> = e200
+        .iter()
+        .map(|&i| (re[i as usize], ra[i as usize]))
+        .collect();
     let m = pairs.len() as f64;
     let (mx, my) = (
         pairs.iter().map(|p| p.0).sum::<f64>() / m,

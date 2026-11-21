@@ -18,12 +18,26 @@ use strand_core::{Error, Result};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     /// `src -> dst` unweighted ("src depends on dst").
-    AddEdge { src: String, dst: String },
+    AddEdge {
+        src: String,
+        dst: String,
+    },
     /// `src -> dst` with weight.
-    AddEdgeW { src: String, dst: String, weight: f32 },
-    RemoveEdge { src: String, dst: String },
-    AddNode { name: String },
-    RemoveNode { name: String },
+    AddEdgeW {
+        src: String,
+        dst: String,
+        weight: f32,
+    },
+    RemoveEdge {
+        src: String,
+        dst: String,
+    },
+    AddNode {
+        name: String,
+    },
+    RemoveNode {
+        name: String,
+    },
 }
 
 const TAG_ADD_EDGE: u8 = 1;
@@ -219,4 +233,3 @@ pub fn replay(file: &std::fs::File) -> Result<(Vec<Vec<Op>>, u64)> {
     }
     Ok((txs, offset))
 }
-

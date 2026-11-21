@@ -17,9 +17,7 @@ pub trait GraphView: Send + Sync {
 
     /// Number of edges (default: sums out-degrees, O(E)).
     fn n_edges(&self) -> usize {
-        (0..self.n_nodes() as u32)
-            .map(|i| self.out_degree(i))
-            .sum()
+        (0..self.n_nodes() as u32).map(|i| self.out_degree(i)).sum()
     }
 
     /// Call `f` on each dependency of `id` (forward neighbors).

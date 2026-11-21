@@ -22,9 +22,9 @@ const LOCK_VERSIONS: &str = include_str!(concat!(env!("OUT_DIR"), "/strand_versi
 /// workspace crate versions at release time.
 const FALLBACK_VERSIONS: &[(&str, &str)] = &[
     ("strand-core", "0.1.0"),
-    ("strand-import", "0.5.0"),
+    ("strand-import", "0.6.0"),
     ("strand-store", "0.2.1"),
-    ("strand-cli", "0.3.5"),
+    ("strand-cli", "0.3.6"),
     ("strand-gui", "0.3.7"),
 ];
 
@@ -111,7 +111,10 @@ fn fetch_latest(name: &str) -> Option<String> {
     let url = format!("https://crates.io/api/v1/crates/{name}");
     let mut resp = agent
         .get(&url)
-        .header("User-Agent", concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+        .header(
+            "User-Agent",
+            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
+        )
         .call()
         .ok()?;
     let body = resp.body_mut().read_to_string().ok()?;

@@ -23,14 +23,27 @@ fn cli_build_and_queries() {
     let graph = dir.path().join("deps.strand");
 
     let out = strand()
-        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .args([
+            "build",
+            csv.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let run = |args: &[&str]| {
         let o = strand().args(args).output().unwrap();
-        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
         String::from_utf8_lossy(&o.stdout).to_string()
     };
     let g = graph.to_str().unwrap();
@@ -50,7 +63,9 @@ fn cli_build_and_queries() {
     assert!(impact.contains("4 affected"));
 
     let why = run(&["why", g, "app", "util"]);
-    assert!(why.contains("app -> liba -> core -> util") || why.contains("app -> libb -> core -> util"));
+    assert!(
+        why.contains("app -> liba -> core -> util") || why.contains("app -> libb -> core -> util")
+    );
 
     assert!(run(&["cycles", g]).contains("no cycles"));
     assert!(run(&["roots", g]).contains("app"));
@@ -73,7 +88,12 @@ fn cli_impact_counts_consistent() {
     let csv = write_csv(&dir);
     let graph = dir.path().join("deps.strand");
     strand()
-        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .args([
+            "build",
+            csv.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
 
@@ -139,7 +159,11 @@ fn cli_scan_rust_project() {
     std::fs::create_dir_all(root.join("src/bar")).unwrap();
     std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
     std::fs::write(root.join("src/lib.rs"), "mod foo;\nmod bar;\n").unwrap();
-    std::fs::write(root.join("src/foo.rs"), "use crate::bar::Thing;\npub struct X;\n").unwrap();
+    std::fs::write(
+        root.join("src/foo.rs"),
+        "use crate::bar::Thing;\npub struct X;\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("src/bar/mod.rs"),
         "use super::foo::X;\nmod inner;\npub struct Thing;\n",
@@ -149,7 +173,12 @@ fn cli_scan_rust_project() {
 
     let graph = dir.path().join("scan.strand");
     let o = strand()
-        .args(["scan", root.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .args([
+            "scan",
+            root.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -177,13 +206,25 @@ fn cli_impact_git_diff() {
             .args(args)
             .output()
             .unwrap();
-        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
     };
     git(&["init", "-q"]);
     std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
     std::fs::write(repo.join("app.rs"), "fn main() {}\n").unwrap();
     git(&["add", "-A"]);
-    git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "init",
+    ]);
     // Uncommitted change -> shows up in `git diff --name-only HEAD`.
     std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\npub fn g() {}\n").unwrap();
 
@@ -192,7 +233,12 @@ fn cli_impact_git_diff() {
     std::fs::write(&csv, "app.rs,src/lib.rs\n").unwrap();
     let graph = dir.path().join("deps.strand");
     strand()
-        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .args([
+            "build",
+            csv.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
 
@@ -210,7 +256,16 @@ fn cli_impact_git_diff() {
 
     // --max-impact turns the blast radius into a CI gate.
     let o = strand()
-        .args(["impact", g, "--git-diff", "HEAD", "--git-dir", rd, "--max-impact", "0"])
+        .args([
+            "impact",
+            g,
+            "--git-diff",
+            "HEAD",
+            "--git-dir",
+            rd,
+            "--max-impact",
+            "0",
+        ])
         .output()
         .unwrap();
     assert!(!o.status.success());
@@ -222,7 +277,12 @@ fn cli_export_diagrams() {
     let csv = write_csv(&dir);
     let graph = dir.path().join("deps.strand");
     strand()
-        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .args([
+            "build",
+            csv.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let g = graph.to_str().unwrap();
@@ -238,7 +298,9 @@ fn cli_export_diagrams() {
     assert!(dot.contains("->"), "{dot}");
 
     let o = strand()
-        .args(["export", g, "--format", "mermaid", "--impact", "core", "--depth", "1"])
+        .args([
+            "export", g, "--format", "mermaid", "--impact", "core", "--depth", "1",
+        ])
         .output()
         .unwrap();
     assert!(o.status.success());
@@ -254,7 +316,12 @@ fn cli_check_rules() {
     let csv = write_csv(&dir);
     let graph = dir.path().join("deps.strand");
     strand()
-        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .args([
+            "build",
+            csv.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let rules = dir.path().join("strand.rules");
@@ -300,7 +367,12 @@ fn cli_missing_node_fails() {
     let csv = write_csv(&dir);
     let graph = dir.path().join("deps.strand");
     strand()
-        .args(["build", csv.to_str().unwrap(), "-o", graph.to_str().unwrap()])
+        .args([
+            "build",
+            csv.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let o = strand()
@@ -328,11 +400,7 @@ fn cli_diff_graphs() {
     let new = g("new", "a,b\nc,d\n");
 
     let o = strand()
-        .args([
-            "diff",
-            old.to_str().unwrap(),
-            new.to_str().unwrap(),
-        ])
+        .args(["diff", old.to_str().unwrap(), new.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));

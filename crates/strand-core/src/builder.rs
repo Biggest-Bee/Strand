@@ -182,9 +182,8 @@ impl GraphBuilder {
             .collect();
 
         // 2. Resolve edges to id pairs and sort/dedupe.
-        let mut resolved: Vec<(u32, u32, f32)> = Vec::with_capacity(
-            self.edges.len() + self.idx_edges.len(),
-        );
+        let mut resolved: Vec<(u32, u32, f32)> =
+            Vec::with_capacity(self.edges.len() + self.idx_edges.len());
         for e in &self.edges {
             resolved.push((
                 name_to_id[e.src.as_str()],
@@ -220,10 +219,7 @@ impl GraphBuilder {
         let (fwd_offsets, fwd_targets, fwd_weights) = build_csr(n_nodes as usize, &deduped);
 
         // 4. Reverse CSR over the same edges.
-        let rev_edges: Vec<(u32, u32, f32)> = deduped
-            .iter()
-            .map(|&(s, d, w)| (d, s, w))
-            .collect();
+        let rev_edges: Vec<(u32, u32, f32)> = deduped.iter().map(|&(s, d, w)| (d, s, w)).collect();
         let (rev_offsets, rev_sources, rev_weights) = build_csr(n_nodes as usize, &rev_edges);
 
         // 5. Name blob + offsets. Ids are already name-sorted, so
@@ -242,7 +238,11 @@ impl GraphBuilder {
 
         // 7. Lay out sections and assemble the body (everything after the
         //    128-byte header), padding each section to 8 bytes.
-        let flags = if self.weighted { format::FLAG_HAS_WEIGHTS } else { 0 };
+        let flags = if self.weighted {
+            format::FLAG_HAS_WEIGHTS
+        } else {
+            0
+        };
         let header = Header {
             flags,
             n_nodes,
@@ -250,11 +250,7 @@ impl GraphBuilder {
             section_offsets: [0; N_SECTIONS],
             checksum: 0,
         };
-        let lay = format::layout(
-            &header,
-            name_bytes.len() as u64,
-            meta_content.len() as u64,
-        );
+        let lay = format::layout(&header, name_bytes.len() as u64, meta_content.len() as u64);
 
         let mut body: Vec<u8> = Vec::new();
         let section_bytes: [&[u8]; N_SECTIONS] = [
@@ -383,10 +379,7 @@ impl GraphBuilder {
 
 /// Build a CSR (offsets, targets, weights) from edges already sorted by
 /// `(src, dst)`. Targets end up sorted ascending within each row.
-fn build_csr(
-    n_nodes: usize,
-    edges: &[(u32, u32, f32)],
-) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+fn build_csr(n_nodes: usize, edges: &[(u32, u32, f32)]) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
     let mut offsets = vec![0u64; n_nodes + 1];
     for &(s, _, _) in edges {
         offsets[s as usize + 1] += 1;
@@ -422,4 +415,3 @@ fn tmp_path(path: &Path) -> std::path::PathBuf {
     s.push(".tmp");
     std::path::PathBuf::from(s)
 }
-

@@ -67,9 +67,9 @@ impl Graph {
         let lay = format::layout(&header, name_bytes_len, meta_len);
         // Every computed section must lie inside the file.
         for (i, &(off, len)) in lay.iter().enumerate() {
-            let end = off.checked_add(len).ok_or_else(|| {
-                Error::Invalid(format!("section {i} offset overflow"))
-            })?;
+            let end = off
+                .checked_add(len)
+                .ok_or_else(|| Error::Invalid(format!("section {i} offset overflow")))?;
             if end > mmap.len() as u64 {
                 return Err(Error::Invalid(format!(
                     "section {i} [{off}, {end}) exceeds file length {}",
@@ -277,7 +277,9 @@ impl Graph {
     /// Node name for `id`. Panics only if `id >= n_nodes` (programmer error;
     /// ids obtained from this graph are always valid).
     pub fn node_name(&self, id: u32) -> &str {
-        let offs = self.u64s(format::sec::NAME_OFFSETS).expect("validated at open");
+        let offs = self
+            .u64s(format::sec::NAME_OFFSETS)
+            .expect("validated at open");
         let nb = self.bytes(format::sec::NAME_BYTES);
         let s = offs[id as usize] as usize;
         let e = offs[id as usize + 1] as usize;
@@ -298,8 +300,12 @@ impl Graph {
     /// Dependencies of `id`: targets of forward edges (`id -> dep`).
     #[inline]
     pub fn out_targets(&self, id: u32) -> &[u32] {
-        let offs = self.u64s(format::sec::FWD_OFFSETS).expect("validated at open");
-        let t = self.u32s(format::sec::FWD_TARGETS).expect("validated at open");
+        let offs = self
+            .u64s(format::sec::FWD_OFFSETS)
+            .expect("validated at open");
+        let t = self
+            .u32s(format::sec::FWD_TARGETS)
+            .expect("validated at open");
         let s = offs[id as usize] as usize;
         let e = offs[id as usize + 1] as usize;
         &t[s..e]
@@ -311,8 +317,12 @@ impl Graph {
         if !self.has_weights() {
             return None;
         }
-        let offs = self.u64s(format::sec::FWD_OFFSETS).expect("validated at open");
-        let w = self.f32s(format::sec::FWD_WEIGHTS).expect("validated at open");
+        let offs = self
+            .u64s(format::sec::FWD_OFFSETS)
+            .expect("validated at open");
+        let w = self
+            .f32s(format::sec::FWD_WEIGHTS)
+            .expect("validated at open");
         let s = offs[id as usize] as usize;
         let e = offs[id as usize + 1] as usize;
         Some(&w[s..e])
@@ -322,8 +332,12 @@ impl Graph {
     /// These are the nodes that break if `id` changes.
     #[inline]
     pub fn in_targets(&self, id: u32) -> &[u32] {
-        let offs = self.u64s(format::sec::REV_OFFSETS).expect("validated at open");
-        let t = self.u32s(format::sec::REV_SOURCES).expect("validated at open");
+        let offs = self
+            .u64s(format::sec::REV_OFFSETS)
+            .expect("validated at open");
+        let t = self
+            .u32s(format::sec::REV_SOURCES)
+            .expect("validated at open");
         let s = offs[id as usize] as usize;
         let e = offs[id as usize + 1] as usize;
         &t[s..e]
@@ -335,8 +349,12 @@ impl Graph {
         if !self.has_weights() {
             return None;
         }
-        let offs = self.u64s(format::sec::REV_OFFSETS).expect("validated at open");
-        let w = self.f32s(format::sec::REV_WEIGHTS).expect("validated at open");
+        let offs = self
+            .u64s(format::sec::REV_OFFSETS)
+            .expect("validated at open");
+        let w = self
+            .f32s(format::sec::REV_WEIGHTS)
+            .expect("validated at open");
         let s = offs[id as usize] as usize;
         let e = offs[id as usize + 1] as usize;
         Some(&w[s..e])
@@ -374,4 +392,3 @@ fn read_u64(mmap: &Mmap, pos: usize) -> Result<u64> {
     }
     Ok(u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()))
 }
-

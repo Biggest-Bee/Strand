@@ -7,8 +7,8 @@ pub mod algo;
 pub mod builder;
 pub mod format;
 pub mod graph;
-pub mod view;
 mod mmap;
+pub mod view;
 
 pub use builder::{BuildStats, Edge, GraphBuilder, MergeOp};
 pub use graph::Graph;

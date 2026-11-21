@@ -210,10 +210,7 @@ pub fn impact_sizes_approx<G: GraphView>(graph: &G, samples: usize) -> Vec<f64> 
 /// [`impact_sizes_approx`] plus the number of landmarks actually used
 /// (may differ from `samples` when the hash threshold selects a
 /// different count, or the strided fallback kicks in).
-pub fn impact_sizes_approx_detail<G: GraphView>(
-    graph: &G,
-    samples: usize,
-) -> (Vec<f64>, usize) {
+pub fn impact_sizes_approx_detail<G: GraphView>(graph: &G, samples: usize) -> (Vec<f64>, usize) {
     let n = graph.n_nodes();
     if n == 0 || samples == 0 {
         return (vec![0.0; n], 0);
@@ -413,9 +410,7 @@ fn impact_sizes_inner<G: GraphView>(graph: &G) -> std::result::Result<Vec<u32>, 
     // Impact size of a component = sum of member counts over its ancestor
     // set; per-node value subtracts the node itself.
     Ok((0..n as u32)
-        .map(|v| {
-            comp_impact[cond.comp[v as usize] as usize].saturating_sub(1)
-        })
+        .map(|v| comp_impact[cond.comp[v as usize] as usize].saturating_sub(1))
         .collect())
 }
 
@@ -437,7 +432,7 @@ fn impact_sizes_naive<G: GraphView>(graph: &G) -> Vec<u32> {
             || {
                 (
                     vec![0u32; n], // generation stamps
-                    0u32,         // current generation
+                    0u32,          // current generation
                     Vec::with_capacity(1024),
                 )
             },

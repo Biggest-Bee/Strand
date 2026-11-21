@@ -32,7 +32,9 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let dir = arg("--dir").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("testdata"));
+    let dir = arg("--dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("testdata"));
     let skip_gen = args.iter().any(|a| a == "--skip-gen");
     let path = dir.join("big.strand");
 

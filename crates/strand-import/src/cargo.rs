@@ -23,7 +23,10 @@ pub fn parse(text: &str) -> Result<EdgeList> {
         let name = p["name"].as_str().unwrap_or("");
         let version = p["version"].as_str().unwrap_or("");
         if !name.is_empty() {
-            by_name.entry(name.to_string()).or_default().push(version.to_string());
+            by_name
+                .entry(name.to_string())
+                .or_default()
+                .push(version.to_string());
         }
     }
     for vers in by_name.values_mut() {

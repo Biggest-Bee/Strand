@@ -134,6 +134,11 @@ strand scan ./my-project -o deps.strand
 # (import/export-from/require, index resolution,
 # tsconfig/jsconfig paths+extends+baseUrl, package.json "imports").
 # A file argument scans its project root (nearest ancestor manifest).
+# Edges static analysis can't see can be declared manually:
+#   # strand: depends-on pkg/target.py   (Python)
+#   // strand: depends-on src/b.rs       (Rust/JS/TS)
+# Dynamic sites it can't resolve (computed module names, require(expr),
+# computed entry_points) are reported as per-file warnings.
 # --lang rust|python|js restricts to one language; default scans all.
 strand scan ./my-project --lang python -o pydeps.strand
 
@@ -561,7 +566,12 @@ cargo test
   and dynamic language tricks - computed module names
   (`import_module('pkg.' + name)`), `entry_points` built by function
   calls, and `getattr`-based dispatch stay invisible, so runtime-only
-  dependencies can be missed. Nodes are file
+  dependencies can be missed. Each such site is counted and reported
+  as a per-file warning ("N dynamic import site(s)") so incomplete
+  results are visible, and `# strand: depends-on <path>` /
+  `// strand: depends-on <path>` comments add manual edges for the
+  cases you know about (paths resolve relative to the file's dir,
+  then the project root). Nodes are file
   paths, so it answers "what breaks if I change `src/foo.rs`?" -
   package-level questions still want `cargo metadata` input.
   Unresolvable imports and third-party packages are dropped entirely

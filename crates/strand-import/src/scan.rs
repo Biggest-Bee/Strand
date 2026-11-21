@@ -109,8 +109,8 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
     let mut warnings = Vec::new();
 
     for (rel, abs) in &files {
-        let text = fs::read_to_string(abs)
-            .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
+        let text =
+            fs::read_to_string(abs).map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
         // Real parse via syn: comments, string/char/raw literals, and
         // grouped `use` trees are handled by the grammar, not text
         // matching. A file that fails to parse contributes no edges and
@@ -146,6 +146,20 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
         let parent = parent_rel(rel);
         for inc in &refs.includes {
             if let Some(dep) = normalize_rel(parent, inc).filter(|c| names.contains(c)) {
+                if dep != *rel {
+                    deps.insert(dep);
+                }
+            }
+        }
+
+        // `// strand: depends-on path` manual edges. Paths resolve
+        // relative to the file's dir, then project root.
+        for spec in manual_dep_specs(&text) {
+            let dep = [parent, ""]
+                .iter()
+                .filter_map(|b| normalize_rel(b, &spec))
+                .find(|c| names.contains(c));
+            if let Some(dep) = dep {
                 if dep != *rel {
                     deps.insert(dep);
                 }
@@ -230,9 +244,7 @@ impl<'ast> Visit<'ast> for RustRefVisitor {
         // `mod foo { ... }` still gets visited for nested items.
         if i.content.is_none() {
             let custom = i.attrs.iter().find_map(path_attr_value);
-            self.refs
-                .mods
-                .push((i.ident.unraw().to_string(), custom));
+            self.refs.mods.push((i.ident.unraw().to_string(), custom));
         }
         visit::visit_item_mod(self, i);
     }
@@ -243,11 +255,7 @@ impl<'ast> Visit<'ast> for RustRefVisitor {
     }
 
     fn visit_macro(&mut self, i: &'ast syn::Macro) {
-        if i.path
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "include")
-        {
+        if i.path.segments.last().is_some_and(|s| s.ident == "include") {
             if let Ok(lit) = syn::parse2::<syn::LitStr>(i.tokens.clone()) {
                 self.refs.includes.push(lit.value());
             }
@@ -304,6 +312,28 @@ fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<Vec<
 }
 
 // ---------- filesystem walk ----------
+
+/// Manual escape hatch: `# strand: depends-on <path>` /
+/// `// strand: depends-on <path>` comment directives. Each occurrence
+/// yields one target path, resolved relative to the file's directory.
+/// For edges the scanner can't see (runtime wiring, computed names).
+fn manual_dep_specs(text: &str) -> Vec<String> {
+    const MARKER: &str = "strand: depends-on";
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(pos) = line.find(MARKER) else {
+            continue;
+        };
+        let rest = line[pos + MARKER.len()..]
+            .trim()
+            .trim_end_matches("*/")
+            .trim();
+        if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+    }
+    out
+}
 
 fn walk_ext(
     dir: &Path,
@@ -452,7 +482,9 @@ fn crate_map(root: &Path, names: &BTreeSet<String>) -> BTreeMap<String, (String,
 }
 
 fn collect_manifests(dir: &Path, root: &Path, out: &mut Vec<(PathBuf, String)>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
@@ -498,10 +530,18 @@ fn crate_src_rel(abs: &Path, root: &Path) -> Option<String> {
         if dir.join("Cargo.toml").is_file() {
             let src = dir.join("src");
             if src.is_dir() {
-                let rel = src.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+                let rel = src
+                    .strip_prefix(root)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 return Some(rel);
             }
-            let rel = dir.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+            let rel = dir
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
             return Some(rel);
         }
         if !dir.starts_with(root) {
@@ -597,12 +637,14 @@ fn ts_call_spec(call: tree_sitter::Node, src: &str) -> Option<String> {
 }
 
 /// All module specifiers in JS/TS source, via tree-sitter.
-/// Returns `(specs, had_error)` - `had_error` means the tree contains
-/// ERROR nodes, so the spec list may be incomplete.
-fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, bool) {
+/// Returns `(specs, had_error, dynamic)` - `had_error` means the tree
+/// contains ERROR nodes; `dynamic` counts `import(expr)`/`require(expr)`
+/// calls with non-literal args (invisible edges).
+fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, bool, usize) {
     let mut specs = Vec::new();
+    let mut dynamic = 0usize;
     let Some(tree) = parse_ts(text, lang) else {
-        return (specs, true);
+        return (specs, true, dynamic);
     };
     let had_error = tree.root_node().has_error();
     let mut stack = vec![tree.root_node()];
@@ -616,6 +658,8 @@ fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, 
             "call_expression" => {
                 if let Some(s) = ts_call_spec(node, text) {
                     specs.push(s);
+                } else if ts_is_dynamic_call(node, text) {
+                    dynamic += 1;
                 }
             }
             _ => {}
@@ -625,7 +669,38 @@ fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, 
             stack.push(child);
         }
     }
-    (specs, had_error)
+    (specs, had_error, dynamic)
+}
+
+/// `require(x)` / `import(x)` where the first arg isn't a string or
+/// template literal - a dynamic site the scanner can't resolve.
+fn ts_is_dynamic_call(call: tree_sitter::Node, src: &str) -> bool {
+    let Some(func) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let is_require =
+        func.kind() == "identifier" && func.utf8_text(src.as_bytes()).is_ok_and(|t| t == "require");
+    let is_dyn_import = func.kind() == "import";
+    if !is_require && !is_dyn_import {
+        return false;
+    }
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return true;
+    };
+    let arg_kind = {
+        let mut cursor = args.walk();
+        // First real argument - skip "(", ",", ")" punctuation.
+        let found = args
+            .children(&mut cursor)
+            .find(|c| !matches!(c.kind(), "(" | ")" | ","))
+            .map(|c| c.kind().to_string());
+        found
+    };
+    match arg_kind.as_deref() {
+        Some("string" | "template_string") => false,
+        Some(_) => true,
+        None => true,
+    }
 }
 
 // ---------- Python scanner ----------
@@ -648,11 +723,14 @@ enum PyRef {
 
 /// All imports in Python source, via tree-sitter. Docstrings, comments,
 /// and string contents can't produce phantom imports; syntax errors
-/// degrade to ERROR nodes rather than wrong guesses.
-fn py_import_refs(text: &str) -> (Vec<PyRef>, bool) {
+/// degrade to ERROR nodes rather than wrong guesses. The third return
+/// value counts dynamic import sites (non-literal `import_module` /
+/// `__import__` args) so callers can warn that edges may be incomplete.
+fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
     let mut out = Vec::new();
+    let mut dynamic = 0usize;
     let Some(tree) = parse_ts(text, tree_sitter_python::LANGUAGE.into()) else {
-        return (out, true);
+        return (out, true, dynamic);
     };
     let had_error = tree.root_node().has_error();
     let mut stack = vec![tree.root_node()];
@@ -709,9 +787,12 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool) {
             "call" => {
                 // Dynamic imports with literal arguments:
                 // `import_module("a.b")`, `importlib.import_module("a.b")`,
-                // `__import__("a.b")`. Non-literal args stay invisible.
-                if let Some(segs) = py_dyn_import_segs(node, text) {
-                    out.push(PyRef::Import(segs));
+                // `__import__("a.b")`. Non-literal args are counted as
+                // dynamic sites (invisible edges) for the warning.
+                match py_dyn_call_kind(node, text) {
+                    PyDynCall::Literal(segs) => out.push(PyRef::Import(segs)),
+                    PyDynCall::Dynamic => dynamic += 1,
+                    PyDynCall::NotDynamic => {}
                 }
             }
             _ => {}
@@ -721,7 +802,7 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool) {
             stack.push(child);
         }
     }
-    (out, had_error)
+    (out, had_error, dynamic)
 }
 
 /// `a.b.c` node text -> segments, or `None` if not a plain dotted path.
@@ -759,44 +840,70 @@ fn rel_mod_segs(node: tree_sitter::Node, text: &str) -> Option<(usize, Vec<Strin
     Some((level, segs))
 }
 
-/// Dotted module path from a dynamic-import call:
-/// `import_module("a.b")`, `importlib.import_module("a.b")`,
-/// `__import__("a.b")`. Returns `None` for non-literal or
-/// non-module-looking arguments.
-fn py_dyn_import_segs(call: tree_sitter::Node, text: &str) -> Option<Vec<String>> {
-    let func = call.child_by_field_name("function")?;
-    let func_text = func.utf8_text(text.as_bytes()).ok()?;
+/// What a `call` node turned out to be for dynamic-import purposes.
+enum PyDynCall {
+    /// `import_module("a.b")` etc. with a valid literal module path.
+    Literal(Vec<String>),
+    /// Dyn-import-shaped call whose module path isn't a plain literal
+    /// (variable, call, f-string, concatenation) - invisible edge.
+    Dynamic,
+    /// Not a dynamic-import call, or a literal that isn't a valid
+    /// module path (unresolvable, not "dynamic").
+    NotDynamic,
+}
+
+/// Classify a call as a dynamic-import site: `import_module`,
+/// `importlib.import_module`, `__import__` and attribute variants.
+fn py_dyn_call_kind(call: tree_sitter::Node, text: &str) -> PyDynCall {
+    let Some(func) = call.child_by_field_name("function") else {
+        return PyDynCall::NotDynamic;
+    };
+    let Ok(func_text) = func.utf8_text(text.as_bytes()) else {
+        return PyDynCall::NotDynamic;
+    };
     let is_dyn = func_text == "__import__"
         || func_text == "import_module"
         || func_text.ends_with(".import_module")
         || func_text.ends_with(".__import__");
     if !is_dyn {
-        return None;
+        return PyDynCall::NotDynamic;
     }
-    let args = call.child_by_field_name("arguments")?;
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return PyDynCall::Dynamic;
+    };
     let mut cursor = args.walk();
-    for arg in args.children(&mut cursor) {
-        if arg.kind() != "string" {
-            continue;
-        }
-        let inner = py_string_inner(arg, text)?;
-        // f-strings interpolate; a "{" means the path isn't literal.
-        if inner.contains('{') {
-            return None;
-        }
-        let segs: Vec<String> = inner
-            .split('.')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        let valid = !segs.is_empty()
-            && segs
-                .iter()
-                .all(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
-        return valid.then_some(segs);
+    // First real argument - skip "(", ",", ")" punctuation nodes.
+    let Some(arg) = args
+        .children(&mut cursor)
+        .find(|c| !matches!(c.kind(), "(" | ")" | ","))
+    else {
+        return PyDynCall::Dynamic;
+    };
+    if arg.kind() != "string" {
+        return PyDynCall::Dynamic;
     }
-    None
+    let Some(inner) = py_string_inner(arg, text) else {
+        return PyDynCall::NotDynamic;
+    };
+    // f-strings interpolate; a "{" means the path isn't literal.
+    if inner.contains('{') {
+        return PyDynCall::Dynamic;
+    }
+    let segs: Vec<String> = inner
+        .split('.')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let valid = !segs.is_empty()
+        && segs
+            .iter()
+            .all(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    if valid {
+        PyDynCall::Literal(segs)
+    } else {
+        PyDynCall::NotDynamic
+    }
 }
 
 /// String literal content without quotes or prefix (`r"x"`, `'''x'''`).
@@ -805,7 +912,12 @@ fn py_string_inner(node: tree_sitter::Node, text: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut i = 0;
     // Skip string prefix chars (r, b, f, u and uppercase combos).
-    while i < bytes.len() && matches!(bytes[i], b'r' | b'R' | b'b' | b'B' | b'f' | b'F' | b'u' | b'U') {
+    while i < bytes.len()
+        && matches!(
+            bytes[i],
+            b'r' | b'R' | b'b' | b'B' | b'f' | b'F' | b'u' | b'U'
+        )
+    {
         i += 1;
     }
     let rest = &raw[i..];
@@ -832,11 +944,16 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
     let mut warnings = Vec::new();
 
     for (rel, abs) in &files {
-        let text = fs::read_to_string(abs)
-            .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        let (refs, had_error) = py_import_refs(&text);
+        let text =
+            fs::read_to_string(abs).map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
+        let (refs, had_error, dynamic) = py_import_refs(&text);
         if had_error {
             warnings.push(format!("{rel}: parse errors (partial scan)"));
+        }
+        if dynamic > 0 {
+            warnings.push(format!(
+                "{rel}: {dynamic} dynamic import site(s) - edges may be incomplete"
+            ));
         }
         let mut deps: BTreeSet<String> = BTreeSet::new();
         let parent = parent_rel(rel);
@@ -856,8 +973,34 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                         }
                     }
                 }
-                PyRef::From { level, segs, names: imps } => {
+                PyRef::From {
+                    level,
+                    segs,
+                    names: imps,
+                } => {
                     add_py_from(&names, rel, parent, level, &segs, &imps, &mut deps);
+                }
+            }
+        }
+
+        // `# strand: depends-on path` manual edges - file path relative
+        // to this file's dir, or a dotted module path.
+        for spec in manual_dep_specs(&text) {
+            let dep = if spec.contains('/') || spec.ends_with(".py") {
+                // Path form: file-dir relative, then project-root relative.
+                [parent, ""]
+                    .iter()
+                    .filter_map(|b| normalize_rel(b, &spec))
+                    .find(|c| names.contains(c))
+            } else {
+                let segs: Vec<String> = spec.split('.').map(str::to_string).collect();
+                ancestor_bases(rel)
+                    .iter()
+                    .find_map(|b| resolve_py_exact(&names, b, &segs))
+            };
+            if let Some(dep) = dep {
+                if dep != *rel {
+                    deps.insert(dep);
                 }
             }
         }
@@ -907,9 +1050,9 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                     .filter(|s| !s.is_empty())
                     .collect();
                 let valid = !segs.is_empty()
-                    && segs.iter().all(|s| {
-                        s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    });
+                    && segs
+                        .iter()
+                        .all(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
                 if !valid {
                     continue;
                 }
@@ -971,7 +1114,13 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             continue;
         };
         let mut deps: BTreeSet<String> = BTreeSet::new();
-        for module in setup_py_entry_specs(&text) {
+        let (specs, dynamic) = setup_py_entry_specs(&text);
+        if dynamic > 0 {
+            warnings.push(format!(
+                "{rel}: {dynamic} computed entry_points value(s) - edges may be incomplete"
+            ));
+        }
+        for module in specs {
             let segs: Vec<String> = module.split('.').map(str::to_string).collect();
             for base in entry_bases(rel) {
                 if let Some(dep) = resolve_py_exact(&names, &base, &segs) {
@@ -986,7 +1135,11 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             edges.push((rel.clone(), dep, None));
         }
     }
-    Ok(ScanOutput { edges, nodes: nodes.into_iter().collect(), warnings })
+    Ok(ScanOutput {
+        edges,
+        nodes: nodes.into_iter().collect(),
+        warnings,
+    })
 }
 
 /// `name = module.path:attr` spec -> `module.path`, or `None`.
@@ -995,9 +1148,9 @@ fn entry_spec_module(spec: &str) -> Option<String> {
     let rhs = spec.split_once('=')?.1.trim();
     let module = rhs.split(':').next()?.trim();
     let valid = !module.is_empty()
-        && module.split('.').all(|s| {
-            !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        });
+        && module
+            .split('.')
+            .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
     valid.then(|| module.to_string())
 }
 
@@ -1024,12 +1177,13 @@ fn setup_cfg_entry_specs(text: &str) -> Vec<String> {
 }
 
 /// `setup.py` `entry_points={...}` dict literal -> entry-point module
-/// paths. Only literal dicts are seen; programmatically built dicts
-/// stay invisible.
-fn setup_py_entry_specs(text: &str) -> Vec<String> {
+/// paths. Also returns a count of `entry_points=` values resolved to a
+/// function call (e.g. `build_eps()`) - computed dicts stay invisible.
+fn setup_py_entry_specs(text: &str) -> (Vec<String>, usize) {
     let mut out = Vec::new();
+    let mut dynamic = 0usize;
     let Some(tree) = parse_ts(text, tree_sitter_python::LANGUAGE.into()) else {
-        return out;
+        return (out, dynamic);
     };
     // Alias map: `NAME = <expr>` assignments, so
     // `setup(entry_points=NAME)` resolves to the assigned dict.
@@ -1055,7 +1209,7 @@ fn setup_py_entry_specs(text: &str) -> Vec<String> {
             }
         }
     }
-    let resolve_expr = |expr: tree_sitter::Node, out: &mut Vec<String>| {
+    let mut resolve_expr = |expr: tree_sitter::Node, out: &mut Vec<String>| {
         // Follow identifier aliases (bounded) then collect literal
         // "name = module:attr" strings from whatever expression remains.
         let mut cur = expr;
@@ -1069,6 +1223,17 @@ fn setup_py_entry_specs(text: &str) -> Vec<String> {
             match aliases.iter().find(|(n, _)| n == name) {
                 Some((_, rhs)) => cur = *rhs,
                 None => return,
+            }
+        }
+        // A non-`dict(...)` call means the dict is computed - count it
+        // as a dynamic site so the scan can warn.
+        if cur.kind() == "call" {
+            let fname = cur
+                .child_by_field_name("function")
+                .and_then(|f| f.utf8_text(text.as_bytes()).ok())
+                .unwrap_or("");
+            if !fname.ends_with("dict") {
+                dynamic += 1;
             }
         }
         collect_entry_strings(cur, text, out);
@@ -1107,7 +1272,7 @@ fn setup_py_entry_specs(text: &str) -> Vec<String> {
             stack.push(child);
         }
     }
-    out
+    (out, dynamic)
 }
 
 /// Collect `"name = module.path:attr"` strings anywhere inside a node
@@ -1265,11 +1430,16 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     let mut alias_cache = JsAliasCache::new(root);
 
     for (rel, abs) in &files {
-        let text = fs::read_to_string(abs)
-            .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        let (specs, had_error) = js_import_specs_ts(&text, js_language_for(rel));
+        let text =
+            fs::read_to_string(abs).map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
+        let (specs, had_error, dynamic) = js_import_specs_ts(&text, js_language_for(rel));
         if had_error {
             warnings.push(format!("{rel}: parse errors (partial scan)"));
+        }
+        if dynamic > 0 {
+            warnings.push(format!(
+                "{rel}: {dynamic} dynamic import site(s) - edges may be incomplete"
+            ));
         }
         let mut deps: BTreeSet<String> = BTreeSet::new();
         let parent = parent_rel(rel);
@@ -1298,12 +1468,48 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
             }
         }
 
+        // `// strand: depends-on spec` manual edges - relative paths
+        // or bare specifiers resolved like normal imports.
+        for spec in manual_dep_specs(&text) {
+            // Path-like specs resolve file-dir relative, then
+            // project-root relative; bare specs go through aliases.
+            let path_dep = |s: &str| {
+                [parent, ""]
+                    .iter()
+                    .filter_map(|b| normalize_rel(b, s))
+                    .find_map(|n| resolve_js(&names, &n))
+            };
+            let dep = if spec.starts_with(".") {
+                path_dep(&spec)
+            } else if spec.contains('/')
+                || spec.ends_with(".ts")
+                || spec.ends_with(".tsx")
+                || spec.ends_with(".js")
+                || spec.ends_with(".jsx")
+                || spec.ends_with(".mjs")
+                || spec.ends_with(".cjs")
+            {
+                path_dep(&spec)
+            } else {
+                resolve_js_alias(&resolver, &names, &spec)
+            };
+            if let Some(dep) = dep {
+                if dep != *rel {
+                    deps.insert(dep);
+                }
+            }
+        }
+
         for dep in deps {
             edges.push((rel.clone(), dep, None));
         }
     }
     let nodes = names.into_iter().collect();
-    Ok(ScanOutput { edges, nodes, warnings })
+    Ok(ScanOutput {
+        edges,
+        nodes,
+        warnings,
+    })
 }
 
 /// tree-sitter grammar for a JS/TS file extension.
@@ -1334,8 +1540,6 @@ fn resolve_js(names: &BTreeSet<String>, norm: &str) -> Option<String> {
     }
     None
 }
-
-
 
 // ---------- JS/TS alias resolution ----------
 //
@@ -1565,9 +1769,7 @@ fn read_tsconfig(
                 .and_then(|p| p.strip_prefix(root).ok())
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
-            if let Some(parent) =
-                read_tsconfig(root, &parent_abs, &parent_dir, depth + 1, seen)
-            {
+            if let Some(parent) = read_tsconfig(root, &parent_abs, &parent_dir, depth + 1, seen) {
                 merged = parent;
             }
         }
@@ -1599,12 +1801,7 @@ fn read_tsconfig(
 
 /// Resolve an `extends` value to a file: relative to the config's dir,
 /// with or without a `.json` suffix, or under `node_modules`.
-fn resolve_extends(
-    root: &Path,
-    cfg_abs: &Path,
-    dir_rel: &str,
-    ext: &str,
-) -> Option<PathBuf> {
+fn resolve_extends(root: &Path, cfg_abs: &Path, dir_rel: &str, ext: &str) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if ext.starts_with('.') {
         let base = cfg_abs.parent()?;
@@ -1656,11 +1853,7 @@ impl TsConfig {
 /// for `#`-prefixed specs first, then tsconfig `paths` (longest
 /// matching prefix wins, TypeScript semantics), then `baseUrl`
 /// fallback for unmatched specifiers.
-fn resolve_js_alias(
-    resolver: &JsResolver,
-    names: &BTreeSet<String>,
-    spec: &str,
-) -> Option<String> {
+fn resolve_js_alias(resolver: &JsResolver, names: &BTreeSet<String>, spec: &str) -> Option<String> {
     if spec.starts_with('#') {
         if let Some(pkg) = &resolver.pkg {
             if let Some(dep) = resolve_patterns(&pkg.patterns, &pkg.base, names, spec) {
@@ -1673,7 +1866,10 @@ fn resolve_js_alias(
             return Some(dep);
         }
         // baseUrl fallback applies only to specifiers no pattern matched.
-        let matched = ts.patterns.iter().any(|p| pattern_star_text(p, spec).is_some());
+        let matched = ts
+            .patterns
+            .iter()
+            .any(|p| pattern_star_text(p, spec).is_some());
         if ts.has_base_url && !matched {
             if let Some(norm) = normalize_rel(&ts.base, spec.trim_start_matches('/')) {
                 return resolve_js(names, &norm);

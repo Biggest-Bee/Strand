@@ -17,11 +17,7 @@ pub enum Diagram {
 
 /// Collect the edges of `g` whose both endpoints are in `nodes`,
 /// deduplicated and capped at `max_edges`. Returns (edges, truncated).
-pub fn edges_within(
-    g: &Graph,
-    nodes: &BTreeSet<u32>,
-    max_edges: usize,
-) -> (Vec<(u32, u32)>, bool) {
+pub fn edges_within(g: &Graph, nodes: &BTreeSet<u32>, max_edges: usize) -> (Vec<(u32, u32)>, bool) {
     let mut edges = BTreeSet::new();
     let mut truncated = false;
     'outer: for &id in nodes {
@@ -50,18 +46,20 @@ pub fn render(
     // Deterministic id assignment sorted by node name.
     let mut sorted: Vec<u32> = nodes.iter().copied().collect();
     sorted.sort_by(|&a, &b| g.node_name(a).cmp(g.node_name(b)));
-    let ids: std::collections::HashMap<u32, usize> = sorted
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, i))
-        .collect();
+    let ids: std::collections::HashMap<u32, usize> =
+        sorted.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
     let mut out = String::new();
     match fmt {
         Diagram::Dot => {
             out.push_str("digraph strand {\n  rankdir=LR;\n");
             for &id in &sorted {
-                let _ = writeln!(out, "  n{} [label=\"{}\"];", ids[&id], dot_escape(g.node_name(id)));
+                let _ = writeln!(
+                    out,
+                    "  n{} [label=\"{}\"];",
+                    ids[&id],
+                    dot_escape(g.node_name(id))
+                );
             }
             for &(a, b) in edges {
                 let _ = writeln!(out, "  n{} -> n{};", ids[&a], ids[&b]);

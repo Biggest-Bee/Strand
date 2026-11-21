@@ -180,9 +180,8 @@ pub fn load_rules(path: Option<&Path>, dir: &Path) -> Result<Vec<Rule>> {
     let p = path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| dir.join("strand.rules"));
-    let text = std::fs::read_to_string(&p).map_err(|e| {
-        Error::Usage(format!("cannot read rules file {}: {e}", p.display()))
-    })?;
+    let text = std::fs::read_to_string(&p)
+        .map_err(|e| Error::Usage(format!("cannot read rules file {}: {e}", p.display())))?;
     parse_rules(&text)
 }
 

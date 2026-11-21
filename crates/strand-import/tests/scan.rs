@@ -14,7 +14,11 @@ fn w(root: &Path, rel: &str, text: &str) {
 /// Fixture project exercising mod decls, crate::/self::/super:: paths,
 /// cross-file `use`, external-crate ignores, and dir skipping.
 fn fixture(root: &Path) {
-    w(root, "Cargo.toml", "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n");
+    w(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n",
+    );
     w(
         root,
         "src/lib.rs",
@@ -30,7 +34,11 @@ fn fixture(root: &Path) {
         "src/bar/mod.rs",
         "use super::foo::X;\nuse self::inner::Y;\nmod inner;\npub struct Thing;\n",
     );
-    w(root, "src/bar/inner.rs", "use crate::foo::X;\npub struct Y;\n");
+    w(
+        root,
+        "src/bar/inner.rs",
+        "use crate::foo::X;\npub struct Y;\n",
+    );
     // Must be skipped entirely.
     w(root, "target/junk.rs", "use crate::foo::X;\n");
     w(root, "node_modules/dep.rs", "mod nothing;\n");
@@ -66,12 +74,17 @@ fn scan_resolves_mod_and_use() {
 
     // External crates and comments produce no edges.
     assert!(!edges.iter().any(|(_, d)| d.contains("std")));
-    assert!(!edges.iter().any(|(s, _)| s.contains("junk") || s.contains("dep")));
+    assert!(!edges
+        .iter()
+        .any(|(s, _)| s.contains("junk") || s.contains("dep")));
 
     // Every .rs file except skipped dirs is a node.
     assert!(out.nodes.contains(&"src/lib.rs".to_string()));
     assert!(out.nodes.contains(&"src/bar/inner.rs".to_string()));
-    assert!(!out.nodes.iter().any(|n| n.contains("target") || n.contains("node_modules")));
+    assert!(!out
+        .nodes
+        .iter()
+        .any(|n| n.contains("target") || n.contains("node_modules")));
 }
 
 #[test]
@@ -89,8 +102,16 @@ fn scan_dedups_edges() {
 fn scan_rust_path_attr_and_include() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    w(root, "src/lib.rs", "#[path = \"deep/hidden.rs\"]\nmod secret;\nmod real;\n");
-    w(root, "src/deep/hidden.rs", "include!(\"gen/included.rs\");\n");
+    w(
+        root,
+        "src/lib.rs",
+        "#[path = \"deep/hidden.rs\"]\nmod secret;\nmod real;\n",
+    );
+    w(
+        root,
+        "src/deep/hidden.rs",
+        "include!(\"gen/included.rs\");\n",
+    );
     w(root, "src/deep/gen/included.rs", "pub fn f() {}\n");
     w(root, "src/real.rs", "pub fn r() {}\n");
     let out = scan_rust(root).unwrap();
@@ -114,7 +135,11 @@ fn scan_python_imports() {
     w(root, "pkg/util.py", "def thing(): pass\n");
     w(root, "pkg/helper.py", "");
     w(root, "other.py", "");
-    w(root, "top.py", "from pkg import mod\nimport pkg.util as u\n");
+    w(
+        root,
+        "top.py",
+        "from pkg import mod\nimport pkg.util as u\n",
+    );
     let out = scan_lang(root, Lang::Python).unwrap();
     let edges = edges_of(&out);
     let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
@@ -125,7 +150,7 @@ fn scan_python_imports() {
     assert!(has("pkg/mod.py", "other.py")); // from ..other import x
     assert!(has("top.py", "pkg/mod.py")); // from pkg import mod (submodule)
     assert!(has("top.py", "pkg/util.py")); // import pkg.util
-    // stdlib `os` produces no edge.
+                                           // stdlib `os` produces no edge.
     assert!(!edges.iter().any(|(_, d)| d.contains("os")));
 }
 
@@ -137,7 +162,11 @@ fn scan_python_nested_package_root() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     w(root, "proj/proj/__init__.py", "");
-    w(root, "proj/proj/core.py", "from proj import util\nimport proj.helpers\n");
+    w(
+        root,
+        "proj/proj/core.py",
+        "from proj import util\nimport proj.helpers\n",
+    );
     w(root, "proj/proj/util.py", "");
     w(root, "proj/proj/helpers.py", "");
     w(root, "proj/run.py", "import proj.core\n");
@@ -189,7 +218,7 @@ fn scan_js_imports() {
     assert!(has("src/index.ts", "src/side.js"));
     assert!(has("src/index.ts", "src/b.tsx"));
     assert!(has("src/index.ts", "src/c/index.ts")); // directory index resolution
-    // 'react' is a bare specifier -> ignored.
+                                                    // 'react' is a bare specifier -> ignored.
     assert!(!edges.iter().any(|(_, d)| d.contains("react")));
 }
 
@@ -248,10 +277,7 @@ fn scan_js_tsconfig_extends() {
     let edges = edges_of(&out);
     // Parent's `paths` inherited; targets resolve against child's
     // effective baseUrl (src) -> src/core/thing.ts.
-    assert!(edges.contains(&(
-        "src/app.ts".to_string(),
-        "src/core/thing.ts".to_string()
-    )));
+    assert!(edges.contains(&("src/app.ts".to_string(), "src/core/thing.ts".to_string())));
 }
 
 #[test]
@@ -286,17 +312,35 @@ fn scan_js_tsconfig_jsonc_and_monorepo() {
     );
     w(root, "shared/util.ts", "export const u = 1;\n");
     w(root, "top.ts", "import { u } from '@root/util';\n");
-    w(root, "packages/app/src/index.ts", "import { l } from '@app/lib/local';\n");
-    w(root, "packages/app/src/lib/local.ts", "export const l = 1;\n");
-    w(root, "packages/lib/src/index.ts", "import { l } from '@lib/thing';\n");
+    w(
+        root,
+        "packages/app/src/index.ts",
+        "import { l } from '@app/lib/local';\n",
+    );
+    w(
+        root,
+        "packages/app/src/lib/local.ts",
+        "export const l = 1;\n",
+    );
+    w(
+        root,
+        "packages/lib/src/index.ts",
+        "import { l } from '@lib/thing';\n",
+    );
     w(root, "packages/lib/src/thing.ts", "export const l = 2;\n");
     let out = scan_lang(root, Lang::Js).unwrap();
     let edges = edges_of(&out);
     let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
 
     assert!(has("top.ts", "shared/util.ts")); // root tsconfig, JSONC parsed
-    assert!(has("packages/app/src/index.ts", "packages/app/src/lib/local.ts"));
-    assert!(has("packages/lib/src/index.ts", "packages/lib/src/thing.ts"));
+    assert!(has(
+        "packages/app/src/index.ts",
+        "packages/app/src/lib/local.ts"
+    ));
+    assert!(has(
+        "packages/lib/src/index.ts",
+        "packages/lib/src/thing.ts"
+    ));
     // packages/lib sees only its own config: exactly one edge, to thing.ts.
     let lib_edges: Vec<_> = edges
         .iter()
@@ -321,7 +365,11 @@ fn scan_js_package_json_imports() {
             }
         }"##,
     );
-    w(root, "src/main.ts", "import { u } from '#util';\nimport { f } from '#feat/x';\n");
+    w(
+        root,
+        "src/main.ts",
+        "import { u } from '#util';\nimport { f } from '#feat/x';\n",
+    );
     w(root, "src/util.ts", "export const u = 1;\n");
     w(root, "src/feat/x.ts", "export const f = 1;\n");
     let out = scan_lang(root, Lang::Js).unwrap();
@@ -379,11 +427,7 @@ fn scan_rust_grouped_use_trees() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     w(root, "Cargo.toml", "[package]\nname = \"p\"\n");
-    w(
-        root,
-        "src/lib.rs",
-        "mod m;\nmod n;\n",
-    );
+    w(root, "src/lib.rs", "mod m;\nmod n;\n");
     w(root, "src/m.rs", "pub mod a;\npub mod b;\n");
     w(root, "src/m/a.rs", "pub struct A;\n");
     w(root, "src/m/b.rs", "pub struct B;\n");
@@ -491,9 +535,9 @@ fn scan_python_dynamic_import_literals() {
             "from importlib import import_module\n",
             "import_module(\"pkg.plugins.oauth\")\n",
             "__import__('pkg.core')\n",
-            "import_module('pkg.' + name)\n",   // not literal: ignored
-            "import_module(f'pkg.{name}')\n",   // f-string: ignored
-            "obj.import_module('pkg.core')\n",  // attribute call: edge
+            "import_module('pkg.' + name)\n", // not literal: ignored
+            "import_module(f'pkg.{name}')\n", // f-string: ignored
+            "obj.import_module('pkg.core')\n", // attribute call: edge
         ),
     );
     let out = scan_lang(root, Lang::Python).unwrap();
@@ -503,7 +547,7 @@ fn scan_python_dynamic_import_literals() {
     assert!(has("pkg/plugins/ldap.py"));
     assert!(has("pkg/plugins/oauth.py"));
     assert!(has("pkg/core.py")); // __import__ + attribute call (deduped)
-    // Exactly three distinct deps - dynamic non-literals add nothing.
+                                 // Exactly three distinct deps - dynamic non-literals add nothing.
     assert_eq!(
         edges.iter().filter(|(s, _)| s == "pkg/loader.py").count(),
         3,
@@ -580,9 +624,9 @@ fn scan_python_setup_entry_points() {
             "    \"myapp.plugins\": [\"ldap = pkg.a:Plugin\"],\n",
             "    \"extra\": [\"c = pkg.c:Plugin\"],\n",
             "})\n",
-            "setup(entry_points=EPS)\n",      // variable ref
-            "setup(entry_points=ALIAS)\n",    // chained alias
-            "setup(entry_points=MORE)\n",     // dict() call
+            "setup(entry_points=EPS)\n",         // variable ref
+            "setup(entry_points=ALIAS)\n",       // chained alias
+            "setup(entry_points=MORE)\n",        // dict() call
             "setup(entry_points=build_eps())\n", // dynamic: invisible
         ),
     );
@@ -595,7 +639,7 @@ fn scan_python_setup_entry_points() {
     assert!(has("setup.py", "pkg/a.py")); // literal dict
     assert!(has("setup.py", "pkg/c.py")); // second setup() call
     assert!(has("setup.py", "pkg/b.py")); // via dict() call alias
-    // pkg/d.py is only reachable through build_eps() - stays invisible.
+                                          // pkg/d.py is only reachable through build_eps() - stays invisible.
     assert!(!has("setup.py", "pkg/d.py"));
     assert!(out.nodes.contains(&"setup.cfg".to_string()));
     assert!(out.nodes.contains(&"setup.py".to_string()));
@@ -650,4 +694,139 @@ fn scan_own_repo_is_sane() {
     assert!(out.edges.iter().any(|(s, d, _)| {
         s == "crates/strand-gui/src/main.rs" && d == "crates/strand-store/src/lib.rs"
     }));
+}
+
+#[test]
+fn scan_python_dynamic_site_warnings() {
+    // Non-literal dynamic imports can't resolve - the scanner must warn
+    // per file instead of silently dropping the edge. Literal calls
+    // still resolve and produce no warning.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/a.py", "");
+    w(root, "pkg/b.py", "");
+    w(
+        root,
+        "pkg/loader.py",
+        concat!(
+            "from importlib import import_module\n",
+            "import_module('pkg.a')\n",      // literal: edge, no warning
+            "import_module(name)\n",         // variable: dynamic
+            "import_module('pkg.' + mod)\n", // concat: dynamic
+            "import_module(f'pkg.{mod}')\n", // f-string: dynamic
+            "__import__(target)\n",          // dynamic
+        ),
+    );
+    w(root, "pkg/quiet.py", "import pkg.a\n");
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    assert!(edges.contains(&("pkg/loader.py".to_string(), "pkg/a.py".to_string())));
+    assert_eq!(out.warnings.len(), 1, "warnings: {:?}", out.warnings);
+    assert!(
+        out.warnings[0].contains("pkg/loader.py")
+            && out.warnings[0].contains("4 dynamic import site(s)"),
+        "warning: {}",
+        out.warnings[0]
+    );
+    assert!(
+        !out.warnings.iter().any(|w| w.contains("quiet.py")),
+        "clean file warned: {:?}",
+        out.warnings
+    );
+}
+
+#[test]
+fn scan_python_manual_depends_on() {
+    // `# strand: depends-on <target>` is the escape hatch for edges
+    // static analysis can't see. Paths resolve relative to the file's
+    // dir; dotted module paths also work. Missing targets are skipped.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/target.py", "");
+    w(root, "pkg/sub/inner.py", "");
+    w(root, "pkg/dynamic.py", "");
+    w(
+        root,
+        "pkg/loader.py",
+        concat!(
+            "import importlib\n",
+            "import_module(name)  # runtime picks the module\n",
+            "# strand: depends-on pkg/target.py\n",
+            "# strand: depends-on pkg.dotted_module\n", // unresolvable: skip
+            "# strand: depends-on does/not/exist.py\n", // missing: skip
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    assert!(
+        edges.contains(&("pkg/loader.py".to_string(), "pkg/target.py".to_string())),
+        "manual edge missing: {edges:?}"
+    );
+    // Dynamic site still warns even though the manual edge covers it.
+    assert!(out.warnings.iter().any(|w| w.contains("loader.py")));
+}
+
+#[test]
+fn scan_python_manual_depends_on_relative() {
+    // Relative path form resolves against the file's directory.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/util.py", "");
+    w(root, "pkg/sub/mod.py", "# strand: depends-on ../util.py\n");
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    assert!(
+        edges.contains(&("pkg/sub/mod.py".to_string(), "pkg/util.py".to_string())),
+        "relative manual edge missing: {edges:?}"
+    );
+}
+
+#[test]
+fn scan_js_dynamic_warnings_and_manual() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "src/a.ts", "export const a = 1;\n");
+    w(root, "src/b.ts", "export const b = 1;\n");
+    w(
+        root,
+        "src/index.ts",
+        concat!(
+            "import('./literal-rel');\n",     // literal dynamic: edge
+            "import(name)\n",                 // variable: dynamic site
+            "const r = require(someVar);\n",  // dynamic site
+            "// strand: depends-on ./b.ts\n", // manual edge
+        ),
+    );
+    w(root, "src/literal-rel.ts", "export const l = 1;\n");
+    let out = scan_lang(root, Lang::Js).unwrap();
+    let edges = edges_of(&out);
+    let has = |d: &str| edges.contains(&("src/index.ts".to_string(), d.to_string()));
+    assert!(has("src/literal-rel.ts"));
+    assert!(has("src/b.ts"), "manual edge missing: {edges:?}");
+    assert_eq!(out.warnings.len(), 1, "warnings: {:?}", out.warnings);
+    assert!(
+        out.warnings[0].contains("src/index.ts")
+            && out.warnings[0].contains("2 dynamic import site(s)"),
+        "warning: {}",
+        out.warnings[0]
+    );
+}
+
+#[test]
+fn scan_rust_manual_depends_on() {
+    // Same escape hatch for Rust files.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "src/lib.rs", "mod a;\n");
+    w(root, "src/a.rs", "// strand: depends-on src/b.rs\n");
+    w(root, "src/b.rs", "pub fn f() {}\n");
+    let out = scan_rust(root).unwrap();
+    let edges = edges_of(&out);
+    assert!(
+        edges.contains(&("src/a.rs".to_string(), "src/b.rs".to_string())),
+        "rust manual edge missing: {edges:?}"
+    );
 }
