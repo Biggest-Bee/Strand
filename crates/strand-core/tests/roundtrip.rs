@@ -230,6 +230,35 @@ fn confidence_view_filters_traversal() {
 }
 
 #[test]
+fn weighted_path_respects_min_confidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    // a->b (w1, Static), b->c (w1, Heuristic), a->c (w5, Static).
+    // Unfiltered cheapest a->c is via b (cost 2); filtered it's direct (5).
+    b.add_edge_weighted_kind("a", "b", 1.0, EdgeKind::Static);
+    b.add_edge_weighted_kind("b", "c", 1.0, EdgeKind::Heuristic);
+    b.add_edge_weighted_kind("a", "c", 5.0, EdgeKind::Static);
+    let p = dir.path().join("wp.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+    let (a, c) = (g.node_id("a").unwrap(), g.node_id("c").unwrap());
+
+    let (path, cost) = strand_core::algo::shortest_path_weighted_csr(&g, a, c).unwrap();
+    assert_eq!(path.len(), 3);
+    assert_eq!(cost, 2.0);
+
+    let (path, cost) = strand_core::algo::shortest_path_weighted_csr_min(
+        &g,
+        a,
+        c,
+        EdgeKind::Declared.confidence(),
+    )
+    .unwrap();
+    assert_eq!(path, vec![a, c]);
+    assert_eq!(cost, 5.0);
+}
+
+#[test]
 fn isolated_nodes_via_kinds() {
     let dir = tempfile::tempdir().unwrap();
     let mut b = GraphBuilder::new();

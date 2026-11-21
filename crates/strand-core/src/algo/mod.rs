@@ -20,7 +20,7 @@ pub use order::{analyze, BuildOrder};
 pub use pagerank::pagerank;
 pub use path::{
     k_shortest_paths, paths_within_depth, shortest_path, shortest_path_weighted,
-    shortest_path_weighted_csr, PathList,
+    shortest_path_weighted_csr, shortest_path_weighted_csr_min, PathList,
 };
 pub use scc::{condensation, strongly_connected, Condensation};
 pub use sets::{common, reachable_set};

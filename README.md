@@ -197,8 +197,6 @@ strand diff old.strand new.strand
 # cycles, diff, export). E.g. review only human-declared edges:
 strand impact deps.strand my-lib --min-confidence declared
 strand deps deps.strand app --min-confidence static   # literal imports only
-# (note: `why --weighted` uses a specialized CSR path and ignores the
-# filter - use unweighted `why` for confidence-scoped chains)
 ```
 
 Every command accepts `--json` for CI use.

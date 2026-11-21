@@ -400,6 +400,77 @@ pub fn shortest_path_weighted_csr(
     Some((path, dist[to as usize]))
 }
 
+/// [`shortest_path_weighted_csr`] with an edge-confidence floor:
+/// edges whose [`crate::EdgeKind`] tag is below `min` are skipped.
+/// `min == 0` traverses everything (identical to the unfiltered call).
+pub fn shortest_path_weighted_csr_min(
+    graph: &crate::Graph,
+    from: u32,
+    to: u32,
+    min: u8,
+) -> Option<(Vec<u32>, f64)> {
+    if min == 0 {
+        return shortest_path_weighted_csr(graph, from, to);
+    }
+    if from == to {
+        return Some((vec![from], 0.0));
+    }
+    let n = graph.n_nodes() as usize;
+    if from as usize >= n || to as usize >= n {
+        return None;
+    }
+    let mut dist = vec![f64::INFINITY; n];
+    let mut parent = vec![UNVISITED; n];
+    let mut heap = BinaryHeap::new();
+    dist[from as usize] = 0.0;
+    heap.push(State {
+        cost: 0.0,
+        node: from,
+    });
+    while let Some(State { cost, node }) = heap.pop() {
+        if cost > dist[node as usize] {
+            continue;
+        }
+        if node == to {
+            break;
+        }
+        let targets = graph.out_targets(node);
+        let weights = graph.out_weights(node);
+        let kinds = graph.out_kinds(node);
+        for (i, &w) in targets.iter().enumerate() {
+            let tag = kinds.and_then(|ks| ks.get(i).copied()).unwrap_or(4);
+            if crate::EdgeKind::from_tag(tag).confidence() < min {
+                continue;
+            }
+            let wi = w as usize;
+            if wi >= n {
+                continue;
+            }
+            let weight = weights.map(|ws| ws[i] as f64).unwrap_or(1.0);
+            if weight < 0.0 {
+                continue;
+            }
+            let nd = cost + weight;
+            if nd < dist[wi] {
+                dist[wi] = nd;
+                parent[wi] = node;
+                heap.push(State { cost: nd, node: w });
+            }
+        }
+    }
+    if !dist[to as usize].is_finite() {
+        return None;
+    }
+    let mut path = vec![to];
+    let mut cur = to;
+    while cur != from {
+        cur = parent[cur as usize];
+        path.push(cur);
+    }
+    path.reverse();
+    Some((path, dist[to as usize]))
+}
+
 #[derive(Clone, Copy)]
 struct State {
     cost: f64,

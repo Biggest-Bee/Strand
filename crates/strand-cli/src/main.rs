@@ -1155,7 +1155,7 @@ fn cmd_why(a: WhyArgs) -> strand_core::Result<()> {
     }
 
     if a.weighted {
-        return match algo::shortest_path_weighted_csr(&g, from, to) {
+        return match algo::shortest_path_weighted_csr_min(&g, from, to, a.conf.min()) {
             Some((path, cost)) => {
                 let names = names_of(&g, &path);
                 if a.json {
@@ -1511,7 +1511,7 @@ fn cmd_export(a: ExportArgs) -> strand_core::Result<()> {
         let from = node_id(&g, &w[0])?;
         let to = node_id(&g, &w[1])?;
         let path = if a.weighted {
-            algo::shortest_path_weighted_csr(&g, from, to).map(|(p, _)| p)
+            algo::shortest_path_weighted_csr_min(&g, from, to, a.conf.min()).map(|(p, _)| p)
         } else {
             algo::shortest_path(&ConfidenceView::new(&g, a.conf.min()), from, to)
         };
