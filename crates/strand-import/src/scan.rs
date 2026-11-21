@@ -706,6 +706,14 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool) {
                     out.push(PyRef::From { level, segs, names });
                 }
             }
+            "call" => {
+                // Dynamic imports with literal arguments:
+                // `import_module("a.b")`, `importlib.import_module("a.b")`,
+                // `__import__("a.b")`. Non-literal args stay invisible.
+                if let Some(segs) = py_dyn_import_segs(node, text) {
+                    out.push(PyRef::Import(segs));
+                }
+            }
             _ => {}
         }
         let mut c = node.walk();
@@ -749,6 +757,70 @@ fn rel_mod_segs(node: tree_sitter::Node, text: &str) -> Option<(usize, Vec<Strin
             .collect()
     };
     Some((level, segs))
+}
+
+/// Dotted module path from a dynamic-import call:
+/// `import_module("a.b")`, `importlib.import_module("a.b")`,
+/// `__import__("a.b")`. Returns `None` for non-literal or
+/// non-module-looking arguments.
+fn py_dyn_import_segs(call: tree_sitter::Node, text: &str) -> Option<Vec<String>> {
+    let func = call.child_by_field_name("function")?;
+    let func_text = func.utf8_text(text.as_bytes()).ok()?;
+    let is_dyn = func_text == "__import__"
+        || func_text == "import_module"
+        || func_text.ends_with(".import_module")
+        || func_text.ends_with(".__import__");
+    if !is_dyn {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for arg in args.children(&mut cursor) {
+        if arg.kind() != "string" {
+            continue;
+        }
+        let inner = py_string_inner(arg, text)?;
+        // f-strings interpolate; a "{" means the path isn't literal.
+        if inner.contains('{') {
+            return None;
+        }
+        let segs: Vec<String> = inner
+            .split('.')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        let valid = !segs.is_empty()
+            && segs
+                .iter()
+                .all(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        return valid.then_some(segs);
+    }
+    None
+}
+
+/// String literal content without quotes or prefix (`r"x"`, `'''x'''`).
+fn py_string_inner(node: tree_sitter::Node, text: &str) -> Option<String> {
+    let raw = node.utf8_text(text.as_bytes()).ok()?;
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    // Skip string prefix chars (r, b, f, u and uppercase combos).
+    while i < bytes.len() && matches!(bytes[i], b'r' | b'R' | b'b' | b'B' | b'f' | b'F' | b'u' | b'U') {
+        i += 1;
+    }
+    let rest = &raw[i..];
+    let quote_len = if rest.starts_with("'''") || rest.starts_with("\"\"\"") {
+        3
+    } else if rest.starts_with('\'') || rest.starts_with('"') {
+        1
+    } else {
+        return None;
+    };
+    let inner = &rest[quote_len..];
+    inner
+        .get(..inner.len().saturating_sub(quote_len))
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn scan_python_impl(root: &Path) -> Result<ScanOutput> {

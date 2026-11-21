@@ -340,11 +340,11 @@ the merged view vs the same BFS on the bare `Graph`):
 | View | time |
 |---|---|
 | pure CSR `Graph` | ~7 µs |
-| store snapshot, empty delta | ~8–11 µs |
-| store snapshot, 200-edge delta | ~9–23 µs |
+| store snapshot, empty delta | ~8-11 µs |
+| store snapshot, 200-edge delta | ~9-23 µs |
 
 Timings are microseconds on a small graph and fluctuate run-to-run; the
-structural point is that the empty-delta path is within ~10–20% of pure CSR
+structural point is that the empty-delta path is within ~10-20% of pure CSR
 and the merge cost is proportional to delta-touched nodes, not graph size.
 Reproduce: `cargo bench -p strand-store`.
 
@@ -542,7 +542,8 @@ cargo test
   tree-sitter for Python and JS/TS - so comments, string literals, and
   grouped `use` trees (`use a::{b, c::d}`) are handled by the grammar,
   not text matching. It handles `mod`/`use`/`#[path]`/`include!` (Rust),
-  `import`/`from` incl. relative imports (Python), and
+  `import`/`from` incl. relative imports and literal
+  `import_module()`/`__import__()` calls (Python), and
   `import`/`export-from`/`require`/dynamic `import()` (JS/TS),
   including `tsconfig`/`jsconfig` `paths` aliases and
   `baseUrl` (JSONC-tolerant, `extends` chains followed, nearest config
@@ -552,7 +553,10 @@ cargo test
   macro-generated modules (a real parser can't see
   them either without expanding macros - `cargo expand` output is a
   workaround for inspection, not for scanning), `include_str!` payloads,
-  and dynamic language tricks. Nodes are file
+  and dynamic language tricks - computed module names
+  (`import_module('pkg.' + name)`), `importlib.metadata` entry-point
+  plugins, and `getattr`-based dispatch stay invisible, so runtime-only
+  dependencies can be missed. Nodes are file
   paths, so it answers "what breaks if I change `src/foo.rs`?" -
   package-level questions still want `cargo metadata` input.
   Unresolvable imports and third-party packages are dropped entirely

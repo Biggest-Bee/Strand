@@ -472,6 +472,46 @@ fn scan_python_ignores_docstring_imports() {
 }
 
 #[test]
+fn scan_python_dynamic_import_literals() {
+    // import_module/__import__ with literal string args resolve like
+    // normal imports; non-literal args stay invisible.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/plugins/__init__.py", "");
+    w(root, "pkg/plugins/ldap.py", "");
+    w(root, "pkg/plugins/oauth.py", "");
+    w(root, "pkg/core.py", "");
+    w(
+        root,
+        "pkg/loader.py",
+        concat!(
+            "import importlib\n",
+            "importlib.import_module('pkg.plugins.ldap')\n",
+            "from importlib import import_module\n",
+            "import_module(\"pkg.plugins.oauth\")\n",
+            "__import__('pkg.core')\n",
+            "import_module('pkg.' + name)\n",   // not literal: ignored
+            "import_module(f'pkg.{name}')\n",   // f-string: ignored
+            "obj.import_module('pkg.core')\n",  // attribute call: edge
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |d: &str| edges.contains(&("pkg/loader.py".to_string(), d.to_string()));
+
+    assert!(has("pkg/plugins/ldap.py"));
+    assert!(has("pkg/plugins/oauth.py"));
+    assert!(has("pkg/core.py")); // __import__ + attribute call (deduped)
+    // Exactly three distinct deps - dynamic non-literals add nothing.
+    assert_eq!(
+        edges.iter().filter(|(s, _)| s == "pkg/loader.py").count(),
+        3,
+        "unexpected edges: {edges:?}"
+    );
+}
+
+#[test]
 fn scan_js_ignores_strings_and_comments() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

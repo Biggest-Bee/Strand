@@ -182,6 +182,8 @@ struct StrandApp {
     update_rx: Option<Receiver<Option<Vec<update_check::Update>>>>,
     /// Newer-version notice text, once known.
     update_note: Option<String>,
+    /// When to re-run the update check (every 10 minutes).
+    update_next_check: std::time::Instant,
     /// In-flight worker analysis; latest request wins.
     analysis_rx: Option<Receiver<AnalysisResult>>,
     /// In-flight focus-layout BFS (depths only, no report).
@@ -547,6 +549,8 @@ impl StrandApp {
             show_instructions: false,
             update_rx: Some(update_check::spawn()),
             update_note: None,
+            update_next_check: std::time::Instant::now()
+                + std::time::Duration::from_secs(600),
             analysis_rx: None,
             depths_rx: None,
             names_rx: None,
@@ -1872,6 +1876,16 @@ impl eframe::App for StrandApp {
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.update_rx = None,
             }
+        }
+
+        // Re-check crates.io every 10 minutes while the app is open -
+        // there is no command to trigger it like the CLI has.
+        if self.update_rx.is_none()
+            && std::time::Instant::now() >= self.update_next_check
+        {
+            self.update_rx = Some(update_check::spawn());
+            self.update_next_check =
+                std::time::Instant::now() + std::time::Duration::from_secs(600);
         }
 
         self.poll_workers();
