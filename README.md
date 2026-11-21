@@ -128,9 +128,12 @@ strand scan ./my-project -o deps.strand
 
 # Rust (mod/use/#[path]/include!/...crate paths), Python (import/from,
 # relative + absolute imports resolved against ancestor dirs so nested
-# package roots like repo/pkg/pkg/ work), JS/TS (import/export-from/
-# require, index resolution, tsconfig/jsconfig paths+extends+baseUrl,
-# package.json "imports").
+# package roots like repo/pkg/pkg/ work, literal import_module()/
+# __import__() calls, and entry points from pyproject.toml/setup.cfg/
+# setup.py - variable-referenced dicts included), JS/TS
+# (import/export-from/require, index resolution,
+# tsconfig/jsconfig paths+extends+baseUrl, package.json "imports").
+# A file argument scans its project root (nearest ancestor manifest).
 # --lang rust|python|js restricts to one language; default scans all.
 strand scan ./my-project --lang python -o pydeps.strand
 
