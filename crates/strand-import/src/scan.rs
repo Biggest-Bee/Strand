@@ -14,7 +14,7 @@
 //! Macros that expand to modules are not followed. External crates and
 //! node_modules packages are ignored.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -814,14 +814,20 @@ fn ts_call_spec(call: tree_sitter::Node, src: &str) -> Option<String> {
 }
 
 /// All module specifiers in JS/TS source, via tree-sitter.
-/// Returns `(specs, had_error, dynamic)` - `had_error` means the tree
-/// contains ERROR nodes; `dynamic` counts `import(expr)`/`require(expr)`
-/// calls with non-literal args (invisible edges).
-fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, bool, usize) {
+/// Returns `(specs, globs, had_error, dynamic)` - `had_error` means the
+/// tree contains ERROR nodes; `dynamic` counts `import(expr)`/`require(expr)`
+/// calls with non-literal args (invisible edges); `globs` holds bundler-style
+/// patterns (`require.context`, `import.meta.glob`, template/concat dynamic
+/// imports) expanded against the scanned file set by the caller.
+fn js_import_specs_ts(
+    text: &str,
+    lang: tree_sitter::Language,
+) -> (Vec<String>, Vec<String>, bool, usize) {
     let mut specs = Vec::new();
+    let mut globs = Vec::new();
     let mut dynamic = 0usize;
     let Some(tree) = parse_ts(text, lang) else {
-        return (specs, true, dynamic);
+        return (specs, globs, true, dynamic);
     };
     let had_error = tree.root_node().has_error();
     let mut stack = vec![tree.root_node()];
@@ -835,8 +841,16 @@ fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, 
             "call_expression" => {
                 if let Some(s) = ts_call_spec(node, text) {
                     specs.push(s);
-                } else if ts_is_dynamic_call(node, text) {
-                    dynamic += 1;
+                } else {
+                    match ts_glob_spec(node, text) {
+                        TsGlob::Patterns(p) => globs.extend(p),
+                        TsGlob::Dynamic => dynamic += 1,
+                        TsGlob::NotGlob => {
+                            if ts_is_dynamic_call(node, text) {
+                                dynamic += 1;
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -846,7 +860,276 @@ fn js_import_specs_ts(text: &str, lang: tree_sitter::Language) -> (Vec<String>, 
             stack.push(child);
         }
     }
-    (specs, had_error, dynamic)
+    (specs, globs, had_error, dynamic)
+}
+
+/// Outcome of checking a call for bundler-style glob loading.
+enum TsGlob {
+    /// Resolved glob patterns to expand against the file set.
+    Patterns(Vec<String>),
+    /// A glob-shaped call whose pattern can't be statically resolved.
+    Dynamic,
+    /// Not a glob-loading call at all.
+    NotGlob,
+}
+
+/// `require.context(dir, ...)`, `import.meta.glob(pat | [pats])`, and
+/// `import()`/`require()` with a template or `+`-concatenated spec that
+/// has a static directory anchor - the cases bundlers turn into
+/// context modules.
+fn ts_glob_spec(call: tree_sitter::Node, src: &str) -> TsGlob {
+    let Some(func) = call.child_by_field_name("function") else {
+        return TsGlob::NotGlob;
+    };
+    let Ok(ft) = func.utf8_text(src.as_bytes()) else {
+        return TsGlob::NotGlob;
+    };
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return TsGlob::NotGlob;
+    };
+
+    if ft == "require.context" {
+        // require.context('./dir', recursive?, regex?) - the regex is
+        // approximated away: `names` only holds JS/TS files anyway.
+        let dir = {
+            let mut c = args.walk();
+            let found = args
+                .children(&mut c)
+                .find(|c| !matches!(c.kind(), "(" | ")" | ","))
+                .and_then(|a| ts_string_literal(a, src));
+            found
+        };
+        return match dir {
+            Some(d) => {
+                // Second arg `false` means non-recursive.
+                let recursive = {
+                    let mut c = args.walk();
+                    let second = args
+                        .children(&mut c)
+                        .filter(|c| !matches!(c.kind(), "(" | ")" | ","))
+                        .nth(1);
+                    second.map(|n| n.kind() != "false").unwrap_or(true)
+                };
+                let pat = if recursive {
+                    format!("{d}/**/*")
+                } else {
+                    format!("{d}/*")
+                };
+                TsGlob::Patterns(vec![pat])
+            }
+            None => TsGlob::Dynamic,
+        };
+    }
+
+    if ft == "import.meta.glob" {
+        // import.meta.glob('./a/*.ts') or an array of patterns.
+        let mut pats = Vec::new();
+        let mut dyn_seen = false;
+        {
+            let mut c = args.walk();
+            for a in args
+                .children(&mut c)
+                .filter(|c| !matches!(c.kind(), "(" | ")" | ","))
+            {
+                collect_glob_arg(a, src, &mut pats, &mut dyn_seen);
+            }
+        }
+        if dyn_seen && pats.is_empty() {
+            return TsGlob::Dynamic;
+        }
+        return if pats.is_empty() {
+            TsGlob::Dynamic
+        } else {
+            TsGlob::Patterns(pats)
+        };
+    }
+
+    // import()/require() with a non-plain-literal spec: template with
+    // substitution or `+` concatenation.
+    let is_require = func.kind() == "identifier" && ft == "require";
+    let is_dyn_import = func.kind() == "import";
+    if !is_require && !is_dyn_import {
+        return TsGlob::NotGlob;
+    }
+    let arg = {
+        let mut c = args.walk();
+        let found = args
+            .children(&mut c)
+            .find(|c| !matches!(c.kind(), "(" | ")" | ","));
+        found
+    };
+    let Some(arg) = arg else {
+        return TsGlob::Dynamic;
+    };
+    match ts_spec_pattern(arg, src) {
+        Some(pat) => {
+            // Needs a directory anchor - `*.js` alone would match
+            // every sibling file.
+            if pat.contains('/') {
+                TsGlob::Patterns(vec![pat])
+            } else {
+                TsGlob::Dynamic
+            }
+        }
+        None => TsGlob::Dynamic,
+    }
+}
+
+/// String literal text of a `string` node (quotes stripped), or a
+/// `template_string` with no substitutions.
+fn ts_string_literal(node: tree_sitter::Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "string" => spec_text(node, src),
+        "template_string" => {
+            let has_sub = {
+                let mut c = node.walk();
+                let found = node
+                    .children(&mut c)
+                    .any(|ch| ch.kind() == "template_substitution");
+                found
+            };
+            if has_sub {
+                None
+            } else {
+                spec_text(node, src)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Collect glob patterns from an `import.meta.glob` argument: a
+/// string/template, or an array of them.
+fn collect_glob_arg(
+    node: tree_sitter::Node,
+    src: &str,
+    pats: &mut Vec<String>,
+    dyn_seen: &mut bool,
+) {
+    match node.kind() {
+        "string" | "template_string" => {
+            if let Some(s) = ts_string_literal(node, src) {
+                pats.push(s);
+            } else {
+                // Template with substitution inside glob() - treat
+                // interpolation as `*`.
+                if node.kind() == "template_string" {
+                    if let Some(p) = ts_template_pattern(node, src) {
+                        pats.push(p);
+                        return;
+                    }
+                }
+                *dyn_seen = true;
+            }
+        }
+        "array" => {
+            let mut c = node.walk();
+            for ch in node
+                .children(&mut c)
+                .filter(|c| !matches!(c.kind(), "[" | "]" | ","))
+            {
+                collect_glob_arg(ch, src, pats, dyn_seen);
+            }
+        }
+        _ => *dyn_seen = true,
+    }
+}
+
+/// A dynamic-import spec argument -> glob pattern, or `None` when it
+/// has no static anchor at all. Template substitutions and non-literal
+/// `+` operands become `*`.
+fn ts_spec_pattern(node: tree_sitter::Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "template_string" => ts_template_pattern(node, src),
+        "binary_expression" => ts_concat_pattern(node, src),
+        _ => None,
+    }
+}
+
+/// `` `./x/${n}.ts` `` -> `./x/*.ts` (one `*` per substitution).
+fn ts_template_pattern(node: tree_sitter::Node, src: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        match ch.kind() {
+            "string_fragment" => {
+                out.push_str(ch.utf8_text(src.as_bytes()).ok()?);
+            }
+            "template_substitution" => out.push('*'),
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// `'./x/' + n + '.ts'` -> `./x/*.ts`. Returns `None` when no string
+/// literal participates (nothing to anchor the pattern).
+fn ts_concat_pattern(node: tree_sitter::Node, src: &str) -> Option<String> {
+    // Flatten `a + b + c` left-associative tree.
+    fn flat(node: tree_sitter::Node, src: &str, parts: &mut Vec<String>) -> bool {
+        if node.kind() == "binary_expression" {
+            // Only `+` concatenation - other operators aren't specs.
+            let is_plus = {
+                let mut c = node.walk();
+                let found = node.children(&mut c).any(|ch| ch.kind() == "+");
+                found
+            };
+            if !is_plus {
+                return false;
+            }
+            // binary_expression children: left, "+", right - take the
+            // first two operand nodes.
+            let mut c = node.walk();
+            let mut exprs = node
+                .children(&mut c)
+                .filter(|ch| !matches!(ch.kind(), "+" | "(" | ")" | ","));
+            let (Some(l), Some(r)) = (exprs.next(), exprs.next()) else {
+                return false;
+            };
+            return flat(l, src, parts) && flat(r, src, parts);
+        }
+        match node.kind() {
+            "string" => {
+                if let Some(s) = spec_text(node, src) {
+                    parts.push(s);
+                    true
+                } else {
+                    false
+                }
+            }
+            "template_string" => {
+                if let Some(p) = ts_template_pattern(node, src) {
+                    parts.push(p);
+                    true
+                } else {
+                    false
+                }
+            }
+            // Non-literal operand -> wildcard.
+            "identifier"
+            | "member_expression"
+            | "call_expression"
+            | "number"
+            | "parenthesized_expression" => {
+                parts.push("*".to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+    let mut parts = Vec::new();
+    if !flat(node, src, &mut parts) || parts.is_empty() {
+        return None;
+    }
+    // Require at least one literal (non-`*`) part to anchor.
+    if parts.iter().all(|p| p == "*") {
+        return None;
+    }
+    Some(parts.concat())
 }
 
 /// `require(x)` / `import(x)` where the first arg isn't a string or
@@ -896,6 +1179,867 @@ enum PyRef {
         segs: Vec<String>,
         names: Vec<String>,
     },
+    /// `glob.glob("pat")`/`iglob`/`Path.glob` literal patterns -
+    /// resolved against the scanned file set by the caller.
+    Glob(Vec<String>),
+    /// Framework convention lists (`pytest_plugins`,
+    /// `INSTALLED_APPS`): dotted strings resolved as module paths,
+    /// dropping trailing segments for `module:Class`-style entries.
+    Convention(Vec<String>),
+}
+
+// ---------- Python constant propagation ----------
+//
+// Flow-insensitive, per-file "set of possible strings" domain. A name
+// maps to every literal-derived value it could hold; any unresolvable
+// assignment makes the name unknown. Used to resolve computed dynamic
+// imports (`import_module("pkg." + NAME)`) that would otherwise be
+// invisible. Deliberately shallow: no control flow, no calls, no
+// cross-module constants.
+
+/// Cap on set sizes - beyond this a site is treated as dynamic.
+const PY_MAX_STRSET: usize = 64;
+/// Recursion cap for const lookups (cycles, deep chains).
+const PY_MAX_EVAL_DEPTH: u8 = 12;
+
+/// Mutating method names that invalidate a container constant.
+const PY_MUTATORS: &[&str] = &[
+    "append",
+    "extend",
+    "update",
+    "add",
+    "setdefault",
+    "pop",
+    "clear",
+    "remove",
+    "insert",
+    "sort",
+    "reverse",
+];
+
+/// Collected bindings and invalidations for one Python file.
+struct PyEnv<'t> {
+    /// `name = <expr>` right-hand sides (all assignments unioned).
+    assigns: HashMap<String, Vec<tree_sitter::Node<'t>>>,
+    /// `for name in <expr>` iterable expressions.
+    verbind: HashMap<String, Vec<tree_sitter::Node<'t>>>,
+    /// Names that can't be trusted: mutated containers, function
+    /// parameters (shadowing), destructured targets.
+    bad: BTreeSet<String>,
+    memo: std::cell::RefCell<HashMap<String, Option<BTreeSet<String>>>>,
+    visiting: std::cell::RefCell<BTreeSet<String>>,
+}
+
+impl<'t> PyEnv<'t> {
+    fn lookup(&self, name: &str, text: &str) -> Option<BTreeSet<String>> {
+        if self.bad.contains(name) {
+            return None;
+        }
+        if let Some(v) = self.memo.borrow().get(name) {
+            return v.clone();
+        }
+        if !self.visiting.borrow_mut().insert(name.to_string()) {
+            return None; // cycle
+        }
+        let mut out: Option<BTreeSet<String>> = Some(BTreeSet::new());
+        // Every binding source must resolve, or the name is unknown.
+        for expr in self.assigns.get(name).into_iter().flatten() {
+            match py_eval_strset(self, *expr, text, 0) {
+                Some(s) => {
+                    if let Some(o) = out.as_mut() {
+                        o.extend(s);
+                        if o.len() > PY_MAX_STRSET {
+                            out = None;
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    out = None;
+                    break;
+                }
+            }
+        }
+        if out.is_some() {
+            for expr in self.verbind.get(name).into_iter().flatten() {
+                match py_eval_strlist(self, *expr, text, 0) {
+                    Some(items) => {
+                        if let Some(o) = out.as_mut() {
+                            for item in items {
+                                o.extend(item);
+                                if o.len() > PY_MAX_STRSET {
+                                    out = None;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        out = None;
+                        break;
+                    }
+                }
+            }
+        }
+        self.visiting.borrow_mut().remove(name);
+        let result = out.filter(|s| !s.is_empty());
+        self.memo
+            .borrow_mut()
+            .insert(name.to_string(), result.clone());
+        result
+    }
+}
+
+/// Walk the tree once collecting assignments, for-bindings, and
+/// invalidations for the const-prop environment.
+fn build_py_env<'t>(tree: &'t tree_sitter::Tree, text: &str) -> PyEnv<'t> {
+    let _ = text;
+    let mut env = PyEnv {
+        assigns: HashMap::new(),
+        verbind: HashMap::new(),
+        bad: BTreeSet::new(),
+        memo: std::cell::RefCell::new(HashMap::new()),
+        visiting: std::cell::RefCell::new(BTreeSet::new()),
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "assignment" => {
+                if let (Some(l), Some(r)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if l.kind() == "identifier" {
+                        if let Ok(name) = l.utf8_text(text.as_bytes()) {
+                            env.assigns.entry(name.to_string()).or_default().push(r);
+                        }
+                    } else {
+                        poison_target(&mut env.bad, l, text);
+                    }
+                }
+            }
+            "augmented_assignment" => {
+                if let Some(l) = node.child_by_field_name("left") {
+                    poison_target(&mut env.bad, l, text);
+                }
+            }
+            "for_statement" => {
+                if let (Some(l), Some(r)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if l.kind() == "identifier" {
+                        if let Ok(name) = l.utf8_text(text.as_bytes()) {
+                            env.verbind.entry(name.to_string()).or_default().push(r);
+                        }
+                    } else {
+                        poison_target(&mut env.bad, l, text);
+                    }
+                }
+            }
+            "call" => {
+                // `X.append(...)`/`D.update(...)` etc. invalidate X.
+                if let Some(func) = node.child_by_field_name("function") {
+                    if func.kind() == "attribute" {
+                        let attr = func
+                            .child_by_field_name("attribute")
+                            .and_then(|a| a.utf8_text(text.as_bytes()).ok())
+                            .unwrap_or("");
+                        if PY_MUTATORS.contains(&attr) {
+                            if let Some(obj) = func.child_by_field_name("object") {
+                                if obj.kind() == "identifier" {
+                                    if let Ok(name) = obj.utf8_text(text.as_bytes()) {
+                                        env.bad.insert(name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "parameters" | "lambda_parameters" => {
+                poison_params(&mut env.bad, node, text);
+            }
+            _ => {}
+        }
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    env
+}
+
+/// Mark every identifier bound by a non-simple assignment target
+/// (subscripts, attributes, destructuring) as unknown.
+fn poison_target(bad: &mut BTreeSet<String>, node: tree_sitter::Node, text: &str) {
+    // `D["k"] = v` / `O.x = v` poison the base object; `a, b = v`
+    // poisons each destructured name.
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "identifier" {
+            if let Ok(name) = n.utf8_text(text.as_bytes()) {
+                bad.insert(name.to_string());
+            }
+            continue; // don't descend into the identifier itself
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Function/lambda parameter names shadow outer constants - mark
+/// them unknown so a param named like a const can't fake-resolve.
+fn poison_params(bad: &mut BTreeSet<String>, params: tree_sitter::Node, text: &str) {
+    let mut c = params.walk();
+    for child in params.children(&mut c) {
+        match child.kind() {
+            "identifier" => {
+                if let Ok(n) = child.utf8_text(text.as_bytes()) {
+                    bad.insert(n.to_string());
+                }
+            }
+            "keyword_parameter"
+            | "typed_parameter"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern" => {
+                // First identifier descendant is the bound name.
+                let mut stack = vec![child];
+                while let Some(n) = stack.pop() {
+                    if n.kind() == "identifier" {
+                        if let Ok(name) = n.utf8_text(text.as_bytes()) {
+                            bad.insert(name.to_string());
+                        }
+                        break;
+                    }
+                    let mut cc = n.walk();
+                    for ch in n.children(&mut cc) {
+                        stack.push(ch);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Evaluate an expression to a set of possible string values.
+/// `None` = unknown (dynamic). Depth-capped; identifiers resolve
+/// through the env with cycle protection.
+fn py_eval_strset(
+    env: &PyEnv,
+    node: tree_sitter::Node,
+    text: &str,
+    depth: u8,
+) -> Option<BTreeSet<String>> {
+    if depth > PY_MAX_EVAL_DEPTH {
+        return None;
+    }
+    match node.kind() {
+        "string" => py_eval_string(node, env, text, depth),
+        "identifier" => {
+            let name = node.utf8_text(text.as_bytes()).ok()?;
+            env.lookup(name, text)
+        }
+        "binary_operator" => py_eval_binary(env, node, text, depth),
+        "call" => py_eval_call_str(env, node, text, depth),
+        "conditional_expression" => {
+            // `A if cond else B` - union of both arms.
+            let a = node.child_by_field_name("consequence");
+            let b = node.child_by_field_name("alternative");
+            let (a, b) = match (a, b) {
+                (Some(x), Some(y)) => (x, y),
+                _ => {
+                    // Field names vary; fall back to first/last child.
+                    let mut named = Vec::new();
+                    let mut wc = node.walk();
+                    for c in node.children(&mut wc) {
+                        if c.is_named() {
+                            named.push(c);
+                        }
+                    }
+                    let first = *named.first()?;
+                    let last = *named.last().unwrap_or(&first);
+                    (first, last)
+                }
+            };
+            let mut out = py_eval_strset(env, a, text, depth + 1)?;
+            out.extend(py_eval_strset(env, b, text, depth + 1)?);
+            (out.len() <= PY_MAX_STRSET).then_some(out)
+        }
+        "parenthesized_expression" => {
+            let inner = node.children(&mut node.walk()).find(|c| c.is_named())?;
+            py_eval_strset(env, inner, text, depth + 1)
+        }
+        "subscript" => py_eval_subscript(env, node, text, depth),
+        _ => None,
+    }
+}
+
+/// String literal, possibly an f-string with interpolations.
+/// Returns the cartesian product of all interpolated values.
+fn py_eval_string(
+    node: tree_sitter::Node,
+    env: &PyEnv,
+    text: &str,
+    depth: u8,
+) -> Option<BTreeSet<String>> {
+    // Collect parts: literal string_content vs interpolation exprs.
+    enum Part<'n> {
+        Lit(String),
+        Expr(tree_sitter::Node<'n>),
+    }
+    let mut parts: Vec<Part> = Vec::new();
+    let mut has_interp = false;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string_content" | "escape_sequence" => {
+                if let Ok(t) = child.utf8_text(text.as_bytes()) {
+                    parts.push(Part::Lit(t.to_string()));
+                }
+            }
+            "interpolation" => {
+                has_interp = true;
+                // Only a bare `{expr}` interpolates cleanly; format
+                // specs/conversions make the value untrustworthy.
+                let expr = child.child_by_field_name("expression")?;
+                let extra = child
+                    .children(&mut child.walk())
+                    .filter(|c| c.is_named() && c.id() != expr.id())
+                    .count();
+                if extra > 0 {
+                    return None;
+                }
+                parts.push(Part::Expr(expr));
+            }
+            _ => {}
+        }
+    }
+    if !has_interp {
+        return py_string_inner(node, text).map(|s| BTreeSet::from([s]));
+    }
+    // Cartesian product over interpolation values, literals spliced in.
+    let mut acc: BTreeSet<String> = BTreeSet::from([String::new()]);
+    for part in parts {
+        match part {
+            Part::Lit(lit) => {
+                acc = acc.iter().map(|s| format!("{s}{lit}")).collect();
+            }
+            Part::Expr(expr) => {
+                let vals = py_eval_strset(env, expr, text, depth + 1)?;
+                let mut next: BTreeSet<String> = BTreeSet::new();
+                for prefix in &acc {
+                    for v in &vals {
+                        next.insert(format!("{prefix}{v}"));
+                        if next.len() > PY_MAX_STRSET {
+                            return None;
+                        }
+                    }
+                }
+                acc = next;
+            }
+        }
+    }
+    Some(acc)
+}
+
+/// `+` concatenation and `%` formatting over evaluated operands.
+fn py_eval_binary(
+    env: &PyEnv,
+    node: tree_sitter::Node,
+    text: &str,
+    depth: u8,
+) -> Option<BTreeSet<String>> {
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+    // Operator is the anonymous child between them.
+    let mut op = "";
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            if let Ok(t) = child.utf8_text(text.as_bytes()) {
+                op = t;
+            }
+        }
+    }
+    match op {
+        "+" => {
+            let ls = py_eval_strset(env, left, text, depth + 1)?;
+            let rs = py_eval_strset(env, right, text, depth + 1)?;
+            let mut out = BTreeSet::new();
+            for a in &ls {
+                for b in &rs {
+                    out.insert(format!("{a}{b}"));
+                    if out.len() > PY_MAX_STRSET {
+                        return None;
+                    }
+                }
+            }
+            Some(out)
+        }
+        "%" => py_eval_percent(env, left, right, text, depth),
+        _ => None,
+    }
+}
+
+/// `"fmt %s %s" % (a, b)` - sequential %-specifiers filled from the
+/// right operand (tuple elements in order, or a single value).
+fn py_eval_percent(
+    env: &PyEnv,
+    left: tree_sitter::Node,
+    right: tree_sitter::Node,
+    text: &str,
+    depth: u8,
+) -> Option<BTreeSet<String>> {
+    let fmts = py_eval_strset(env, left, text, depth + 1)?;
+    // Right operand values: tuple -> elements, else single set.
+    let rsets: Vec<BTreeSet<String>> = if matches!(right.kind(), "tuple" | "list" | "set") {
+        py_eval_strlist(env, right, text, depth + 1)?
+    } else {
+        vec![py_eval_strset(env, right, text, depth + 1)?]
+    };
+    let mut out = BTreeSet::new();
+    'outer: for fmt in &fmts {
+        // Split fmt into literal segments and % specifiers.
+        let specs = py_percent_specs(fmt)?;
+        if specs != rsets.len() {
+            continue 'outer; // arity mismatch - try other fmt candidates
+        }
+        // Cartesian product over right values.
+        let mut combos: Vec<Vec<String>> = vec![vec![String::new()]];
+        for rs in &rsets {
+            let mut next = Vec::new();
+            for combo in &combos {
+                for v in rs {
+                    let mut c = combo.clone();
+                    c.push(v.clone());
+                    next.push(c);
+                    if next.len() > PY_MAX_STRSET {
+                        return None;
+                    }
+                }
+            }
+            combos = next;
+        }
+        for combo in combos {
+            let mut result = String::new();
+            let bytes = fmt.as_bytes();
+            let mut i = 0;
+            let mut vi = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+                        result.push('%');
+                        i += 2;
+                        continue;
+                    }
+                    // %(name)s unsupported.
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                        return None;
+                    }
+                    let mut j = i + 1;
+                    while j < bytes.len()
+                        && !matches!(bytes[j], b'd' | b's' | b'r' | b'i' | b'f' | b'g')
+                    {
+                        j += 1;
+                    }
+                    if j >= bytes.len() || vi >= combo.len() {
+                        return None;
+                    }
+                    result.push_str(&combo[vi]);
+                    vi += 1;
+                    i = j + 1;
+                } else {
+                    // Copy one UTF-8 char.
+                    let ch_len = utf8_len(bytes[i]);
+                    result.push_str(&fmt[i..i + ch_len]);
+                    i += ch_len;
+                }
+            }
+            out.insert(result);
+            if out.len() > PY_MAX_STRSET {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Count %-conversion specifiers in a format string (%% excluded,
+/// %(name)s unsupported -> None).
+fn py_percent_specs(fmt: &str) -> Option<usize> {
+    let b = fmt.as_bytes();
+    let mut i = 0;
+    let mut n = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 1 < b.len() && b[i + 1] == b'%' {
+                i += 2;
+                continue;
+            }
+            if i + 1 < b.len() && b[i + 1] == b'(' {
+                return None;
+            }
+            let mut j = i + 1;
+            while j < b.len() && !matches!(b[j], b'd' | b's' | b'r' | b'i' | b'f' | b'g') {
+                j += 1;
+            }
+            if j >= b.len() {
+                return None;
+            }
+            n += 1;
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    Some(n)
+}
+
+/// `sep.join(iterable)` and `"...".format(args)` - the two call forms
+/// worth resolving. Everything else is unknown.
+fn py_eval_call_str(
+    env: &PyEnv,
+    node: tree_sitter::Node,
+    text: &str,
+    depth: u8,
+) -> Option<BTreeSet<String>> {
+    let func = node.child_by_field_name("function")?;
+    if func.kind() != "attribute" {
+        return None;
+    }
+    let attr = func
+        .child_by_field_name("attribute")
+        .and_then(|a| a.utf8_text(text.as_bytes()).ok())?;
+    let obj = func.child_by_field_name("object")?;
+    let args = node.child_by_field_name("arguments")?;
+    // Positional args only (skip keywords/starred).
+    let mut arg_nodes = Vec::new();
+    let mut cursor = args.walk();
+    for c in args.children(&mut cursor) {
+        if c.is_named()
+            && !matches!(
+                c.kind(),
+                "keyword_argument" | "dictionary_splat" | "list_splat" | "parenthesized_list_splat"
+            )
+        {
+            arg_nodes.push(c);
+        }
+    }
+    match attr {
+        "join" => {
+            let seps = py_eval_strset(env, obj, text, depth + 1)?;
+            let items = arg_nodes
+                .first()
+                .and_then(|a| py_eval_strlist(env, *a, text, depth + 1))?;
+            py_join_strs(&seps, &items)
+        }
+        "format" => {
+            let fmts = py_eval_strset(env, obj, text, depth + 1)?;
+            let argsets: Option<Vec<BTreeSet<String>>> = arg_nodes
+                .iter()
+                .map(|a| py_eval_strset(env, *a, text, depth + 1))
+                .collect();
+            py_format_strs(&fmts, &argsets?)
+        }
+        _ => None,
+    }
+}
+
+/// Cartesian join of element string-sets with each separator.
+fn py_join_strs(seps: &BTreeSet<String>, items: &[BTreeSet<String>]) -> Option<BTreeSet<String>> {
+    // Cartesian product over items (order preserved).
+    let mut combos: Vec<Vec<String>> = vec![Vec::new()];
+    for item in items {
+        let mut next = Vec::new();
+        for combo in &combos {
+            for v in item {
+                let mut c = combo.clone();
+                c.push(v.clone());
+                next.push(c);
+                if next.len() > PY_MAX_STRSET {
+                    return None;
+                }
+            }
+        }
+        combos = next;
+    }
+    let mut out = BTreeSet::new();
+    for sep in seps {
+        for combo in &combos {
+            out.insert(combo.join(sep));
+            if out.len() > PY_MAX_STRSET {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `"...{}...".format(a, b)` - supports auto `{}` and explicit `{N}`
+/// positional fields only.
+fn py_format_strs(fmts: &BTreeSet<String>, args: &[BTreeSet<String>]) -> Option<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for fmt in fmts {
+        // Extract field specs in order.
+        let fields: Option<Vec<Option<usize>>> = py_format_fields(fmt);
+        let Some(fields) = fields else { continue };
+        // Map each field to an arg index; auto fields consume args
+        // sequentially, explicit {N} index directly.
+        let mut arg_idx: Vec<usize> = Vec::new();
+        let mut auto = 0usize;
+        let mut ok = true;
+        for f in &fields {
+            match f {
+                None => {
+                    if auto >= args.len() {
+                        ok = false;
+                        break;
+                    }
+                    arg_idx.push(auto);
+                    auto += 1;
+                }
+                Some(n) => {
+                    if *n >= args.len() {
+                        ok = false;
+                        break;
+                    }
+                    arg_idx.push(*n);
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // Cartesian product over the referenced arg sets.
+        let mut combos: Vec<Vec<String>> = vec![Vec::new()];
+        for &ai in &arg_idx {
+            let mut next = Vec::new();
+            for combo in &combos {
+                for v in &args[ai] {
+                    let mut c = combo.clone();
+                    c.push(v.clone());
+                    next.push(c);
+                    if next.len() > PY_MAX_STRSET {
+                        return None;
+                    }
+                }
+            }
+            combos = next;
+        }
+        for combo in combos {
+            out.insert(py_format_apply(fmt, &combo)?);
+            if out.len() > PY_MAX_STRSET {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Parse `{...}` fields: None = auto `{}`, Some(n) = `{n}`.
+/// Returns None if any field is named/complex.
+fn py_format_fields(fmt: &str) -> Option<Vec<Option<usize>>> {
+    let mut out = Vec::new();
+    let b = fmt.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'{' {
+            if i + 1 < b.len() && b[i + 1] == b'{' {
+                i += 2;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'}' {
+                j += 1;
+            }
+            if j >= b.len() {
+                return None;
+            }
+            let inner = &fmt[i + 1..j];
+            if inner.is_empty() {
+                out.push(None);
+            } else if inner.chars().all(|c| c.is_ascii_digit()) {
+                out.push(Some(inner.parse().ok()?));
+            } else {
+                return None; // {name}, {x!r}, {x:>5} unsupported
+            }
+            i = j + 1;
+        } else if b[i] == b'}' {
+            if i + 1 < b.len() && b[i + 1] == b'}' {
+                i += 2;
+                continue;
+            }
+            return None;
+        } else {
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Substitute already-computed field values into a format string.
+/// `values` are in placeholder-occurrence order.
+fn py_format_apply(fmt: &str, values: &[String]) -> Option<String> {
+    // fields[i] corresponds to the i-th placeholder occurrence;
+    // values are in field order.
+    let mut out = String::new();
+    let b = fmt.as_bytes();
+    let mut i = 0;
+    let mut fi = 0;
+    while i < b.len() {
+        if b[i] == b'{' {
+            if i + 1 < b.len() && b[i + 1] == b'{' {
+                out.push('{');
+                i += 2;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'}' {
+                j += 1;
+            }
+            if j >= b.len() || fi >= values.len() {
+                return None;
+            }
+            out.push_str(&values[fi]);
+            fi += 1;
+            i = j + 1;
+        } else if b[i] == b'}' {
+            if i + 1 < b.len() && b[i + 1] == b'}' {
+                out.push('}');
+                i += 2;
+            } else {
+                return None;
+            }
+        } else {
+            let l = utf8_len(b[i]);
+            out.push_str(&fmt[i..i + l]);
+            i += l;
+        }
+    }
+    Some(out)
+}
+
+/// Evaluate an iterable expression to per-element string sets.
+fn py_eval_strlist(
+    env: &PyEnv,
+    node: tree_sitter::Node,
+    text: &str,
+    depth: u8,
+) -> Option<Vec<BTreeSet<String>>> {
+    if depth > PY_MAX_EVAL_DEPTH {
+        return None;
+    }
+    match node.kind() {
+        "list" | "tuple" | "set" => {
+            let mut out = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if !child.is_named() {
+                    continue;
+                }
+                out.push(py_eval_strset(env, child, text, depth + 1)?);
+            }
+            Some(out)
+        }
+        "identifier" => {
+            let name = node.utf8_text(text.as_bytes()).ok()?;
+            if env.bad.contains(name) {
+                return None;
+            }
+            // Resolve through assignments: each RHS may itself be a
+            // list literal or another name.
+            let exprs = env.assigns.get(name)?;
+            let mut out = Vec::new();
+            for e in exprs {
+                if let Some(items) = py_eval_strlist(env, *e, text, depth + 1) {
+                    out.extend(items);
+                } else if let Some(s) = py_eval_strset(env, *e, text, depth + 1) {
+                    // `X = "abc"` iterated gives chars - useless; bail.
+                    let _ = s;
+                    return None;
+                } else {
+                    return None;
+                }
+            }
+            Some(out)
+        }
+        "parenthesized_expression" => {
+            let inner = node.children(&mut node.walk()).find(|c| c.is_named())?;
+            py_eval_strlist(env, inner, text, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// `D["key"]` where D is a dict literal (or name bound to one):
+/// over-approximate as the union of all values - the key is data,
+/// not structure we can trust.
+fn py_eval_subscript(
+    env: &PyEnv,
+    node: tree_sitter::Node,
+    text: &str,
+    depth: u8,
+) -> Option<BTreeSet<String>> {
+    let obj = node.child_by_field_name("object")?;
+    match obj.kind() {
+        "dictionary" => py_dict_values(env, obj, text, depth),
+        "identifier" => {
+            let name = obj.utf8_text(text.as_bytes()).ok()?;
+            if env.bad.contains(name) {
+                return None;
+            }
+            let exprs = env.assigns.get(name)?;
+            let mut out = BTreeSet::new();
+            for e in exprs {
+                if let Some(v) = py_dict_values(env, *e, text, depth + 1) {
+                    out.extend(v);
+                }
+            }
+            (!out.is_empty() && out.len() <= PY_MAX_STRSET).then_some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Union of all values in a dict literal (keys ignored).
+fn py_dict_values(
+    env: &PyEnv,
+    node: tree_sitter::Node,
+    text: &str,
+    depth: u8,
+) -> Option<BTreeSet<String>> {
+    if node.kind() != "dictionary" {
+        return None;
+    }
+    let mut out = BTreeSet::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "pair" {
+            continue;
+        }
+        if let Some(v) = child.child_by_field_name("value") {
+            if let Some(s) = py_eval_strset(env, v, text, depth + 1) {
+                out.extend(s);
+            }
+        }
+    }
+    (!out.is_empty() && out.len() <= PY_MAX_STRSET).then_some(out)
 }
 
 /// All imports in Python source, via tree-sitter. Docstrings, comments,
@@ -910,6 +2054,9 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
         return (out, true, dynamic);
     };
     let had_error = tree.root_node().has_error();
+    // Const-prop environment for computed dynamic imports - built in
+    // a pre-pass so bindings are order-independent.
+    let env = build_py_env(&tree, text);
     // Names bound by import statements - `getattr` on one of these is
     // dynamic dispatch (module __getattr__ can lazily import, so the
     // edge is invisible). Collected in the same walk; getattr calls
@@ -981,15 +2128,79 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize) {
                     out.push(PyRef::From { level, segs, names });
                 }
             }
+            "assignment" => {
+                // Framework convention lists: `pytest_plugins = [...]`,
+                // `INSTALLED_APPS = [...]` - literal dotted strings the
+                // frameworks import on our behalf.
+                if let (Some(l), Some(r)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if l.kind() == "identifier" {
+                        if let Ok(name) = l.utf8_text(text.as_bytes()) {
+                            if matches!(name, "pytest_plugins" | "INSTALLED_APPS") {
+                                if let Some(strings) = py_convention_strings(&env, r, text) {
+                                    if !strings.is_empty() {
+                                        out.push(PyRef::Convention(strings));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             "call" => {
                 // Dynamic imports with literal arguments:
                 // `import_module("a.b")`, `importlib.import_module("a.b")`,
                 // `__import__("a.b")`. Non-literal args are counted as
                 // dynamic sites (invisible edges) for the warning.
-                match py_dyn_call_kind(node, text) {
-                    PyDynCall::Literal(segs) => out.push(PyRef::Import(segs)),
+                match py_dyn_call_kind(node, text, &env) {
+                    PyDynCall::Literal(paths) => {
+                        for segs in paths {
+                            out.push(PyRef::Import(segs));
+                        }
+                    }
                     PyDynCall::Dynamic => dynamic += 1,
                     PyDynCall::NotDynamic => {}
+                }
+                // glob.glob/iglob/Path.glob with a literal or
+                // const-derived pattern - matched against the file set.
+                if let Some(func) = node.child_by_field_name("function") {
+                    if let Ok(ft) = func.utf8_text(text.as_bytes()) {
+                        let is_glob = ft == "glob"
+                            || ft == "iglob"
+                            || ft.ends_with(".glob")
+                            || ft.ends_with(".iglob");
+                        if is_glob {
+                            if let Some(args) = node.child_by_field_name("arguments") {
+                                let evaluated = {
+                                    let mut c = args.walk();
+                                    let found = args
+                                        .children(&mut c)
+                                        .find(|c| !matches!(c.kind(), "(" | ")" | ","))
+                                        .and_then(|arg| py_eval_strset(&env, arg, text, 0));
+                                    found
+                                };
+                                match evaluated {
+                                    // Literal/const-derived pattern -
+                                    // expand against the scanned files.
+                                    // Non-wildcard patterns are exact
+                                    // matches, which is correct.
+                                    Some(vals) => {
+                                        let pats: Vec<String> = vals.into_iter().collect();
+                                        if !pats.is_empty() {
+                                            out.push(PyRef::Glob(pats));
+                                        }
+                                    }
+                                    // Computed pattern - invisible
+                                    // edges, count for the warning.
+                                    None => dynamic += 1,
+                                }
+                            } else {
+                                dynamic += 1;
+                            }
+                        }
+                    }
                 }
                 // `getattr(<imported-name>, ...)` - dynamic attribute
                 // dispatch; module __getattr__ may lazily import, so
@@ -1066,10 +2277,11 @@ fn rel_mod_segs(node: tree_sitter::Node, text: &str) -> Option<(usize, Vec<Strin
 
 /// What a `call` node turned out to be for dynamic-import purposes.
 enum PyDynCall {
-    /// `import_module("a.b")` etc. with a valid literal module path.
-    Literal(Vec<String>),
-    /// Dyn-import-shaped call whose module path isn't a plain literal
-    /// (variable, call, f-string, concatenation) - invisible edge.
+    /// `import_module("a.b")` etc. resolving to one or more valid
+    /// module paths (literal or const-propagated).
+    Literal(Vec<Vec<String>>),
+    /// Dyn-import-shaped call whose module path isn't resolvable -
+    /// invisible edge.
     Dynamic,
     /// Not a dynamic-import call, or a literal that isn't a valid
     /// module path (unresolvable, not "dynamic").
@@ -1078,7 +2290,9 @@ enum PyDynCall {
 
 /// Classify a call as a dynamic-import site: `import_module`,
 /// `importlib.import_module`, `__import__` and attribute variants.
-fn py_dyn_call_kind(call: tree_sitter::Node, text: &str) -> PyDynCall {
+/// `env` is the file's const-prop environment - computed arguments
+/// like `"pkg." + NAME` resolve when every piece is literal-derived.
+fn py_dyn_call_kind(call: tree_sitter::Node, text: &str, env: &PyEnv) -> PyDynCall {
     let Some(func) = call.child_by_field_name("function") else {
         return PyDynCall::NotDynamic;
     };
@@ -1103,17 +2317,36 @@ fn py_dyn_call_kind(call: tree_sitter::Node, text: &str) -> PyDynCall {
     else {
         return PyDynCall::Dynamic;
     };
-    if arg.kind() != "string" {
-        return PyDynCall::Dynamic;
+    // Plain literal string: fast path, no env needed.
+    if arg.kind() == "string" {
+        if let Some(inner) = py_string_inner(arg, text) {
+            if !inner.contains('{') {
+                return py_module_path_call(inner);
+            }
+        }
+        // f-string or unparseable - fall through to const-prop, which
+        // handles interpolations over known constants.
     }
-    let Some(inner) = py_string_inner(arg, text) else {
-        return PyDynCall::NotDynamic;
+    // Computed argument: evaluate to a set of possible module paths.
+    let Some(vals) = py_eval_strset(env, arg, text, 0) else {
+        return PyDynCall::Dynamic;
     };
-    // f-strings interpolate; a "{" means the path isn't literal.
-    if inner.contains('{') {
-        return PyDynCall::Dynamic;
+    let mut paths = Vec::new();
+    for v in &vals {
+        if let PyDynCall::Literal(mut p) = py_module_path_call(v.clone()) {
+            paths.append(&mut p);
+        }
     }
-    let segs: Vec<String> = inner
+    if paths.is_empty() {
+        PyDynCall::Dynamic
+    } else {
+        PyDynCall::Literal(paths)
+    }
+}
+
+/// Validate a dotted module string -> segment list (single path).
+fn py_module_path_call(module: String) -> PyDynCall {
+    let segs: Vec<String> = module
         .split('.')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -1124,7 +2357,7 @@ fn py_dyn_call_kind(call: tree_sitter::Node, text: &str) -> PyDynCall {
             .iter()
             .all(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
     if valid {
-        PyDynCall::Literal(segs)
+        PyDynCall::Literal(vec![segs])
     } else {
         PyDynCall::NotDynamic
     }
@@ -1204,6 +2437,33 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                 } => {
                     add_py_from(&names, rel, parent, level, &segs, &imps, &mut deps);
                 }
+                PyRef::Glob(patterns) => {
+                    for pat in patterns {
+                        for dep in py_glob_expand(&names, &[parent, ""], &pat) {
+                            if dep != *rel {
+                                deps.insert(dep);
+                            }
+                        }
+                    }
+                }
+                PyRef::Convention(strings) => {
+                    for s in strings {
+                        let segs: Vec<String> = s.split('.').map(str::to_string).collect();
+                        // Try longest prefix first - `myapp.apps.MyConfig`
+                        // resolves `myapp.apps` (the module), not the
+                        // class attribute.
+                        'outer: for end in (1..=segs.len()).rev() {
+                            for b in ancestor_bases(rel) {
+                                if let Some(dep) = resolve_py_exact(&names, &b, &segs[..end]) {
+                                    if dep != *rel {
+                                        deps.insert(dep);
+                                    }
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1231,6 +2491,34 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
 
         for dep in deps {
             edges.push((rel.clone(), dep, None));
+        }
+    }
+
+    // pytest auto-loads every ancestor `conftest.py` for each test
+    // module - an implicit framework edge the imports never show.
+    // Restricted to test-looking files: `test_*.py`/`*_test.py`
+    // basenames or anything under a `test`/`tests` directory.
+    for (rel, _) in &files {
+        let base = rel.rsplit('/').next().unwrap_or(rel);
+        let under_test_dir = rel.split('/').any(|seg| seg == "test" || seg == "tests");
+        let test_named = base.starts_with("test_") || base.ends_with("_test.py");
+        if !under_test_dir && !test_named {
+            continue;
+        }
+        let mut dir = parent_rel(rel);
+        loop {
+            let conf = if dir.is_empty() {
+                "conftest.py".to_string()
+            } else {
+                format!("{dir}/conftest.py")
+            };
+            if names.contains(&conf) && conf != *rel {
+                edges.push((rel.clone(), conf, None));
+            }
+            if dir.is_empty() {
+                break;
+            }
+            dir = parent_rel(dir);
         }
     }
 
@@ -1536,6 +2824,103 @@ fn entry_bases(rel: &str) -> Vec<String> {
 /// Resolve a `from <dots><mod> import <names>` against the file set.
 /// `level` is the count of leading dots (0 = absolute import, which
 /// tries every ancestor dir as a package root like `sys.path`).
+/// `pytest_plugins`/`INSTALLED_APPS` RHS -> dotted module strings.
+/// Handles list/tuple literals and single strings via const-prop.
+fn py_convention_strings(env: &PyEnv, node: tree_sitter::Node, text: &str) -> Option<Vec<String>> {
+    // List/tuple/set of strings.
+    if matches!(node.kind(), "list" | "tuple" | "set") {
+        let items = py_eval_strlist(env, node, text, 0)?;
+        let mut out = Vec::new();
+        for item in items {
+            if item.len() == 1 {
+                out.extend(item);
+            } else {
+                return None; // multi-valued element - too fuzzy
+            }
+        }
+        return Some(out);
+    }
+    // Single string or name.
+    py_eval_strset(env, node, text, 0).map(|s| s.into_iter().collect())
+}
+
+/// Expand a glob pattern against scanned file names. Tried relative
+/// to each base dir (file's dir, then project root). Supports `*`,
+/// `?`, and `**` path segments.
+fn py_glob_expand(names: &BTreeSet<String>, bases: &[&str], pattern: &str) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for base in bases {
+        let Some(norm) = normalize_rel(base, pattern) else {
+            continue;
+        };
+        // normalize_rel treats `*`/`?` as ordinary segment chars -
+        // they survive as literal text for the matcher.
+        for name in names {
+            if glob_match(&norm, name) {
+                out.insert(name.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Match a `/`-separated glob pattern against a `/`-separated path.
+/// `**` matches zero or more whole segments; `*`/`?` work inside a
+/// segment.
+fn glob_match(pat: &str, path: &str) -> bool {
+    let p: Vec<&str> = pat.split('/').collect();
+    let s: Vec<&str> = path.split('/').collect();
+    glob_match_segs(&p, &s)
+}
+
+fn glob_match_segs(pat: &[&str], path: &[&str]) -> bool {
+    if pat.is_empty() {
+        return path.is_empty();
+    }
+    if pat[0] == "**" {
+        // `**` matches zero or more segments.
+        for skip in 0..=path.len() {
+            if glob_match_segs(&pat[1..], &path[skip..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if path.is_empty() {
+        return false;
+    }
+    wild_match(pat[0], path[0]) && glob_match_segs(&pat[1..], &path[1..])
+}
+
+/// `*`/`?` wildcard match within one path segment.
+fn wild_match(pat: &str, s: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = s.chars().collect();
+    // Iterative two-pointer with backtracking on '*'.
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star_p, mut star_s) = (usize::MAX, 0usize);
+    while si < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+        } else if star_p != usize::MAX {
+            pi = star_p + 1;
+            star_s += 1;
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 fn add_py_from(
     names: &BTreeSet<String>,
     rel: &str,
@@ -1656,7 +3041,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     for (rel, abs) in &files {
         let text =
             fs::read_to_string(abs).map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        let (specs, had_error, dynamic) = js_import_specs_ts(&text, js_language_for(rel));
+        let (specs, globs, had_error, dynamic) = js_import_specs_ts(&text, js_language_for(rel));
         if had_error {
             warnings.push(format!("{rel}: parse errors (partial scan)"));
         }
@@ -1686,6 +3071,17 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
             // aliases and `baseUrl` resolve intra-project; anything
             // else is node_modules.
             if let Some(dep) = resolve_js_alias(&resolver, &names, &spec) {
+                if dep != *rel {
+                    deps.insert(dep);
+                }
+            }
+        }
+
+        // Bundler-style glob patterns (`require.context`,
+        // `import.meta.glob`, template/concat dynamic imports) expand
+        // against the scanned JS/TS file set.
+        for pat in globs {
+            for dep in js_glob_expand(&names, &[parent, ""], &pat) {
                 if dep != *rel {
                     deps.insert(dep);
                 }
@@ -1743,6 +3139,31 @@ fn js_language_for(rel: &str) -> tree_sitter::Language {
         Some("tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
         _ => tree_sitter_javascript::LANGUAGE.into(),
     }
+}
+
+/// Expand a JS glob pattern against scanned file names, relative to
+/// each base dir. A pattern whose last segment has no `.` also tries
+/// `+ext` variants so `import('./x/' + n)` reaches `x/a.ts` etc.
+fn js_glob_expand(names: &BTreeSet<String>, bases: &[&str], pattern: &str) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for base in bases {
+        let Some(norm) = normalize_rel(base, pattern) else {
+            continue;
+        };
+        let mut pats = vec![norm.clone()];
+        let last = norm.rsplit('/').next().unwrap_or("");
+        if !last.contains('.') {
+            for ext in JS_EXTS {
+                pats.push(format!("{norm}.{ext}"));
+            }
+        }
+        for name in names {
+            if pats.iter().any(|p| glob_match(p, name)) {
+                out.insert(name.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Resolve a normalized relative JS spec to a file: exact, +ext, /index+ext.

@@ -959,3 +959,225 @@ fn scan_rust_depinfo_edgeless_module() {
     assert!(!out.warnings[0].contains("lib.rs"));
     assert!(!out.warnings[0].contains("it.rs"));
 }
+
+#[test]
+fn scan_python_const_prop_dynamic_imports() {
+    // Computed import_module args resolve when every piece is a
+    // literal-derived constant - set-of-strings domain, flow
+    // insensitive, per file.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/plugins/__init__.py", "");
+    w(root, "pkg/plugins/ldap.py", "");
+    w(root, "pkg/a.py", "");
+    w(root, "pkg/b.py", "");
+    w(
+        root,
+        "pkg/loader.py",
+        concat!(
+            "from importlib import import_module\n",
+            "NAME = 'ldap'\n",
+            "import_module('pkg.plugins.' + NAME)\n", // const concat
+            "import_module(f'pkg.plugins.{NAME}')\n", // f-string const
+            "for n in ('a', 'b'):\n",
+            "    import_module('pkg.' + n)\n", // for-loop expand
+            "T = 'plugins.' + NAME\n",
+            "import_module('pkg.' + T)\n", // chained const
+            "J = '.'.join(['plugins', NAME])\n",
+            "import_module('pkg.' + J)\n", // join
+            "F = 'pkg.plugins.{}'.format(NAME)\n",
+            "import_module(F)\n", // .format
+            "P = 'pkg.plugins.%s' % NAME\n",
+            "import_module(P)\n",                    // % formatting
+            "import_module('pkg.' + unknown_var)\n", // still dynamic
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |d: &str| edges.contains(&("pkg/loader.py".to_string(), d.to_string()));
+    for d in ["pkg/plugins/ldap.py", "pkg/a.py", "pkg/b.py"] {
+        assert!(has(d), "missing edge to {d}: {edges:?}");
+    }
+    // ldap reached via concat, f-string, chained, join, format, %.
+    // pkg/plugins/__init__.py comes along as the package init of the
+    // resolved submodule imports. unknown_var adds nothing and warns.
+    assert_eq!(
+        edges.iter().filter(|(s, _)| s == "pkg/loader.py").count(),
+        4,
+        "edges: {edges:?}"
+    );
+    assert!(out.warnings.iter().any(|w| w.contains("loader.py")));
+}
+
+#[test]
+fn scan_python_const_prop_mutation_and_shadowing() {
+    // Mutated containers and function params can't be trusted -
+    // they stay dynamic rather than producing wrong edges.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "pkg/__init__.py", "");
+    w(root, "pkg/x.py", "");
+    w(root, "pkg/y.py", "");
+    w(
+        root,
+        "pkg/loader.py",
+        concat!(
+            "from importlib import import_module\n",
+            "NAMES = ['x', 'y']\n",
+            "NAMES.append('z')\n", // mutation -> unknown
+            "for n in NAMES:\n",
+            "    import_module('pkg.' + n)\n",
+            "def f(NAME):\n",
+            "    import_module('pkg.' + NAME)\n", // param shadows: unknown
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    assert!(
+        !edges
+            .iter()
+            .any(|(s, d)| s == "pkg/loader.py" && d.starts_with("pkg/")),
+        "unexpected resolved edges: {edges:?}"
+    );
+    // Both sites warn (loop + param use are 2 dynamic sites).
+    assert!(out.warnings.iter().any(|w| w.contains("loader.py")));
+}
+
+#[test]
+fn scan_python_glob_expansion() {
+    // Literal glob patterns expand against the scanned file set -
+    // plugin loaders get real edges, not warnings.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "app.py", "import glob\nimport os\n");
+    w(root, "plugins/__init__.py", "");
+    w(root, "plugins/a.py", "");
+    w(root, "plugins/b.py", "");
+    w(root, "plugins/sub/c.py", "");
+    w(root, "other/d.py", "");
+    w(
+        root,
+        "loader.py",
+        concat!(
+            "import glob\n",
+            "for p in glob.glob('plugins/*.py'):\n",
+            "    pass\n",
+            "for p in glob.iglob('plugins/**/*.py'):\n",
+            "    pass\n",
+            "PAT = 'plugins/*.py'\n",
+            "for p in glob.glob(PAT):\n",
+            "    pass\n",
+            "for p in glob.glob(some_var):\n", // dynamic -> warns, no edges
+            "    pass\n",
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |d: &str| edges.contains(&("loader.py".to_string(), d.to_string()));
+    // `plugins/*.py` -> a.py, b.py, __init__.py (one segment only).
+    // `plugins/**/*.py` -> all of plugins/ incl. sub/c.py.
+    // PAT const -> same as first pattern. `other/d.py` never matched.
+    for d in [
+        "plugins/__init__.py",
+        "plugins/a.py",
+        "plugins/b.py",
+        "plugins/sub/c.py",
+    ] {
+        assert!(has(d), "missing glob edge to {d}: {edges:?}");
+    }
+    assert!(!has("other/d.py"), "phantom glob edge: {edges:?}");
+    assert!(!has("app.py"), "phantom glob edge: {edges:?}");
+    assert!(out.warnings.iter().any(|w| w.contains("loader.py")));
+}
+
+#[test]
+fn scan_python_framework_conventions() {
+    // pytest_plugins, INSTALLED_APPS dotted strings, and conftest.py
+    // ancestor edges are framework wiring the imports don't show.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "conftest.py", "");
+    w(root, "tests/conftest.py", "");
+    w(root, "tests/test_x.py", "def test_x(): pass\n");
+    w(root, "tests/unit/test_y.py", "def test_y(): pass\n");
+    w(root, "myapp/__init__.py", "");
+    w(root, "myapp/apps.py", "");
+    w(root, "myapp/plugins/ldap.py", "");
+    w(root, "myapp/plugins/sql.py", "");
+    w(root, "settings.py", "");
+    w(
+        root,
+        "tests/conftest.py",
+        "pytest_plugins = ['myapp.plugins.ldap', 'myapp.plugins.sql']\n",
+    );
+    w(
+        root,
+        "settings.py",
+        concat!(
+            "INSTALLED_APPS = [\n",
+            "    'myapp',\n",
+            "    'myapp.apps.MyConfig',\n", // class attr -> module prefix
+            "]\n",
+        ),
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    let edges = edges_of(&out);
+    let has = |s: &str, d: &str| edges.contains(&(s.to_string(), d.to_string()));
+    // pytest_plugins dotted strings -> module files.
+    assert!(has("tests/conftest.py", "myapp/plugins/ldap.py"));
+    assert!(has("tests/conftest.py", "myapp/plugins/sql.py"));
+    // INSTALLED_APPS -> longest resolvable module prefix.
+    assert!(has("settings.py", "myapp/__init__.py"));
+    assert!(has("settings.py", "myapp/apps.py"));
+    // conftest.py auto-loaded by every test module beneath it.
+    assert!(has("tests/test_x.py", "tests/conftest.py"));
+    assert!(has("tests/test_x.py", "conftest.py"));
+    assert!(has("tests/unit/test_y.py", "tests/conftest.py"));
+    assert!(has("tests/unit/test_y.py", "conftest.py"));
+    // Non-test files get no conftest edges.
+    assert!(!has("myapp/apps.py", "conftest.py"));
+}
+
+#[test]
+fn scan_js_glob_expansion() {
+    // require.context, import.meta.glob, and template/concat dynamic
+    // imports expand against the scanned file set like webpack/vite
+    // context modules do.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "plugins/a.ts", "export const a = 1;\n");
+    w(root, "plugins/b.ts", "export const b = 1;\n");
+    w(root, "plugins/sub/c.ts", "export const c = 1;\n");
+    w(root, "plugins/deep/d.js", "module.exports = 1;\n");
+    w(root, "other/e.ts", "export const e = 1;\n");
+    w(
+        root,
+        "loader.ts",
+        concat!(
+            "const ctx = require.context('./plugins', true);\n",
+            "const mods = import.meta.glob('./plugins/*.ts');\n",
+            "const lazy = () => import(`./plugins/${name}.ts`);\n",
+            "const lazy2 = () => import('./plugins/' + which);\n",
+            "const dyn = () => import(someVar);\n", // still dynamic
+        ),
+    );
+    let out = scan_lang(root, Lang::Js).unwrap();
+    let edges = edges_of(&out);
+    let has = |d: &str| edges.contains(&("loader.ts".to_string(), d.to_string()));
+    // require.context recursive -> everything under plugins/.
+    // import.meta.glob './plugins/*.ts' -> a.ts, b.ts only (one level).
+    // template `./plugins/${name}.ts` -> a.ts, b.ts.
+    // concat './plugins/' + which -> all under plugins/ (ext variants).
+    for d in [
+        "plugins/a.ts",
+        "plugins/b.ts",
+        "plugins/sub/c.ts",
+        "plugins/deep/d.js",
+    ] {
+        assert!(has(d), "missing glob edge to {d}: {edges:?}");
+    }
+    assert!(!has("other/e.ts"), "phantom glob edge: {edges:?}");
+    // `import(someVar)` has no anchor - warns, no edges.
+    assert!(out.warnings.iter().any(|w| w.contains("loader.ts")));
+}

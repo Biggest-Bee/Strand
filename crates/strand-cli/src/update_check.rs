@@ -22,9 +22,9 @@ const LOCK_VERSIONS: &str = include_str!(concat!(env!("OUT_DIR"), "/strand_versi
 /// workspace crate versions at release time.
 const FALLBACK_VERSIONS: &[(&str, &str)] = &[
     ("strand-core", "0.1.0"),
-    ("strand-import", "0.8.0"),
+    ("strand-import", "0.9.0"),
     ("strand-store", "0.2.1"),
-    ("strand-cli", "0.3.8"),
+    ("strand-cli", "0.3.9"),
     ("strand-gui", "0.3.7"),
 ];
 

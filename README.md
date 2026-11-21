@@ -564,14 +564,25 @@ cargo test
   including `tsconfig`/`jsconfig` `paths` aliases and
   `baseUrl` (JSONC-tolerant, `extends` chains followed, nearest config
   per file for monorepos) and `package.json` `"imports"` (`#alias`).
+  Computed imports are resolved when every piece is a literal-derived
+  constant: a per-file set-of-strings pass folds `+`, f-strings,
+  `%`, `.format`, `"".join`, ternaries, dict subscripts, and loops over
+  literal collections (set size capped at 64; mutations and unknown
+  values stay dynamic). Literal glob patterns expand against the
+  scanned files: Python `glob.glob`/`iglob`/`Path.glob`, JS
+  `require.context`, `import.meta.glob`, and template/`+`-concat
+  dynamic imports with a static directory anchor. Framework
+  conventions add edges imports never show: Python `pytest_plugins`,
+  Django `INSTALLED_APPS` dotted strings (longest resolvable module
+  prefix wins), and `conftest.py` ancestors of test files.
   Files that fail to parse are skipped with a warning (the scan may be
   incomplete). It misses
   macro-generated modules (a real parser can't see
   them either without expanding macros - `cargo expand` output is a
   workaround for inspection, not for scanning), `include_str!` payloads,
-  and dynamic language tricks - computed module names
-  (`import_module('pkg.' + name)`), `entry_points` built by function
-  calls, and `getattr()` dispatch on import-bound names stay
+  and dynamic language tricks whose values only exist at runtime -
+  env vars, config, cross-function data flow, and `entry_points` built
+  by function calls stay
   invisible, so runtime-only dependencies can be missed. Each such
   site is counted and reported as a per-file warning ("N dynamic
   import site(s)") so incomplete results are visible. For Rust, when
