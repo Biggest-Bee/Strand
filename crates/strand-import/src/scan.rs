@@ -129,6 +129,7 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         "package.resolved",
         "pubspec.lock",
         "podfile.lock",
+        "paket.lock",
     ];
     let mut lock_files: Vec<(String, PathBuf)> = Vec::new();
     walk_files(root, root, &mut |rel, abs| {
@@ -199,7 +200,24 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
             });
         match pinned {
             Some(nodes_for) if !nodes_for.is_empty() => {
-                for n in nodes_for {
+                // A manifest dep that already carries `@version`
+                // (e.g. requirements.txt `==` pins) prefers the
+                // exact locked node over every version of the name.
+                let exact: Vec<String> = if dst.contains('@') {
+                    nodes_for
+                        .iter()
+                        .filter(|n| n.as_str() == dst)
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let targets = if exact.is_empty() {
+                    nodes_for.as_slice()
+                } else {
+                    exact.as_slice()
+                };
+                for n in targets {
                     if seen_bridge.insert((src.clone(), n.clone())) {
                         bridged.push((src.clone(), n.clone(), w, kind));
                     }
@@ -235,6 +253,7 @@ fn lock_group(fmt: crate::Format) -> Option<&'static str> {
         SwiftResolved => Some("swift"),
         PubspecLock => Some("pub"),
         PodfileLock => Some("cocoapods"),
+        PaketLock => Some("jvm"),
         GoMod | GoSum => Some("go"),
         _ => None,
     }
@@ -260,8 +279,10 @@ fn manifest_group(src: &str) -> Option<&'static str> {
         "pubspec.yaml" => Some("pub"),
         "podfile" => Some("cocoapods"),
         "package.swift" => Some("swift"),
-        "directory.packages.props" => Some("nuget"),
+        "directory.packages.props" | "packages.config" => Some("nuget"),
+        "paket.dependencies" => Some("jvm"),
         _ if f.ends_with(".csproj") => Some("nuget"),
+        _ if f == "setup.py" => Some("python"),
         _ if f.starts_with("requirements") && f.ends_with(".txt") => Some("python"),
         _ => None,
     }

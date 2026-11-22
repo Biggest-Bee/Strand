@@ -38,9 +38,9 @@ fn requirements_txt() {
     let out = scan_manifests(root).unwrap();
     assert_eq!(
         deps_of(&out, "requirements.txt"),
-        vec!["click", "flask", "requests", "urllib3"]
+        // `requests==2.31.0` pins to a versioned node id.
+        vec!["click", "flask", "requests@2.31.0", "urllib3"]
     );
-    assert!(out.nodes.contains(&"requests".to_string()));
     assert!(out
         .edges
         .iter()
@@ -339,4 +339,82 @@ fn cargo_workspace_dependencies() {
     let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
     assert!(deps.contains(&"serde"));
     assert!(deps.contains(&"anyhow"));
+}
+
+#[test]
+fn requirements_pins_emit_versioned_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("requirements.txt"),
+        "requests==2.31.0\nflask>=2.0\nurllib3===1.26.*\nclick\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"requests@2.31.0"));
+    assert!(deps.contains(&"urllib3@1.26"));
+    assert!(deps.contains(&"flask")); // range spec stays bare
+    assert!(deps.contains(&"click"));
+}
+
+#[test]
+fn brewfile_and_compose_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Brewfile"),
+        "brew 'postgresql@15'\ncask \"docker\"\n# brew 'commented'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("compose.yaml"),
+        "services:\n  db:\n    image: postgres:16\n  web:\n    build: .\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"postgresql@15"));
+    assert!(deps.contains(&"docker"));
+    assert!(deps.contains(&"postgres:16"));
+    assert!(!deps.iter().any(|d| d.contains("commented")));
+}
+
+#[test]
+fn packages_config_and_paket() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("packages.config"),
+        "<?xml version=\"1.0\"?><packages><package id=\"Newtonsoft.Json\" version=\"13.0.3\" /></packages>",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("paket.dependencies"),
+        "nuget Newtonsoft.Json\ngithub \"akka/akka\"\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"Newtonsoft.Json"));
+    assert!(deps.contains(&"akka/akka"));
+}
+
+#[test]
+fn version_catalog_and_setup_py() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("libs.versions.toml"),
+        "[versions]\nokhttp = \"4.12.0\"\n[libraries]\nokhttp = { module = \"com.squareup.okhttp3:okhttp\", version.ref = \"okhttp\" }\njunit = \"junit:junit:4.13.2\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("setup.py"),
+        "from setuptools import setup\nsetup(name='x', install_requires=['requests>=2', \"flask==3.0\"], python_requires='>=3.9')\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"com.squareup.okhttp3:okhttp"));
+    assert!(deps.contains(&"junit:junit"));
+    assert!(deps.contains(&"requests"));
+    assert!(deps.contains(&"flask@3.0")); // setup.py uses same pin path? no - check
+    assert!(!deps.contains(&"python"));
 }

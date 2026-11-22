@@ -64,6 +64,15 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
                 | "deno.json"
                 | "deno.jsonc"
                 | "dockerfile"
+                | "brewfile"
+                | "docker-compose.yml"
+                | "docker-compose.yaml"
+                | "compose.yml"
+                | "compose.yaml"
+                | "packages.config"
+                | "paket.dependencies"
+                | "libs.versions.toml"
+                | "setup.py"
                 | "directory.packages.props"
         ) || name.ends_with(".csproj")
             || name.ends_with(".gradle")
@@ -118,6 +127,21 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             podfile_deps(&text)
         } else if name == "deno.json" || name == "deno.jsonc" {
             deno_json_deps(&text)
+        } else if name == "brewfile" {
+            brewfile_deps(&text)
+        } else if matches!(
+            name.as_str(),
+            "docker-compose.yml" | "docker-compose.yaml" | "compose.yml" | "compose.yaml"
+        ) {
+            compose_deps(&text)
+        } else if name == "packages.config" {
+            packages_config_deps(&text)
+        } else if name == "paket.dependencies" {
+            paket_deps(&text)
+        } else if name == "libs.versions.toml" {
+            version_catalog_deps(&text)
+        } else if name == "setup.py" {
+            setup_py_deps(&text)
         } else if name == "package.swift" {
             package_swift_deps(&text)
         } else if name.ends_with(".csproj") || name == "directory.packages.props" {
@@ -261,10 +285,35 @@ fn requirements_deps(text: &str, abs: &Path, root: &Path, depth: usize) -> Vec<S
             continue;
         }
         if let Some(n) = pep503_name(line) {
-            out.push(n);
+            out.push(pin_version(line, n));
         }
     }
     out
+}
+
+/// `name==1.2.3` / `name===1.2.3` pins become `name@1.2.3` node ids
+/// so requirements files carry resolved versions, not just names.
+/// Other specifiers (`>=`, `~=`, bare) keep the bare name.
+fn pin_version(spec: &str, name: String) -> String {
+    let s = spec.split(';').next().unwrap_or("").trim();
+    for (i, _) in s.match_indices("==") {
+        // Skip `>=`/`<=`/`!=`/`~=`: the char before `==`... actually
+        // those operators are single `=`, so `==` only matches the
+        // equality operator. A preceding `=` (i.e. `===`) is fine.
+        let _ = i;
+        let after = &s[i + 2..];
+        let after = after.strip_prefix('=').unwrap_or(after);
+        let ver: String = after
+            .trim_start()
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != ',')
+            .collect();
+        let ver = ver.trim().trim_end_matches(".*");
+        if !ver.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return format!("{name}@{ver}");
+        }
+    }
+    name
 }
 
 /// `pyproject.toml`: PEP 621 `[project]` deps + optional-deps +
@@ -884,6 +933,210 @@ fn strip_jsonc(text: &str) -> String {
                 }
             }
             _ => out.push(c),
+        }
+    }
+    out
+}
+
+// ---------- Brewfile / compose / legacy package formats ----------
+
+/// `Brewfile`: `brew 'name'` / `cask "name"` declarations.
+fn brewfile_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        let rest = t
+            .strip_prefix("brew")
+            .or_else(|| t.strip_prefix("cask"));
+        let Some(rest) = rest else { continue };
+        let rest = rest.trim_start();
+        if !rest.starts_with(['\'', '"']) {
+            continue;
+        }
+        let q = rest.chars().next().unwrap();
+        if let Some(end) = rest[1..].find(q) {
+            let name = &rest[1..1 + end];
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `docker-compose.yml`/`compose.yml`: `services:` -> `image:` refs.
+fn compose_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(services) = doc.get("services").and_then(|v| v.as_mapping()) {
+        for (_svc, cfg) in services {
+            if let Some(img) = cfg.get("image").and_then(|v| v.as_str()) {
+                let img = img.trim();
+                if !img.is_empty() {
+                    out.push(img.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Legacy NuGet `packages.config`: `<package id="X" version="Y"/>`.
+fn packages_config_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("<package") {
+        let after = &rest[i..];
+        // Tag boundary: `<packages` must not match.
+        if after["<package".len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric())
+        {
+            rest = &rest[i + 1..];
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        let attrs = &after[..gt];
+        for q in ['"', '\''] {
+            let needle = format!("id={q}");
+            if let Some(p) = attrs.find(&needle) {
+                let val = &attrs[p + needle.len()..];
+                if let Some(end) = val.find(q) {
+                    let id = val[..end].trim();
+                    if !id.is_empty() {
+                        out.push(id.to_string());
+                    }
+                }
+                break;
+            }
+        }
+        rest = &after[gt + 1..];
+    }
+    out
+}
+
+/// `paket.dependencies`: `nuget Group:Artifact, Version` and
+/// `github "org/repo"` lines.
+fn paket_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("nuget ") {
+            // `nuget Group:Artifact` or `Group % Artifact % Version`
+            let coord = rest
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .replace('%', ":")
+                .trim()
+                .to_string();
+            // `Group:Artifact:Version` -> keep group:artifact.
+            let parts: Vec<&str> = coord.split(':').collect();
+            if parts.len() >= 2 {
+                out.push(format!("{}:{}", parts[0].trim(), parts[1].trim()));
+            }
+        } else if let Some(rest) = t.strip_prefix("github ") {
+            let rest = rest.trim().trim_matches(['"', '\'']);
+            let repo = rest.split('/').take(2).collect::<Vec<_>>().join("/");
+            if repo.contains('/') {
+                out.push(repo);
+            }
+        }
+    }
+    out
+}
+
+/// Gradle version catalog `gradle/libs.versions.toml`:
+/// `[libraries]`/`[plugins]` entries `x = "g:a:v"` or
+/// `x = { module = "g:a", ... }` -> dep `g:a`.
+fn version_catalog_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = toml::from_str::<toml::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for section in ["libraries", "plugins", "bundles"] {
+        let Some(tbl) = doc.get(section).and_then(|v| v.as_table()) else {
+            continue;
+        };
+        for (_alias, val) in tbl {
+            match val {
+                toml::Value::String(s) => {
+                    let parts: Vec<&str> = s.split(':').collect();
+                    if parts.len() >= 3 {
+                        out.push(format!("{}:{}", parts[0], parts[1]));
+                    }
+                }
+                toml::Value::Table(t) => {
+                    if let Some(m) = t.get("module").and_then(|v| v.as_str()) {
+                        let parts: Vec<&str> = m.split(':').collect();
+                        if parts.len() >= 2 {
+                            out.push(format!("{}:{}", parts[0], parts[1]));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// `setup.py`: `install_requires=[...]`, `setup_requires=[...]`,
+/// `tests_require=[...]` lists of quoted requirement strings.
+fn setup_py_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["install_requires", "setup_requires", "tests_require"] {
+        let mut rest = text;
+        while let Some(i) = rest.find(key) {
+            let after_key = &rest[i + key.len()..];
+            // Must be `key =` or `key=`.
+            let trimmed = after_key.trim_start();
+            if !trimmed.starts_with('=') {
+                rest = &rest[i + key.len()..];
+                continue;
+            }
+            let after_eq = trimmed[1..].trim_start();
+            let Some(open) = after_eq.find(['[', '(']) else {
+                break;
+            };
+            let close = if after_eq.as_bytes()[open] == b'[' { ']' } else { ')' };
+            let body = &after_eq[open + 1..];
+            let Some(end) = body.find(close) else { break };
+            let list = &body[..end];
+            // Extract all quoted spans.
+            let bytes = list.as_bytes();
+            let mut j = 0;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if b == b'\'' || b == b'"' {
+                    let q = b;
+                    let mut k = j + 1;
+                    let mut s = String::new();
+                    while k < bytes.len() && bytes[k] != q {
+                        if bytes[k] == b'\\' && k + 1 < bytes.len() {
+                            k += 1;
+                        }
+                        s.push(bytes[k] as char);
+                        k += 1;
+                    }
+                    if let Some(n) = pep503_name(&s) {
+                        out.push(pin_version(&s, n));
+                    }
+                    j = k;
+                }
+                j += 1;
+            }
+            rest = &body[end + 1..];
         }
     }
     out

@@ -51,6 +51,8 @@ pub enum Format {
     BunLock,
     /// `Podfile.lock` (CocoaPods).
     PodfileLock,
+    /// `paket.lock` (JVM, packages.lock.json schema).
+    PaketLock,
     /// `webpack --json` stats output (per-module resolved deps).
     WebpackStats,
     /// `esbuild --metafile` JSON output (per-input imports).
@@ -83,6 +85,7 @@ pub fn parse(text: &str, format: Format) -> Result<EdgeList> {
         Format::UvLock => locks::uv_lock(text),
         Format::BunLock => locks::bun_lock(text),
         Format::PodfileLock => locks::podfile_lock(text),
+        Format::PaketLock => locks::nuget_lock(text),
         Format::WebpackStats => bundler::webpack_stats(text),
         Format::EsbuildMeta => bundler::esbuild_meta(text),
     }
@@ -109,6 +112,7 @@ pub fn detect_format(path: &std::path::Path, text: &str) -> Format {
             "uv.lock" => return Format::UvLock,
             "bun.lock" => return Format::BunLock,
             "podfile.lock" => return Format::PodfileLock,
+            "paket.lock" => return Format::PaketLock,
             _ => {}
         }
     }
