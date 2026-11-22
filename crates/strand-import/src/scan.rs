@@ -1250,7 +1250,7 @@ fn ts_is_dynamic_call(call: tree_sitter::Node, src: &str) -> bool {
 
 // ---------- Python scanner ----------
 
-const PY_EXTS: &[&str] = &["py"];
+const PY_EXTS: &[&str] = &["py", "pyi"];
 
 /// One import found by the tree-sitter Python parse.
 enum PyRef {
@@ -1274,6 +1274,9 @@ enum PyRef {
     /// `entry_points(group="x")` consumer lookups - group names
     /// resolved via const-prop; empty vec means "all groups".
     EpGroup(Vec<String>),
+    /// `runpy.run_path("script.py")` - a file path (not a module
+    /// path) resolved file-dir relative, then project-root relative.
+    PathDep(String),
 }
 
 // ---------- Python constant propagation ----------
@@ -2277,6 +2280,24 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize) {
                     }
                     PyDynCall::NotDynamic => {}
                 }
+                // `runpy.run_path("script.py")` - literal/const file
+                // path dep (module path handled above via run_module).
+                if let Some(func) = node.child_by_field_name("function") {
+                    if let Ok(ft) = func.utf8_text(text.as_bytes()) {
+                        if ft == "run_path" || ft.ends_with(".run_path") {
+                            match py_first_arg(node)
+                                .and_then(|a| py_eval_strset(&env, a, text, 0))
+                            {
+                                Some(vals) => {
+                                    for v in vals {
+                                        out.push(PyRef::PathDep(v));
+                                    }
+                                }
+                                None => dynamic += 1,
+                            }
+                        }
+                    }
+                }
                 // glob.glob/iglob/Path.glob with a literal or
                 // const-derived pattern - matched against the file set.
                 if let Some(func) = node.child_by_field_name("function") {
@@ -2471,7 +2492,9 @@ fn py_dyn_call_kind(call: tree_sitter::Node, text: &str, env: &PyEnv) -> PyDynCa
     let is_dyn = func_text == "__import__"
         || func_text == "import_module"
         || func_text.ends_with(".import_module")
-        || func_text.ends_with(".__import__");
+        || func_text.ends_with(".__import__")
+        || func_text == "run_module"
+        || func_text.ends_with(".run_module");
     if !is_dyn {
         return PyDynCall::NotDynamic;
     }
@@ -2864,6 +2887,19 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                                     break 'outer;
                                 }
                             }
+                        }
+                    }
+                }
+                PyRef::PathDep(spec) => {
+                    // File path: file-dir relative, then project-root
+                    // relative - same rule as `# strand: depends-on`.
+                    if let Some(dep) = [parent, ""]
+                        .iter()
+                        .filter_map(|b| normalize_rel(b, &spec))
+                        .find(|c| names.contains(c))
+                    {
+                        if dep != *rel {
+                            note_dep(&mut deps, dep, EdgeKind::Static);
                         }
                     }
                 }
@@ -3488,7 +3524,13 @@ fn ancestor_bases(rel: &str) -> Vec<String> {
 fn resolve_py(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Option<String> {
     for k in (1..=segs.len()).rev() {
         let p = join_rel(base, &segs[..k]);
-        for cand in [format!("{p}.py"), format!("{p}/__init__.py")] {
+        // .py before .pyi: the implementation wins over the stub.
+        for cand in [
+            format!("{p}.py"),
+            format!("{p}.pyi"),
+            format!("{p}/__init__.py"),
+            format!("{p}/__init__.pyi"),
+        ] {
             if names.contains(&cand) {
                 return Some(cand);
             }
@@ -3500,7 +3542,12 @@ fn resolve_py(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Option<S
 /// Exact full-path resolution for `import a.b.c` statements.
 fn resolve_py_exact(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Option<String> {
     let p = join_rel(base, segs);
-    for cand in [format!("{p}.py"), format!("{p}/__init__.py")] {
+    for cand in [
+        format!("{p}.py"),
+        format!("{p}.pyi"),
+        format!("{p}/__init__.py"),
+        format!("{p}/__init__.pyi"),
+    ] {
         if names.contains(&cand) {
             return Some(cand);
         }
@@ -3510,13 +3557,18 @@ fn resolve_py_exact(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Op
 
 // ---------- JS/TS scanner ----------
 
-const JS_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+const JS_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"];
 
 fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     walk_ext(root, root, JS_EXTS, &mut files)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    // `.json` files are resolvable import targets (`import data from
+    // './x.json'`) but are not themselves import-scanned.
+    let mut json_files: Vec<(String, PathBuf)> = Vec::new();
+    walk_ext(root, root, &["json"], &mut json_files)?;
+    let mut names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    names.extend(json_files.iter().map(|(n, _)| n.clone()));
     let mut edges: EdgeList = Vec::new();
     let mut warnings = Vec::new();
     let mut alias_cache = JsAliasCache::new(root);
@@ -3543,7 +3595,8 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
                 let Some(norm) = normalize_rel(parent, &spec) else {
                     continue;
                 };
-                if let Some(dep) = resolve_js(&names, &norm) {
+                let dep = resolve_js(&names, &norm).or_else(|| resolve_json(&names, &norm));
+                if let Some(dep) = dep {
                     if dep != *rel {
                         note_dep(&mut deps, dep, EdgeKind::Static);
                     }
@@ -3617,11 +3670,15 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
 
 /// tree-sitter grammar for a JS/TS file extension.
 fn js_language_for(rel: &str) -> tree_sitter::Language {
-    match rel.rsplit('.').next() {
-        Some("ts") => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Some("tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        _ => tree_sitter_javascript::LANGUAGE.into(),
+    let lower = rel.to_lowercase();
+    if lower.ends_with(".tsx") {
+        return tree_sitter_typescript::LANGUAGE_TSX.into();
     }
+    // .ts, .d.ts, .mts, .cts all parse under the TS grammar.
+    if lower.ends_with(".ts") || lower.ends_with(".mts") || lower.ends_with(".cts") {
+        return tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+    }
+    tree_sitter_javascript::LANGUAGE.into()
 }
 
 /// Expand a JS glob pattern against scanned file names, relative to
@@ -3660,11 +3717,49 @@ fn resolve_js(names: &BTreeSet<String>, norm: &str) -> Option<String> {
             return Some(cand);
         }
     }
+    // `./x` -> `x.d.ts` declaration files.
+    let cand = format!("{norm}.d.ts");
+    if names.contains(&cand) {
+        return Some(cand);
+    }
     for ext in JS_EXTS {
         let cand = format!("{norm}/index.{ext}");
         if names.contains(&cand) {
             return Some(cand);
         }
+    }
+    // NodeNext / bundler convention: `./x.js` resolves to `x.ts` or
+    // `x.tsx`, `.mjs` -> `.mts`, `.cjs` -> `.cts`, `.jsx` -> `.tsx`.
+    // Try the extensionless stem against every script extension.
+    for script_ext in [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"] {
+        let Some(stem) = norm.strip_suffix(script_ext) else {
+            continue;
+        };
+        for ext in JS_EXTS {
+            let cand = format!("{stem}.{ext}");
+            if names.contains(&cand) {
+                return Some(cand);
+            }
+        }
+        let cand = format!("{stem}.d.ts");
+        if names.contains(&cand) {
+            return Some(cand);
+        }
+        break;
+    }
+    None
+}
+
+/// JSON module resolution: `./data.json` exact, `./data` ->
+/// `data.json`, `./dir` -> `dir/index.json`? (no - JSON has no
+/// index convention; exact + `.json` suffix only).
+fn resolve_json(names: &BTreeSet<String>, norm: &str) -> Option<String> {
+    if names.contains(norm) && norm.ends_with(".json") {
+        return Some(norm.to_string());
+    }
+    let cand = format!("{norm}.json");
+    if names.contains(&cand) {
+        return Some(cand);
     }
     None
 }
