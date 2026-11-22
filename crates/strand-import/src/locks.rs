@@ -22,11 +22,11 @@ fn strip_line_comment(line: &str) -> &str {
     line.split("//").next().unwrap_or("")
 }
 
-/// Extract the first whitespace-separated token of each `"..."` string
-/// in a TOML-ish array fragment like `"a", "b 1.0 (src)",`.
-fn quoted_first_tokens(s: &str) -> Vec<String> {
+
+/// Inner content of each `"..."` string in a TOML-ish array fragment.
+fn quoted_strings(s: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut it = s.chars().peekable();
+    let mut it = s.chars();
     while let Some(c) = it.next() {
         if c == '"' {
             let mut tok = String::new();
@@ -36,11 +36,7 @@ fn quoted_first_tokens(s: &str) -> Vec<String> {
                 }
                 tok.push(c);
             }
-            if let Some(name) = tok.split_whitespace().next() {
-                if !name.is_empty() {
-                    out.push(name.to_string());
-                }
-            }
+            out.push(tok);
         }
     }
     out
@@ -52,14 +48,114 @@ fn push_edge(edges: &mut EdgeList, src: &str, dst: String) {
     }
 }
 
+/// Source node id used by flat lockfiles (no inter-package edges
+/// recorded): `scan_project` rewrites it to the lockfile's rel path.
+pub(crate) const FLAT_SRC: &str = "(lockfile)";
+
+/// `name@version` node id; bare `name` when version is empty.
+fn nv(name: &str, version: &str) -> String {
+    if version.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}@{version}")
+    }
+}
+
+/// Split a `name@version` node id. The `@` must be followed by a
+/// digit so scoped names (`@scope/name`) and `name@range` specs are
+/// not mistaken for pinned ids.
+fn split_nv(node: &str) -> (&str, &str) {
+    if let Some(i) = node.rfind('@') {
+        if i > 0 && node[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return (&node[..i], &node[i + 1..]);
+        }
+    }
+    (node, "")
+}
+
+/// Index of locked `name@version` node ids by bare name. Dep
+/// references that carry no version resolve through it: a unique
+/// version pins to `name@ver`; several versions emit a may-edge to
+/// the bare `name` plus `name -> name@ver` disambiguation edges.
+#[derive(Default)]
+struct VerIndex {
+    by_name: BTreeMap<String, Vec<String>>,
+}
+
+impl VerIndex {
+    fn add(&mut self, node: &str) {
+        let (n, _) = split_nv(node);
+        let v = self.by_name.entry(n.to_string()).or_default();
+        if !v.contains(&node.to_string()) {
+            v.push(node.to_string());
+        }
+    }
+
+    /// Node ids a bare dep `name` resolves to. `seen`/`edges`
+    /// collect the `name -> name@ver` disambiguation edges emitted
+    /// for multi-version names.
+    fn resolve(
+        &self,
+        name: &str,
+        edges: &mut EdgeList,
+        seen: &mut BTreeSet<(String, String)>,
+    ) -> Vec<String> {
+        match self.by_name.get(name).map(Vec::as_slice) {
+            Some([]) | None => vec![name.to_string()],
+            Some([one]) => vec![one.clone()],
+            Some(many) => {
+                for m in many {
+                    if seen.insert((name.to_string(), m.clone())) {
+                        edges.push((
+                            name.to_string(),
+                            m.clone(),
+                            None,
+                            strand_core::EdgeKind::Static,
+                        ));
+                    }
+                }
+                vec![name.to_string()]
+            }
+        }
+    }
+}
+
 // ---------- Cargo.lock ----------
 
-/// Parse `Cargo.lock`. `[[package]]` blocks carry `name = "..."` and a
-/// possibly multi-line `dependencies = [ "dep", "dep ver (src)", ... ]`.
+/// Parse `Cargo.lock`. `[[package]]` blocks carry `name`, `version`,
+/// and a possibly multi-line `dependencies = [ "dep", "dep ver
+/// (src)", ... ]`. Nodes are `name@version`; dep strings that omit a
+/// version resolve through the package index (unique version pins,
+/// several versions get may-edges to the bare name plus
+/// disambiguation edges). Every package emits a self-loop edge as a
+/// node declaration (skipped as an edge by `fill_builder`).
 pub fn cargo_lock(text: &str) -> Result<EdgeList> {
-    let mut edges = EdgeList::new();
-    let mut cur: Option<String> = None;
+    struct Pkg {
+        name: String,
+        version: String,
+        deps: Vec<String>, // raw quoted dep strings
+    }
+    let mut pkgs: Vec<Pkg> = Vec::new();
+    let mut cur_name = String::new();
+    let mut cur_ver = String::new();
+    let mut cur_deps: Vec<String> = Vec::new();
     let mut dep_buf: Option<String> = None;
+    let mut have_pkg = false;
+
+    let flush = |pkgs: &mut Vec<Pkg>,
+                     name: &mut String,
+                     ver: &mut String,
+                     deps: &mut Vec<String>,
+                     have: &mut bool| {
+        if *have {
+            pkgs.push(Pkg {
+                name: std::mem::take(name),
+                version: std::mem::take(ver),
+                deps: std::mem::take(deps),
+            });
+            *have = false;
+        }
+    };
 
     for line in text.lines() {
         let t = line.trim();
@@ -67,17 +163,13 @@ pub fn cargo_lock(text: &str) -> Result<EdgeList> {
             buf.push(' ');
             buf.push_str(t);
             if t.contains(']') {
-                if let Some(src) = &cur {
-                    for dep in quoted_first_tokens(buf) {
-                        push_edge(&mut edges, src, dep);
-                    }
-                }
+                cur_deps.extend(quoted_strings(buf));
                 dep_buf = None;
             }
             continue;
         }
         if t == "[[package]]" {
-            cur = None;
+            flush(&mut pkgs, &mut cur_name, &mut cur_ver, &mut cur_deps, &mut have_pkg);
             continue;
         }
         if t.starts_with('[') {
@@ -87,14 +179,14 @@ pub fn cargo_lock(text: &str) -> Result<EdgeList> {
             let key = key.trim();
             let val = val.trim();
             match key {
-                "name" => cur = Some(unquote(val)),
+                "name" => {
+                    cur_name = unquote(val);
+                    have_pkg = true;
+                }
+                "version" => cur_ver = unquote(val),
                 "dependencies" if val.starts_with('[') => {
                     if val.contains(']') {
-                        if let Some(src) = &cur {
-                            for dep in quoted_first_tokens(val) {
-                                push_edge(&mut edges, src, dep);
-                            }
-                        }
+                        cur_deps.extend(quoted_strings(val));
                     } else {
                         dep_buf = Some(val.to_string());
                     }
@@ -103,25 +195,88 @@ pub fn cargo_lock(text: &str) -> Result<EdgeList> {
             }
         }
     }
+    flush(&mut pkgs, &mut cur_name, &mut cur_ver, &mut cur_deps, &mut have_pkg);
+
+    let mut index = VerIndex::default();
+    let nodes: Vec<String> = pkgs.iter().map(|p| nv(&p.name, &p.version)).collect();
+    for n in &nodes {
+        index.add(n);
+    }
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for n in &nodes {
+        // Node declaration: self-loop, skipped as an edge downstream.
+        if seen.insert((n.clone(), n.clone())) {
+            edges.push((n.clone(), n.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+    for (p, node) in pkgs.iter().zip(&nodes) {
+        for d in &p.deps {
+            // Dep string: `name`, `name version`, or
+            // `name version (source)`. An explicit version pins the
+            // node directly; otherwise resolve via the index.
+            let toks: Vec<&str> = d.split_whitespace().collect();
+            let Some(name) = toks.first() else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            let ver = toks.get(1).copied().unwrap_or("");
+            let dsts = if !ver.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                vec![nv(name, ver)]
+            } else {
+                index.resolve(name, &mut edges, &mut seen)
+            };
+            for dst in dsts {
+                if seen.insert((node.clone(), dst.clone())) {
+                    edges.push((node.clone(), dst, None, strand_core::EdgeKind::Static));
+                }
+            }
+        }
+    }
     Ok(edges)
 }
 
 // ---------- poetry.lock ----------
 
-/// Parse `poetry.lock`. `[[package]]` blocks have `[package.dependencies]`
-/// and `[package.dev-dependencies]` tables of `name = constraint` lines.
+/// Parse `poetry.lock`. `[[package]]` blocks have `name`, `version`,
+/// and `[package.dependencies]`/`[package.dev-dependencies]` tables
+/// of `name = constraint` lines. Nodes are `name@version`; dep names
+/// resolve through the package index like [`cargo_lock`]. Every
+/// package emits a self-loop node declaration.
 pub fn poetry_lock(text: &str) -> Result<EdgeList> {
-    let mut edges = EdgeList::new();
-    let mut cur: Option<String> = None;
-    // None = not in a dep table; Some(true) = deps, Some(false) = dev-deps
-    // (both treated the same; the flag exists only for clarity).
+    struct Pkg {
+        name: String,
+        version: String,
+        deps: Vec<String>,
+    }
+    let mut pkgs: Vec<Pkg> = Vec::new();
+    let mut name = String::new();
+    let mut ver = String::new();
+    let mut deps: Vec<String> = Vec::new();
+    let mut have = false;
+    // None = not in a dep table.
     let mut in_deps = false;
     let mut depth = 0i32; // {} [] nesting inside a dep value
+
+    let flush = |pkgs: &mut Vec<Pkg>,
+                     name: &mut String,
+                     ver: &mut String,
+                     deps: &mut Vec<String>,
+                     have: &mut bool| {
+        if *have {
+            pkgs.push(Pkg {
+                name: std::mem::take(name),
+                version: std::mem::take(ver),
+                deps: std::mem::take(deps),
+            });
+            *have = false;
+        }
+    };
 
     for line in text.lines() {
         let t = line.trim();
         if t == "[[package]]" {
-            cur = None;
+            flush(&mut pkgs, &mut name, &mut ver, &mut deps, &mut have);
             in_deps = false;
             depth = 0;
             continue;
@@ -131,30 +286,29 @@ pub fn poetry_lock(text: &str) -> Result<EdgeList> {
             depth = 0;
             continue;
         }
-        if let Some((key, _)) = t.split_once('=') {
-            if key.trim() == "name" && cur.is_none() && !in_deps {
-                // Only the package's own `name`, not table keys.
-                if let Some((k, v)) = t.split_once('=') {
-                    if k.trim() == "name" {
-                        cur = Some(unquote(v.trim()));
-                        continue;
-                    }
-                }
+        if let Some((key, val)) = t.split_once('=') {
+            let key = key.trim();
+            if key == "name" && !in_deps && cur_name_empty(&name) {
+                name = unquote(val.trim());
+                have = true;
+                continue;
+            }
+            if key == "version" && !in_deps && have {
+                ver = unquote(val.trim());
+                continue;
             }
         }
         if !in_deps {
             continue;
         }
-        // In a dep table: `name = "^1.0"` or `name = {version = "...", ...}`
+        // In a dep table: `name = "^1.0"` or `name = {version = "..."}`
         // possibly spanning lines. A `key =` at brace depth 0 starts a
         // dep; continuation lines (depth > 0) are part of its value.
         if depth == 0 {
             if let Some((key, _)) = t.split_once('=') {
                 let dep = unquote(key.trim());
                 if dep != "python" {
-                    if let Some(src) = &cur {
-                        push_edge(&mut edges, src, dep);
-                    }
+                    deps.push(dep);
                 }
             }
         }
@@ -167,7 +321,34 @@ pub fn poetry_lock(text: &str) -> Result<EdgeList> {
         }
         depth = depth.max(0);
     }
+    flush(&mut pkgs, &mut name, &mut ver, &mut deps, &mut have);
+
+    let mut index = VerIndex::default();
+    let nodes: Vec<String> = pkgs.iter().map(|p| nv(&p.name, &p.version)).collect();
+    for n in &nodes {
+        index.add(n);
+    }
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for n in &nodes {
+        if seen.insert((n.clone(), n.clone())) {
+            edges.push((n.clone(), n.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+    for (p, node) in pkgs.iter().zip(&nodes) {
+        for dep in &p.deps {
+            for dst in index.resolve(dep, &mut edges, &mut seen) {
+                if seen.insert((node.clone(), dst.clone())) {
+                    edges.push((node.clone(), dst, None, strand_core::EdgeKind::Static));
+                }
+            }
+        }
+    }
     Ok(edges)
+}
+
+fn cur_name_empty(name: &str) -> bool {
+    name.is_empty()
 }
 
 // ---------- go.mod ----------
@@ -792,3 +973,567 @@ pub fn pnpm_lock(text: &str) -> Result<EdgeList> {
     }
     Ok(edges)
 }
+
+// ---------- composer.lock (PHP) ----------
+
+/// Parse `composer.lock`: `packages` + `packages-dev` arrays of
+/// `{name, version, require: {dep: constraint}}`. Nodes `name@version`.
+pub fn composer_lock(text: &str) -> Result<EdgeList> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| err(format!("composer.lock: {e}")))?;
+    let mut pkgs = Vec::new();
+    for section in ["packages", "packages-dev"] {
+        if let Some(arr) = v[section].as_array() {
+            for p in arr {
+                let name = p["name"].as_str().unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let ver = p["version"].as_str().unwrap_or("");
+                let mut deps = Vec::new();
+                if let Some(req) = p["require"].as_object() {
+                    deps.extend(req.keys().cloned());
+                }
+                pkgs.push(PkgSpec {
+                    node: nv(name, ver),
+                    deps,
+                });
+            }
+        }
+    }
+    Ok(indexed_edges(&pkgs))
+}
+
+// ---------- Gemfile.lock (Ruby) ----------
+
+/// Parse `Gemfile.lock`. `GEM`/`PATH`/`GIT` sections hold `specs:`
+/// entries `    name (version)` with dep lines `      dep (req)`.
+/// `DEPENDENCIES` is the root list (covered by the Gemfile manifest).
+/// Nodes `name@version`.
+pub fn gemfile_lock(text: &str) -> Result<EdgeList> {
+    let mut pkgs: Vec<PkgSpec> = Vec::new();
+    let mut in_specs = false;
+    let mut cur: Option<usize> = None;
+
+    for raw in text.lines() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let ind = raw.len() - raw.trim_start().len();
+        let t = raw.trim();
+        // Section headers are unindented uppercase words.
+        if ind == 0 {
+            in_specs = false;
+            cur = None;
+            if matches!(t, "GEM" | "PATH" | "GIT") {
+                // specs: marker handled below
+            } else if t == "DEPENDENCIES:" || t == "SPEC CHECKSUMS:" || t.starts_with("PODFILE") {
+                // not spec sections
+            }
+            continue;
+        }
+        if !in_specs {
+            if t == "specs:" {
+                in_specs = true;
+            }
+            continue;
+        }
+        // Inside specs: `    name (version)` at indent 4 starts a
+        // spec; `      dep (req)` at indent 6 is its dependency.
+        if ind <= 4 {
+            if let Some((name, ver)) = parse_paren_spec(t) {
+                pkgs.push(PkgSpec {
+                    node: nv(name, ver),
+                    deps: Vec::new(),
+                });
+                cur = Some(pkgs.len() - 1);
+            }
+            continue;
+        }
+        if let (Some(ci), Some((dn, _))) = (cur, parse_paren_spec(t)) {
+            pkgs[ci].deps.push(dn.to_string());
+        }
+    }
+    if pkgs.is_empty() {
+        return Err(err("Gemfile.lock: no specs found"));
+    }
+    Ok(indexed_edges(&pkgs))
+}
+
+/// `name (version)` -> (name, version). Version keeps platform
+/// suffixes (`1.2.3-java`).
+fn parse_paren_spec(t: &str) -> Option<(&str, &str)> {
+    let open = t.rfind('(')?;
+    let close = t.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let name = t[..open].trim();
+    let ver = t[open + 1..close].trim();
+    if name.is_empty() || ver.is_empty() || name.contains(' ') {
+        return None;
+    }
+    Some((name, ver))
+}
+
+// ---------- packages.lock.json (NuGet) ----------
+
+/// Parse `packages.lock.json` (NuGet PackageReference restore).
+/// `dependencies` maps target framework -> package id ->
+/// `{resolved, dependencies: {id: range}}`. Nodes `id@resolved`.
+pub fn nuget_lock(text: &str) -> Result<EdgeList> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| err(format!("packages.lock.json: {e}")))?;
+    let mut pkgs: Vec<(String, Vec<String>)> = Vec::new(); // (node, dep ids)
+    let mut seen_nodes: BTreeSet<String> = BTreeSet::new();
+    if let Some(targets) = v["dependencies"].as_object() {
+        for (_tfm, pkgs_obj) in targets {
+            let Some(pkgs_obj) = pkgs_obj.as_object() else {
+                continue;
+            };
+            // id -> resolved version within this target.
+            let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+            for (id, meta) in pkgs_obj {
+                if let Some(r) = meta["resolved"].as_str() {
+                    resolved.insert(id.clone(), r.to_string());
+                }
+            }
+            for (id, meta) in pkgs_obj {
+                let ver = meta["resolved"].as_str().unwrap_or("");
+                let node = nv(id, ver);
+                if !seen_nodes.insert(node.clone()) {
+                    continue;
+                }
+                let mut deps = Vec::new();
+                if let Some(d) = meta["dependencies"].as_object() {
+                    for did in d.keys() {
+                        // Resolve dep id to its locked version in
+                        // this target; bare id when unknown.
+                        let dnode = resolved
+                            .get(did)
+                            .map(|dv| nv(did, dv))
+                            .unwrap_or_else(|| did.clone());
+                        deps.push(dnode);
+                    }
+                }
+                pkgs.push((node, deps));
+            }
+        }
+    }
+    // pkgs deps are already node ids, not bare names - build edges
+    // directly with self-loop declarations.
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for (n, _) in &pkgs {
+        if seen.insert((n.clone(), n.clone())) {
+            edges.push((n.clone(), n.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+    for (node, deps) in &pkgs {
+        for dst in deps {
+            if seen.insert((node.clone(), dst.clone())) {
+                edges.push((node.clone(), dst.clone(), None, strand_core::EdgeKind::Static));
+            }
+        }
+    }
+    Ok(edges)
+}
+
+// ---------- Package.resolved (Swift) ----------
+
+/// Parse `Package.resolved` (SwiftPM). `pins[]` carry `identity`
+/// and `state.version`/`state.revision`. The format records no
+/// inter-package edges, so each pin hangs off [`FLAT_SRC`].
+pub fn swift_resolved(text: &str) -> Result<EdgeList> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| err(format!("Package.resolved: {e}")))?;
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    if let Some(pins) = v["pins"].as_array() {
+        for p in pins {
+            let id = p["identity"].as_str().unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let ver = p["state"]["version"]
+                .as_str()
+                .or_else(|| p["state"]["revision"].as_str())
+                .unwrap_or("");
+            let node = nv(id, ver);
+            if seen.insert(node.clone()) {
+                edges.push((
+                    FLAT_SRC.to_string(),
+                    node,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("Package.resolved: no pins found"));
+    }
+    Ok(edges)
+}
+
+// ---------- pubspec.lock (Dart/Flutter) ----------
+
+/// Parse `pubspec.lock`. `packages:` maps name -> `{version, ...}`.
+/// The format records no inter-package edges, so each package hangs
+/// off [`FLAT_SRC`].
+pub fn pubspec_lock(text: &str) -> Result<EdgeList> {
+    let doc: serde_yml::Value =
+        serde_yml::from_str(text).map_err(|e| err(format!("pubspec.lock: {e}")))?;
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    if let Some(pkgs) = doc.get("packages").and_then(|v| v.as_mapping()) {
+        for (name_v, meta) in pkgs {
+            let Some(name) = name_v.as_str() else { continue };
+            let ver = meta.get("version").and_then(|v| v.as_str()).unwrap_or("");
+            let node = nv(name, ver);
+            if seen.insert(node.clone()) {
+                edges.push((
+                    FLAT_SRC.to_string(),
+                    node,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("pubspec.lock: no packages found"));
+    }
+    Ok(edges)
+}
+
+// ---------- go.sum ----------
+
+/// Parse `go.sum`: `module version hash` lines (plus `/go.mod`
+/// hash variants). Emits `module -> module version` edges so the
+/// bare module nodes that `go.mod` requires point at their locked
+/// versions.
+pub fn go_sum(text: &str) -> Result<EdgeList> {
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(module), Some(ver)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if module.is_empty() {
+            continue;
+        }
+        let ver = ver.strip_suffix("/go.mod").unwrap_or(ver);
+        if ver.is_empty() {
+            continue;
+        }
+        let dst = format!("{module} {ver}");
+        if seen.insert((module.to_string(), dst.clone())) {
+            edges.push((module.to_string(), dst, None, strand_core::EdgeKind::Static));
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("go.sum: no module entries found"));
+    }
+    Ok(edges)
+}
+
+// ---------- uv.lock ----------
+
+/// Parse `uv.lock` (uv). `[[package]]` entries carry `name`,
+/// `version`, and `dependencies = [{name = "...", ...}]`. Dep
+/// entries pin no version, so names resolve through the package
+/// index. Nodes `name@version`.
+pub fn uv_lock(text: &str) -> Result<EdgeList> {
+    let doc: toml::Value = toml::from_str(text).map_err(|e| err(format!("uv.lock: {e}")))?;
+    let mut pkgs = Vec::new();
+    if let Some(arr) = doc.get("package").and_then(|v| v.as_array()) {
+        for p in arr {
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("");
+            let mut deps = Vec::new();
+            if let Some(darr) = p.get("dependencies").and_then(|v| v.as_array()) {
+                for d in darr {
+                    if let Some(dn) = d.get("name").and_then(|v| v.as_str()) {
+                        if !dn.is_empty() {
+                            deps.push(dn.to_string());
+                        }
+                    }
+                }
+            }
+            pkgs.push(PkgSpec {
+                node: nv(name, ver),
+                deps,
+            });
+        }
+    }
+    if pkgs.is_empty() {
+        return Err(err("uv.lock: no packages found"));
+    }
+    Ok(indexed_edges(&pkgs))
+}
+
+// ---------- bun.lock ----------
+
+/// Parse `bun.lock` (JSONC). `workspaces` maps project dirs to
+/// their declared deps (emitted as `<dir>/package.json -> dep`,
+/// matching the package.json manifest nodes); `packages` maps
+/// `name@version` to `[resolution, {dependencies: {...}}]`.
+pub fn bun_lock(text: &str) -> Result<EdgeList> {
+    let cleaned = jsonc_clean(text);
+    let v: serde_json::Value =
+        serde_json::from_str(&cleaned).map_err(|e| err(format!("bun.lock: {e}")))?;
+
+    // Index of locked `name@version` package keys by bare name.
+    let mut index = VerIndex::default();
+    if let Some(pkgs) = v["packages"].as_object() {
+        for key in pkgs.keys() {
+            index.add(key);
+        }
+    }
+
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+
+    // Resolve a dep spec like `^1.0`, `npm:name@1.2.3`, `name@1.2.3`,
+    // `workspace:*` to locked node ids.
+    fn resolve_spec(
+        index: &VerIndex,
+        name: &str,
+        spec: &str,
+        edges: &mut EdgeList,
+        seen: &mut BTreeSet<(String, String)>,
+    ) -> Vec<String> {
+        let spec = spec.strip_prefix("npm:").unwrap_or(spec);
+        if let Some((n, ver)) = spec.rsplit_once('@') {
+            if n == name && !ver.is_empty() && !ver.contains(':') {
+                let node = nv(name, ver);
+                if index.by_name.get(name).is_some_and(|v| v.contains(&node)) {
+                    return vec![node];
+                }
+            }
+        }
+        index.resolve(name, edges, seen)
+    }
+
+    // workspaces: dir -> {name?, dependencies/devDependencies/...}
+    if let Some(ws) = v["workspaces"].as_object() {
+        for (dir, meta) in ws {
+            let src = if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            };
+            for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+                if let Some(deps) = meta[section].as_object() {
+                    for (name, spec) in deps {
+                        let spec = spec.as_str().unwrap_or("");
+                        if spec == "workspace:*" || spec.starts_with("link:") {
+                            continue; // intra-workspace, not external
+                        }
+                        for dst in resolve_spec(&index, name, spec, &mut edges, &mut seen) {
+                            if src != dst && seen.insert((src.clone(), dst.clone())) {
+                                edges.push((
+                                    src.clone(),
+                                    dst,
+                                    None,
+                                    strand_core::EdgeKind::Static,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // packages: `name@ver` -> [resolution, meta?]
+    if let Some(pkgs) = v["packages"].as_object() {
+        for (key, val) in pkgs {
+            let meta = if let Some(arr) = val.as_array() {
+                arr.get(1).cloned().unwrap_or(serde_json::Value::Null)
+            } else {
+                val.clone()
+            };
+            for section in ["dependencies", "optionalDependencies", "peerDependencies"] {
+                if let Some(deps) = meta[section].as_object() {
+                    for (name, spec) in deps {
+                        let spec = spec.as_str().unwrap_or("");
+                        for dst in resolve_spec(&index, name, spec, &mut edges, &mut seen) {
+                            if key != &dst && seen.insert((key.clone(), dst.clone())) {
+                                edges.push((
+                                    key.clone(),
+                                    dst,
+                                    None,
+                                    strand_core::EdgeKind::Static,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            // Node declaration so leaf packages still appear.
+            if seen.insert((key.clone(), key.clone())) {
+                edges.push((
+                    key.clone(),
+                    key.clone(),
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("bun.lock: no packages found"));
+    }
+    Ok(edges)
+}
+
+/// Strip `//` line comments and trailing commas from JSONC text
+/// (bun.lock). String-aware: `//` inside quotes is preserved.
+fn jsonc_clean(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_str = false;
+    let mut esc = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ',' => {
+                // Drop the comma if the next non-ws char closes a
+                // container (trailing comma).
+                let mut lookahead = chars.clone();
+                let mut next = None;
+                for c in lookahead.by_ref() {
+                    if !c.is_whitespace() {
+                        next = Some(c);
+                        break;
+                    }
+                }
+                match next {
+                    Some('}') | Some(']') => {}
+                    _ => out.push(','),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+// ---------- Podfile.lock (CocoaPods) ----------
+
+/// Parse `Podfile.lock`. `PODS:` entries `  - Name (version)` may be
+/// followed by deeper `    - Dep (constraint)` lines; dep names
+/// without `/` (subspecs) are external pod deps. `DEPENDENCIES:` is
+/// the root list (covered by the Podfile manifest). Nodes
+/// `Name@version`.
+pub fn podfile_lock(text: &str) -> Result<EdgeList> {
+    let mut pkgs = Vec::new();
+    let mut in_pods = false;
+    let mut cur: Option<usize> = None;
+
+    for raw in text.lines() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let ind = raw.len() - raw.trim_start().len();
+        let t = raw.trim();
+        if ind == 0 {
+            in_pods = t == "PODS:";
+            cur = None;
+            continue;
+        }
+        if !in_pods {
+            continue;
+        }
+        let Some(item) = t.strip_prefix("- ") else {
+            continue;
+        };
+        if ind <= 2 {
+            // `  - Name (version)` or `  - Name (version):`
+            if let Some((name, ver)) = parse_paren_spec(item.trim_end_matches(':')) {
+                pkgs.push(PkgSpec {
+                    node: nv(name, ver),
+                    deps: Vec::new(),
+                });
+                cur = Some(pkgs.len() - 1);
+            }
+            continue;
+        }
+        // Deeper `- Dep (req)`: subspecs contain `/`, skip those.
+        if let (Some(ci), Some((dn, _))) = (cur, parse_paren_spec(item)) {
+            if !dn.contains('/') {
+                pkgs[ci].deps.push(dn.to_string());
+            }
+        }
+    }
+    if pkgs.is_empty() {
+        return Err(err("Podfile.lock: no pods found"));
+    }
+    Ok(indexed_edges(&pkgs))
+}
+
+// ---------- shared ----------
+
+/// One locked package: `node` is its `name@version` id, `deps` are
+/// bare dep names resolved through [`VerIndex`].
+struct PkgSpec {
+    node: String,
+    deps: Vec<String>,
+}
+
+/// Build `name@version -> dep` edges for a package list whose deps
+/// are bare names: self-loop node declarations plus index-resolved
+/// dep edges with multi-version disambiguation.
+fn indexed_edges(pkgs: &[PkgSpec]) -> EdgeList {
+    let mut index = VerIndex::default();
+    for p in pkgs {
+        index.add(&p.node);
+    }
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for p in pkgs {
+        if seen.insert((p.node.clone(), p.node.clone())) {
+            edges.push((p.node.clone(), p.node.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+    for p in pkgs {
+        for dep in &p.deps {
+            for dst in index.resolve(dep, &mut edges, &mut seen) {
+                if seen.insert((p.node.clone(), dst.clone())) {
+                    edges.push((p.node.clone(), dst, None, strand_core::EdgeKind::Static));
+                }
+            }
+        }
+    }
+    edges
+}
+  

@@ -6,6 +6,8 @@ fn edges(text: &str, f: Format) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = strand_import::parse(text, f)
         .unwrap()
         .into_iter()
+        // Self-loops are node declarations, not dependency edges.
+        .filter(|(a, b, ..)| a != b)
         .map(|(a, b, ..)| (a, b))
         .collect();
     v.sort();
@@ -36,8 +38,8 @@ version = "2.0.0"
     assert_eq!(
         edges(text, Format::CargoLock),
         vec![
-            ("app".to_string(), "liba".to_string()),
-            ("app".to_string(), "libb".to_string()),
+            ("app@0.1.0".to_string(), "liba@1.0.0".to_string()),
+            ("app@0.1.0".to_string(), "libb@2.0.0".to_string()),
         ]
     );
 }
@@ -56,8 +58,9 @@ version = "1"
     assert_eq!(
         edges(text, Format::CargoLock),
         vec![
-            ("a".to_string(), "b".to_string()),
-            ("a".to_string(), "c".to_string()),
+            ("a@1".to_string(), "b@1".to_string()),
+            // `c 1.0` pins explicitly even though c is not a package.
+            ("a@1".to_string(), "c@1.0".to_string()),
         ]
     );
 }
@@ -92,10 +95,12 @@ version = "1.0.0"
     assert_eq!(
         got,
         vec![
-            ("app".to_string(), "liba".to_string()),
-            ("app".to_string(), "libb".to_string()),
-            ("app".to_string(), "libc".to_string()),
-            ("app".to_string(), "pytest".to_string()),
+            // Only liba is a locked package; libb/libc/pytest resolve
+            // to bare names (not present in the lock).
+            ("app@0.1.0".to_string(), "liba@1.0.0".to_string()),
+            ("app@0.1.0".to_string(), "libb".to_string()),
+            ("app@0.1.0".to_string(), "libc".to_string()),
+            ("app@0.1.0".to_string(), "pytest".to_string()),
         ]
     );
 }
@@ -365,4 +370,209 @@ fn yarn_pnpm_detect() {
         strand_import::detect_format(Path::new("foo.txt"), "# yarn lockfile v1\n\n"),
         Format::YarnLock
     );
+}
+
+#[test]
+fn composer_lock_transitive() {
+    let text = r#"{
+  "packages": [
+    {"name": "laravel/framework", "version": "10.0.0",
+     "require": {"symfony/console": "^6.0", "psr/log": "^3.0"}},
+    {"name": "symfony/console", "version": "6.4.0",
+     "require": {"psr/log": "^2.0|^3.0"}},
+    {"name": "psr/log", "version": "3.0.0"}
+  ],
+  "packages-dev": [],
+  "content-hash": "abc"
+}"#;
+    let e = edges(text, Format::ComposerLock);
+    assert!(e.contains(&("laravel/framework@10.0.0".into(), "symfony/console@6.4.0".into())));
+    assert!(e.contains(&("laravel/framework@10.0.0".into(), "psr/log@3.0.0".into())));
+    assert!(e.contains(&("symfony/console@6.4.0".into(), "psr/log@3.0.0".into())));
+}
+
+#[test]
+fn gemfile_lock_transitive() {
+    let text = r#"GEM
+  remote: https://rubygems.org/
+  specs:
+    rails (7.1.0)
+      actionpack (= 7.1.0)
+      activesupport (= 7.1.0)
+    actionpack (7.1.0)
+      activesupport (= 7.1.0)
+      rack (~> 2.2)
+    activesupport (7.1.0)
+      concurrent-ruby (~> 1.0)
+    concurrent-ruby (1.2.0)
+    rack (2.2.8)
+
+DEPENDENCIES:
+  rails (= 7.1.0)
+
+SPEC CHECKSUMS:
+  rails (7.1.0) sha
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    mustermann (3.0.0)
+"#;
+    let e = edges(text, Format::GemfileLock);
+    assert!(e.contains(&("rails@7.1.0".into(), "actionpack@7.1.0".into())));
+    assert!(e.contains(&("actionpack@7.1.0".into(), "rack@2.2.8".into())));
+    assert!(e.contains(&("activesupport@7.1.0".into(), "concurrent-ruby@1.2.0".into())));
+    assert!(!e.iter().any(|(a, _)| a == "mustermann@3.0.0" && false));
+}
+
+#[test]
+fn nuget_lock_transitive() {
+    let text = r#"{
+  "version": 2,
+  "dependencies": {
+    "net6.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct", "requested": "13.0.3", "resolved": "13.0.3",
+        "dependencies": {"System.Runtime.CompilerServices.Unsafe": "6.0.0"}
+      },
+      "System.Runtime.CompilerServices.Unsafe": {
+        "type": "Transitive", "resolved": "6.0.0"
+      }
+    }
+  }
+}"#;
+    let e = edges(text, Format::NugetLock);
+    assert!(e.contains(&("Newtonsoft.Json@13.0.3".into(), "System.Runtime.CompilerServices.Unsafe@6.0.0".into())));
+}
+
+#[test]
+fn swift_resolved_flat() {
+    let text = r#"{
+  "pins" : [
+    { "identity" : "alamofire", "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Alamofire/Alamofire", 
+      "state" : { "revision" : "abc", "version" : "5.9.1" } }
+  ],
+  "version" : 2
+}"#;
+    // Flat format: the only edge hangs off the (lockfile) placeholder.
+    let raw = strand_import::parse(text, Format::SwiftResolved).unwrap();
+    assert_eq!(
+        raw.iter().map(|(s, d, ..)| (s.as_str(), d.as_str())).collect::<Vec<_>>(),
+        vec![("(lockfile)", "alamofire@5.9.1")]
+    );
+}
+
+#[test]
+fn pubspec_lock_flat() {
+    let text = r#"packages:
+  chars:
+    dependency: "direct main"
+    description:
+      name: chars
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.4.0"
+  collection:
+    dependency: transitive
+    version: "1.19.0"
+sdks:
+  dart: ">=3.0.0"
+"#;
+    let raw = strand_import::parse(text, Format::PubspecLock).unwrap();
+    assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "chars@1.4.0"));
+    assert!(raw.iter().any(|(s, d, ..)| d == "collection@1.19.0"));
+}
+
+#[test]
+fn go_sum_versions() {
+    let text = "github.com/a/b v1.2.3 h1:abc=\ngithub.com/a/b v1.2.3/go.mod h1:def=\ngithub.com/c/d v0.0.0-20200101 h1:x=\n";
+    let e = edges(text, Format::GoSum);
+    assert!(e.contains(&("github.com/a/b".into(), "github.com/a/b v1.2.3".into())));
+    assert!(e.contains(&("github.com/c/d".into(), "github.com/c/d v0.0.0-20200101".into())));
+    assert_eq!(e.len(), 2); // /go.mod dup deduped
+}
+
+#[test]
+fn uv_lock_transitive() {
+    let text = r#"version = 1
+requires-python = ">=3.9"
+
+[[package]]
+name = "anyio"
+version = "4.3.0"
+dependencies = [
+    { name = "idna", specifier = ">=2.8" },
+    { name = "sniffio", specifier = ">=1.1" },
+]
+
+[[package]]
+name = "idna"
+version = "3.6"
+
+[[package]]
+name = "sniffio"
+version = "1.3.1"
+"#;
+    let e = edges(text, Format::UvLock);
+    assert!(e.contains(&("anyio@4.3.0".into(), "idna@3.6".into())));
+    assert!(e.contains(&("anyio@4.3.0".into(), "sniffio@1.3.1".into())));
+}
+
+#[test]
+fn bun_lock_jsonc() {
+    let text = r#"{
+  // bun lockfile
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "my-app",
+      "dependencies": { "left-pad": "^1.3.0" },
+    },
+  },
+  "packages": {
+    "left-pad@1.3.0": ["left-pad@1.3.0", { "dependencies": { "abbrev": "^1.1.1" } }],
+    "abbrev@1.1.1": ["abbrev@1.1.1", {}],
+  },
+}"#;
+    let e = edges(text, Format::BunLock);
+    assert!(e.contains(&("package.json".into(), "left-pad@1.3.0".into())));
+    assert!(e.contains(&("left-pad@1.3.0".into(), "abbrev@1.1.1".into())));
+}
+
+#[test]
+fn podfile_lock_transitive() {
+    let text = r#"PODS:
+  - Alamofire (5.9.1)
+  - DeviceKit (5.2.0):
+    - DeviceKit/Core (= 5.2.0)
+    - Alamofire (~> 5.0)
+
+DEPENDENCIES:
+  - Alamofire (~> 5.0)
+  - DeviceKit (= 5.2.0)
+
+SPEC CHECKSUMS:
+  Alamofire: abc
+
+PODFILE CHECKSUM: def
+"#;
+    let e = edges(text, Format::PodfileLock);
+    assert!(e.contains(&("DeviceKit@5.2.0".into(), "Alamofire@5.9.1".into())));
+    assert!(!e.iter().any(|(a, _)| a.contains("DeviceKit/Core")));
+}
+
+#[test]
+fn new_lock_detect() {
+    for (name, text) in [
+        ("composer.lock", "{\"content-hash\":\"x\",\"packages\":[]}"),
+        ("go.sum", "m v1 h1:x=\n"),
+        ("uv.lock", "version = 1\nrequires-python = \">=3.9\"\n[[package]]\nname=\"a\"\n"),
+        ("bun.lock", "{\"lockfileVersion\": 1, \"workspaces\": {}}"),
+        ("Podfile.lock", "PODS:\n\nPODFILE CHECKSUM: x\n"),
+        ("packages.lock.json", "{\"version\":2,\"dependencies\":{}}"),
+    ] {
+        let f = strand_import::detect_format(std::path::Path::new(name), text);
+        assert_ne!(f, Format::Csv, "{name} not detected");
+    }
 }

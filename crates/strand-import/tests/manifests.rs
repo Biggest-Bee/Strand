@@ -189,3 +189,125 @@ fn scan_project_includes_manifests() {
         s == "requirements.txt" && d == "requests"
     }));
 }
+
+#[test]
+fn composer_json_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("composer.json"),
+        r#"{"require": {"php": ">=8.1", "laravel/framework": "^10.0"},
+            "require-dev": {"phpunit/phpunit": "^10.0"}}"#,
+    )
+    .unwrap();
+    let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"laravel/framework"));
+    assert!(deps.contains(&"phpunit/phpunit"));
+    assert!(!deps.contains(&"php"));
+}
+
+#[test]
+fn gemfile_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Gemfile"),
+        "source 'https://rubygems.org'\ngem 'rails', '~> 7.1'\ngem \"devise\"\n",
+    )
+    .unwrap();
+    let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"rails"));
+    assert!(deps.contains(&"devise"));
+    assert_eq!(deps.len(), 2);
+}
+
+#[test]
+fn pubspec_yaml_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pubspec.yaml"),
+        "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n  http: ^1.2.0\ndev_dependencies:\n  test: ^1.24.0\n",
+    )
+    .unwrap();
+    let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"http"));
+    assert!(deps.contains(&"test"));
+    assert!(deps.contains(&"flutter"));
+}
+
+#[test]
+fn podfile_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Podfile"),
+        "target 'App' do\n  pod 'Alamofire', '~> 5.9'\n  pod(\"DeviceKit\")\nend\n",
+    )
+    .unwrap();
+    let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"Alamofire"));
+    assert!(deps.contains(&"DeviceKit"));
+}
+
+#[test]
+fn package_swift_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Package.swift"),
+        "dependencies: [\n  .package(url: \"https://github.com/Alamofire/Alamofire.git\", from: \"5.9.0\"),\n  .package(path: \"../local\"),\n]\n",
+    )
+    .unwrap();
+    let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert_eq!(deps, vec!["Alamofire"]);
+}
+
+#[test]
+fn csproj_and_props_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("App.csproj"),
+        "<Project><ItemGroup><PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" /></ItemGroup></Project>",
+    )
+    .unwrap();
+    let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
+    assert!(out.edges.iter().any(|e| e.1 == "Newtonsoft.Json"));
+}
+
+#[test]
+fn gradle_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("build.gradle.kts"),
+        "dependencies {\n  implementation(\"com.squareup.okhttp3:okhttp:4.12.0\")\n  testImplementation 'junit:junit:4.13.2'\n}\n",
+    )
+    .unwrap();
+    let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"com.squareup.okhttp3:okhttp"));
+    assert!(deps.contains(&"junit:junit"));
+}
+
+#[test]
+fn workflow_and_dockerfile_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    let wf = dir.path().join(".github").join("workflows");
+    std::fs::create_dir_all(&wf).unwrap();
+    std::fs::write(
+        wf.join("ci.yml"),
+        "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n      - uses: ./.github/actions/local\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Dockerfile"),
+        "FROM python:3.12-slim AS base\nFROM scratch\n",
+    )
+    .unwrap();
+    let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"actions/checkout@v4"));
+    assert!(!deps.contains(&"./.github/actions/local"));
+    assert!(deps.contains(&"python:3.12-slim"));
+    assert!(!deps.contains(&"scratch"));
+}

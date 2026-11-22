@@ -9,6 +9,16 @@
 //! - JS/TS: `package.json` (deps/dev/peer/optional)
 //! - Rust: `Cargo.toml` ([dependencies], [dev-dependencies],
 //!   [build-dependencies], `[target.*]` variants)
+//! - PHP: `composer.json` (require/require-dev)
+//! - Ruby: `Gemfile` (gem declarations)
+//! - Dart/Flutter: `pubspec.yaml` (dependencies/dev_dependencies)
+//! - Swift: `Package.swift` (.package(url:))
+//! - .NET: `*.csproj` + `Directory.Packages.props` (PackageReference/
+//!   PackageVersion)
+//! - JVM: `*.gradle`/`*.gradle.kts` (quoted `group:artifact:version`)
+//! - iOS: `Podfile` (pod declarations)
+//! - Config: `.github/workflows/*.yml` `uses:` actions,
+//!   `Dockerfile` `FROM` images
 //!
 //! Edges are `manifest_rel_path -> dep_name` with
 //! [`strand_core::EdgeKind::Declared`] - explicitly declared by config.
@@ -36,6 +46,7 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             .map(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
             .flatten()
             .unwrap_or_default();
+        let norm_rel = rel.replace('\\', "/").to_lowercase();
         let hit = matches!(
             name.as_str(),
             "pyproject.toml"
@@ -45,8 +56,21 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
                 | "cargo.toml"
                 | "environment.yml"
                 | "environment.yaml"
-        ) || (name.starts_with("requirements") && name.ends_with(".txt"))
-            || (parent == "requirements" && name.ends_with(".txt"));
+                | "composer.json"
+                | "gemfile"
+                | "pubspec.yaml"
+                | "podfile"
+                | "package.swift"
+                | "dockerfile"
+                | "directory.packages.props"
+        ) || name.ends_with(".csproj")
+            || name.ends_with(".gradle")
+            || name.ends_with(".gradle.kts")
+            || name.ends_with(".dockerfile")
+            || (name.starts_with("requirements") && name.ends_with(".txt"))
+            || (parent == "requirements" && name.ends_with(".txt"))
+            || (norm_rel.starts_with(".github/workflows/") || norm_rel.contains("/.github/workflows/")
+                && (name.ends_with(".yml") || name.ends_with(".yaml")));
         if hit {
             files.push((rel, abs));
         }
@@ -69,14 +93,39 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let deps = match name.as_str() {
-            "pyproject.toml" => pyproject_deps(&text),
-            "pipfile" => pipfile_deps(&text),
-            "setup.cfg" => setup_cfg_deps(&text),
-            "package.json" => package_json_deps(&text),
-            "cargo.toml" => cargo_toml_deps(&text),
-            "environment.yml" | "environment.yaml" => conda_env_deps(&text),
-            _ => requirements_deps(&text, abs, root, 0),
+        let rel_norm = rel.replace('\\', "/").to_lowercase();
+        let deps = if name == "pyproject.toml" {
+            pyproject_deps(&text)
+        } else if name == "pipfile" {
+            pipfile_deps(&text)
+        } else if name == "setup.cfg" {
+            setup_cfg_deps(&text)
+        } else if name == "package.json" {
+            package_json_deps(&text)
+        } else if name == "cargo.toml" {
+            cargo_toml_deps(&text)
+        } else if name == "environment.yml" || name == "environment.yaml" {
+            conda_env_deps(&text)
+        } else if name == "composer.json" {
+            composer_deps(&text)
+        } else if name == "gemfile" {
+            gemfile_deps(&text)
+        } else if name == "pubspec.yaml" {
+            pubspec_deps(&text)
+        } else if name == "podfile" {
+            podfile_deps(&text)
+        } else if name == "package.swift" {
+            package_swift_deps(&text)
+        } else if name.ends_with(".csproj") || name == "directory.packages.props" {
+            nuget_manifest_deps(&text)
+        } else if name.ends_with(".gradle") || name.ends_with(".gradle.kts") {
+            gradle_deps(&text)
+        } else if rel_norm.starts_with(".github/workflows/") || rel_norm.contains("/.github/workflows/") {
+            workflow_deps(&text)
+        } else if name == "dockerfile" || name.ends_with(".dockerfile") {
+            dockerfile_deps(&text)
+        } else {
+            requirements_deps(&text, abs, root, 0)
         };
         nodes.insert(rel.clone());
         for dep in deps {
@@ -474,6 +523,262 @@ fn cargo_toml_deps(text: &str) -> Vec<String> {
                 collect(t.get(kind).and_then(|v| v.as_table()), &mut out);
             }
         }
+    }
+    out
+}
+
+// ---------- PHP / Ruby / Dart / Swift / .NET / JVM / iOS / config ----------
+
+/// `composer.json`: `require` + `require-dev` object keys
+/// (`vendor/package`).
+fn composer_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in ["require", "require-dev"] {
+        if let Some(obj) = doc.get(key).and_then(|v| v.as_object()) {
+            for name in obj.keys() {
+                if name != "php" {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Gemfile`: `gem 'name'` / `gem "name"` declarations (first quoted
+/// arg; version constraints and source options ignored).
+fn gemfile_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("gem") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !rest.starts_with(['\'', '"']) {
+            continue;
+        }
+        let q = rest.chars().next().unwrap();
+        if let Some(end) = rest[1..].find(q) {
+            let name = &rest[1..1 + end];
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `pubspec.yaml`: `dependencies` + `dev_dependencies` map keys.
+fn pubspec_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for section in ["dependencies", "dev_dependencies"] {
+        if let Some(tbl) = doc.get(section).and_then(|v| v.as_mapping()) {
+            for (k, _) in tbl {
+                if let Some(name) = k.as_str() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Podfile`: `pod 'Name'` / `pod "Name"` declarations.
+fn podfile_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("pod") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !rest.starts_with(['\'', '"', '(']) {
+            continue;
+        }
+        let rest = rest.trim_start_matches('(').trim_start();
+        if let Some(q) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') {
+            if let Some(end) = rest[1..].find(q) {
+                let name = &rest[1..1 + end];
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Package.swift`: `.package(url: "https://.../Name.git", ...)` -
+/// dep name is the last URL path component minus `.git`.
+fn package_swift_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in text.match_indices(".package(") {
+        // Scan the call's text for `url:` then a quoted string.
+        let rest = &text[m.0 + ".package(".len()..];
+        let end = rest.find(')').unwrap_or(rest.len().min(400));
+        let call = &rest[..end];
+        let Some(u) = call.find("url:") else { continue };
+        let after = &call[u + 4..];
+        let Some(q) = after.find(['\'', '"']) else { continue };
+        let quote = after.as_bytes()[q];
+        let inner = &after[q + 1..];
+        let Some(close) = inner.find(quote as char) else { continue };
+        let url = inner[..close].trim();
+        if url.is_empty() || url.starts_with("path:") {
+            continue;
+        }
+        let base = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".git");
+        if !base.is_empty() {
+            out.push(base.to_string());
+        }
+    }
+    out
+}
+
+/// `*.csproj` / `Directory.Packages.props`: `Include="Id"` on
+/// `<PackageReference` / `<PackageVersion` tags.
+fn nuget_manifest_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in ["PackageReference", "PackageVersion"] {
+        let mut rest = text;
+        let open = format!("<{tag}");
+        while let Some(i) = rest.find(&open) {
+            // Tag-name boundary: next char must not be alphanumeric.
+            let after = &rest[i..];
+            let boundary = after[open.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '-'));
+            if !boundary {
+                rest = &rest[i + 1..];
+                continue;
+            }
+            let Some(gt) = after.find('>') else { break };
+            let attrs = &after[..gt];
+            for q in ['"', '\''] {
+                let needle = format!("Include={q}");
+                if let Some(p) = attrs.find(&needle) {
+                    let val = &attrs[p + needle.len()..];
+                    if let Some(end) = val.find(q) {
+                        let id = val[..end].trim();
+                        if !id.is_empty() {
+                            out.push(id.to_string());
+                        }
+                    }
+                    break;
+                }
+            }
+            rest = &after[gt + 1..];
+        }
+    }
+    out
+}
+
+/// `*.gradle` / `*.gradle.kts`: quoted `group:artifact:version`
+/// coordinates on dependency-declaring lines.
+fn gradle_deps(text: &str) -> Vec<String> {
+    const KEYWORDS: &[&str] = &[
+        "implementation",
+        "api(",
+        "api ",
+        "compileOnly",
+        "runtimeOnly",
+        "testImplementation",
+        "testRuntimeOnly",
+        "testCompileOnly",
+        "kapt",
+        "ksp",
+        "annotationProcessor",
+        "classpath",
+        "detektPlugins",
+        "libs.",
+    ];
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("//") {
+            continue;
+        }
+        if !KEYWORDS.iter().any(|k| t.contains(k)) {
+            continue;
+        }
+        // Quoted strings on the line; `g:a:v` coords -> `g:a`.
+        let mut rest = t;
+        while let Some(q) = rest.find(['\'', '"']) {
+            let quote = rest.as_bytes()[q];
+            let inner = &rest[q + 1..];
+            let Some(end) = inner.find(quote as char) else { break };
+            let s = inner[..end].trim();
+            let parts: Vec<&str> = s.split(':').collect();
+            if parts.len() >= 3
+                && parts.iter().all(|p| !p.is_empty() && !p.contains(' '))
+                && parts[0].chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            {
+                out.push(format!("{}:{}", parts[0], parts[1]));
+            }
+            rest = &inner[end + 1..];
+        }
+    }
+    out
+}
+
+/// `.github/workflows/*.yml`: `uses: owner/repo@ref` action deps.
+/// Local (`./`) and Docker (`docker://`) refs are skipped.
+fn workflow_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim().trim_start_matches('-').trim_start();
+        let Some(rest) = t.strip_prefix("uses:") else {
+            continue;
+        };
+        let dep = rest.trim().trim_matches(['"', '\'']);
+        if dep.is_empty() || dep.starts_with("./") || dep.starts_with("docker://") {
+            continue;
+        }
+        out.push(dep.to_string());
+    }
+    out
+}
+
+/// `Dockerfile`: `FROM image[:tag][@digest]` base-image deps.
+fn dockerfile_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("FROM") else {
+            continue;
+        };
+        // Instruction must be `FROM ` (word boundary).
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let mut it = rest.split_whitespace();
+        let Some(img) = it.next() else { continue };
+        if img.eq_ignore_ascii_case("scratch") {
+            continue;
+        }
+        out.push(img.to_string());
     }
     out
 }

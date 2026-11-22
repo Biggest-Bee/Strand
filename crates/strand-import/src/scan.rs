@@ -116,9 +116,19 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         "npm-shrinkwrap.json",
         "yarn.lock",
         "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
         "poetry.lock",
+        "uv.lock",
         "go.mod",
+        "go.sum",
         "pom.xml",
+        "composer.lock",
+        "gemfile.lock",
+        "packages.lock.json",
+        "package.resolved",
+        "pubspec.lock",
+        "podfile.lock",
     ];
     let mut lock_files: Vec<(String, PathBuf)> = Vec::new();
     walk_files(root, root, &mut |rel, abs| {
@@ -142,7 +152,17 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         };
         let fmt = crate::detect_format(abs, &text);
         match crate::parse(&text, fmt) {
-            Ok(es) => {
+            Ok(mut es) => {
+                // Flat lockfiles (no inter-package edges) emit
+                // `(lockfile) -> pkg` edges; point them at this
+                // lockfile's rel path.
+                if is_flat_lock(fmt) {
+                    for e in &mut es {
+                        if e.0 == crate::locks::FLAT_SRC {
+                            e.0 = rel.clone();
+                        }
+                    }
+                }
                 let group = lock_group(fmt);
                 for (s, d, _, _) in &es {
                     nodes.push(s.clone());
@@ -152,7 +172,7 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
                             lock_nodes
                                 .entry(g)
                                 .or_default()
-                                .entry(lock_node_name(n).to_string())
+                                .entry(lock_node_name(n).to_lowercase())
                                 .or_default()
                                 .push(n.clone());
                         }
@@ -171,7 +191,12 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
     for (src, dst, w, kind) in manifest_edges {
         let pinned = manifest_group(&src)
             .and_then(|g| lock_nodes.get(g))
-            .and_then(|m| m.get(&dst));
+            .and_then(|m| {
+                // Case-insensitive: Podfile/pod names and NuGet ids
+                // vary in case between manifest and lock.
+                m.get(&dst.to_lowercase())
+                    .or_else(|| m.get(&lock_node_name(&dst).to_lowercase()))
+            });
         match pinned {
             Some(nodes_for) if !nodes_for.is_empty() => {
                 for n in nodes_for {
@@ -201,11 +226,25 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
 fn lock_group(fmt: crate::Format) -> Option<&'static str> {
     use crate::Format::*;
     match fmt {
-        NpmLock | YarnLock | PnpmLock => Some("npm"),
+        NpmLock | YarnLock | PnpmLock | BunLock => Some("npm"),
         CargoLock | Cargo => Some("cargo"),
-        PoetryLock => Some("python"),
+        PoetryLock | UvLock => Some("python"),
+        ComposerLock => Some("php"),
+        GemfileLock => Some("ruby"),
+        NugetLock => Some("nuget"),
+        SwiftResolved => Some("swift"),
+        PubspecLock => Some("pub"),
+        PodfileLock => Some("cocoapods"),
+        GoMod | GoSum => Some("go"),
         _ => None,
     }
+}
+
+/// Lockfile formats whose parsers emit `(lockfile) -> pkg` edges
+/// (no recorded inter-package edges in the format itself).
+fn is_flat_lock(fmt: crate::Format) -> bool {
+    use crate::Format::*;
+    matches!(fmt, SwiftResolved | PubspecLock)
 }
 
 /// Ecosystem group a manifest edge source belongs to.
@@ -216,6 +255,13 @@ fn manifest_group(src: &str) -> Option<&'static str> {
         "cargo.toml" => Some("cargo"),
         "pyproject.toml" | "pipfile" | "setup.cfg" | "environment.yml"
         | "environment.yaml" => Some("python"),
+        "composer.json" => Some("php"),
+        "gemfile" => Some("ruby"),
+        "pubspec.yaml" => Some("pub"),
+        "podfile" => Some("cocoapods"),
+        "package.swift" => Some("swift"),
+        "directory.packages.props" => Some("nuget"),
+        _ if f.ends_with(".csproj") => Some("nuget"),
         _ if f.starts_with("requirements") && f.ends_with(".txt") => Some("python"),
         _ => None,
     }
