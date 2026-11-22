@@ -3664,7 +3664,7 @@ dependencies = [
 
 [[package]]
 name = "strand-import"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde_json",
  "strand-core",

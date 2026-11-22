@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 strand-core = { path = "../strand-core", version = "0.2.0" }
-strand-import = { path = "../strand-import", version = "0.13.0" }
+strand-import = { path = "../strand-import", version = "0.14.0" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
