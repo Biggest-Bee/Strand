@@ -61,6 +61,8 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
                 | "pubspec.yaml"
                 | "podfile"
                 | "package.swift"
+                | "deno.json"
+                | "deno.jsonc"
                 | "dockerfile"
                 | "directory.packages.props"
         ) || name.ends_with(".csproj")
@@ -114,6 +116,8 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             pubspec_deps(&text)
         } else if name == "podfile" {
             podfile_deps(&text)
+        } else if name == "deno.json" || name == "deno.jsonc" {
+            deno_json_deps(&text)
         } else if name == "package.swift" {
             package_swift_deps(&text)
         } else if name.ends_with(".csproj") || name == "directory.packages.props" {
@@ -517,6 +521,20 @@ fn cargo_toml_deps(text: &str) -> Vec<String> {
     for kind in dep_kinds {
         collect(doc.get(kind).and_then(|v| v.as_table()), &mut out);
     }
+    // [workspace.dependencies]: inherited via `dep.workspace = true`.
+    if let Some(ws) = doc
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|v| v.as_table())
+    {
+        for (key, val) in ws {
+            let name = val
+                .get("package")
+                .and_then(|p| p.as_str())
+                .unwrap_or(key);
+            out.push(name.to_string());
+        }
+    }
     if let Some(targets) = doc.get("target").and_then(|v| v.as_table()) {
         for (_, t) in targets {
             for kind in dep_kinds {
@@ -779,6 +797,94 @@ fn dockerfile_deps(text: &str) -> Vec<String> {
             continue;
         }
         out.push(img.to_string());
+    }
+    out
+}
+
+/// `deno.json`/`deno.jsonc`: `imports` map values that are remote
+/// URLs or `npm:`/`jsr:` specifiers become dep nodes (local `./`
+/// paths are source edges handled elsewhere, not manifest deps).
+fn deno_json_deps(text: &str) -> Vec<String> {
+    // deno.jsonc allows comments/trailing commas: reuse the JSONC
+    // cleaner from locks.rs is private, so do a light strip here.
+    let cleaned = strip_jsonc(text);
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&cleaned) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(imports) = doc.get("imports").and_then(|v| v.as_object()) {
+        for (_, spec) in imports {
+            let specs: Vec<&str> = match spec {
+                serde_json::Value::String(s) => vec![s.as_str()],
+                serde_json::Value::Object(o) => o
+                    .values()
+                    .filter_map(|v| v.as_str())
+                    .collect(),
+                _ => vec![],
+            };
+            for s in specs {
+                if s.starts_with("npm:") || s.starts_with("jsr:") {
+                    // `npm:pkg@1.2.3` / `jsr:@scope/pkg@1.2.3`
+                    out.push(s.to_string());
+                } else if s.starts_with("https://") || s.starts_with("http://") {
+                    // Remote module URL: dep is the URL itself.
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Minimal JSONC cleaner for deno.jsonc: drop `//` comments and
+/// trailing commas outside strings.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_str = false;
+    let mut esc = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ',' => {
+                let mut lookahead = chars.clone();
+                let mut next = None;
+                for c in lookahead.by_ref() {
+                    if !c.is_whitespace() {
+                        next = Some(c);
+                        break;
+                    }
+                }
+                match next {
+                    Some('}') | Some(']') => {}
+                    _ => out.push(','),
+                }
+            }
+            _ => out.push(c),
+        }
     }
     out
 }

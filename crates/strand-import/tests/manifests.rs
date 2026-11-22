@@ -311,3 +311,32 @@ fn workflow_and_dockerfile_deps() {
     assert!(deps.contains(&"python:3.12-slim"));
     assert!(!deps.contains(&"scratch"));
 }
+
+#[test]
+fn deno_json_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("deno.jsonc"),
+        "{\n  // comment\n  \"imports\": {\n    \"lodash\": \"npm:lodash@4.17.21\",\n    \"fresh\": \"https://deno.land/x/fresh@1.6.8/mod.ts\",\n    \"local\": \"./src/local.ts\",\n  },\n}\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"npm:lodash@4.17.21"));
+    assert!(deps.contains(&"https://deno.land/x/fresh@1.6.8/mod.ts"));
+    assert!(!deps.iter().any(|d| d.contains("local.ts")));
+}
+
+#[test]
+fn cargo_workspace_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"a\"]\n[workspace.dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nanyhow = \"1\"\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"serde"));
+    assert!(deps.contains(&"anyhow"));
+}
