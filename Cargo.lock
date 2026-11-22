@@ -3666,6 +3666,7 @@ dependencies = [
 name = "strand-import"
 version = "0.14.0"
 dependencies = [
+ "rayon",
  "serde_json",
  "strand-core",
  "syn 3.0.10",

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use strand_core::{EdgeKind, Error, Result};
 use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
@@ -124,19 +125,29 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
     let mut edges: EdgeList = Vec::new();
     let mut warnings = Vec::new();
 
-    for (rel, abs) in &files {
-        let text =
-            fs::read_to_string(abs).map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        // Real parse via syn: comments, string/char/raw literals, and
-        // grouped `use` trees are handled by the grammar, not text
-        // matching. A file that fails to parse contributes no edges and
-        // is reported in `warnings` - the graph may be incomplete.
-        let refs = match parse_rs_refs(&text) {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = e.to_string();
-                let first = msg.lines().next().unwrap_or(&msg);
-                warnings.push(format!("{rel}: {first}"));
+    // Parse all files in parallel (rayon); resolution below stays
+    // sequential so edge order is deterministic. Read errors abort
+    // (as before); parse errors become per-file warnings.
+    let extracted: Vec<std::result::Result<(RustRefs, Vec<String>), String>> = files
+        .par_iter()
+        .map(|(_rel, abs)| {
+            let text = fs::read_to_string(abs)
+                .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
+            let inner = parse_rs_refs(&text)
+                .map(|r| (r, manual_dep_specs(&text)))
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    msg.lines().next().unwrap_or(&msg).to_string()
+                });
+            Ok(inner)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for ((rel, abs), inner) in files.iter().zip(extracted) {
+        let (refs, manual) = match inner {
+            Ok(v) => v,
+            Err(msg) => {
+                warnings.push(format!("{rel}: {msg}"));
                 continue;
             }
         };
@@ -170,7 +181,7 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
 
         // `// strand: depends-on path` manual edges. Paths resolve
         // relative to the file's dir, then project root.
-        for spec in manual_dep_specs(&text) {
+        for spec in manual {
             let dep = [parent, ""]
                 .iter()
                 .filter_map(|b| normalize_rel(b, &spec))
@@ -2821,10 +2832,27 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
     // config files below build the group -> targets map.
     let mut ep_lookups: Vec<(String, Vec<String>)> = Vec::new();
 
-    for (rel, abs) in &files {
-        let text =
-            fs::read_to_string(abs).map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        let (refs, had_error, dynamic, env_cfg) = py_import_refs(&text);
+    // Parse all files in parallel (rayon); resolution below stays
+    // sequential so edge order is deterministic.
+    let extracted = files
+        .par_iter()
+        .map(|(rel, abs)| {
+            let text = fs::read_to_string(abs)
+                .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
+            let (refs, had_error, dynamic, env_cfg) = py_import_refs(&text);
+            Ok((
+                rel.clone(),
+                refs,
+                had_error,
+                dynamic,
+                env_cfg,
+                manual_dep_specs(&text),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for (rel_s, refs, had_error, dynamic, env_cfg, manual) in extracted {
+        let rel = &rel_s;
         if had_error {
             warnings.push(format!("{rel}: parse errors (partial scan)"));
         }
@@ -2911,7 +2939,7 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
 
         // `# strand: depends-on path` manual edges - file path relative
         // to this file's dir, or a dotted module path.
-        for spec in manual_dep_specs(&text) {
+        for spec in manual {
             let dep = if spec.contains('/') || spec.ends_with(".py") {
                 // Path form: file-dir relative, then project-root relative.
                 [parent, ""]
@@ -3573,10 +3601,29 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     let mut warnings = Vec::new();
     let mut alias_cache = JsAliasCache::new(root);
 
-    for (rel, abs) in &files {
-        let text =
-            fs::read_to_string(abs).map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-        let (specs, globs, had_error, dynamic) = js_import_specs_ts(&text, js_language_for(rel));
+    // Parse all files in parallel (rayon); alias resolution below
+    // stays sequential (shared config cache) so edge order is
+    // deterministic.
+    let extracted = files
+        .par_iter()
+        .map(|(rel, abs)| {
+            let text = fs::read_to_string(abs)
+                .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
+            let (specs, globs, had_error, dynamic) =
+                js_import_specs_ts(&text, js_language_for(rel));
+            Ok((
+                rel.clone(),
+                specs,
+                globs,
+                had_error,
+                dynamic,
+                manual_dep_specs(&text),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for (rel_s, specs, globs, had_error, dynamic, manual) in extracted {
+        let rel = &rel_s;
         if had_error {
             warnings.push(format!("{rel}: parse errors (partial scan)"));
         }
@@ -3626,7 +3673,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
 
         // `// strand: depends-on spec` manual edges - relative paths
         // or bare specifiers resolved like normal imports.
-        for spec in manual_dep_specs(&text) {
+        for spec in manual {
             // Path-like specs resolve file-dir relative, then
             // project-root relative; bare specs go through aliases.
             let path_dep = |s: &str| {
