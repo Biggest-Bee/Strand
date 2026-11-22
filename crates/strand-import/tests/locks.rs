@@ -576,3 +576,104 @@ fn new_lock_detect() {
         assert_ne!(f, Format::Csv, "{name} not detected");
     }
 }
+
+#[test]
+fn stack_lock_flat() {
+    let text = r#"packages:
+- completed:
+    hackage: aeson-2.2.1.0@sha256:abc123
+  original:
+    hackage: aeson
+- completed:
+    hackage: text-2.0.2@sha256:def
+  original:
+    hackage: text
+snapshot:
+  url: https://example.com/snapshot.yaml
+"#;
+    let raw = strand_import::parse(text, Format::StackLock).unwrap();
+    assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "aeson@2.2.1.0"));
+    assert!(raw.iter().any(|(s, d, ..)| d == "text@2.0.2"));
+}
+
+#[test]
+fn mix_lock_flat() {
+    let text = "%{\n  \"decimal\": {:hex, :decimal, \"2.0.0\", \"abc\", [:mix], [{:hex, :foo, \"1.0\", \"x\", [:mix], [], \"hexpm\", \"y\"}], \"hexpm\", \"z\"},\n  \"phoenix\": {:hex, :phoenix, \"1.7.21\", \"abc\", [:mix], [], \"hexpm\", \"z\"}\n}\n";
+    let raw = strand_import::parse(text, Format::MixLock).unwrap();
+    assert!(raw.iter().any(|(s, d, ..)| d == "decimal@2.0.0"));
+    assert!(raw.iter().any(|(s, d, ..)| d == "phoenix@1.7.21"));
+}
+
+#[test]
+fn cartfile_resolved_flat() {
+    let text = "github \"Alamofire/Alamofire\" \"5.9.1\"\ngit \"https://x/y\" \"abc123\"\n";
+    let raw = strand_import::parse(text, Format::CartfileResolved).unwrap();
+    assert!(raw.iter().any(|(s, d, ..)| d == "Alamofire/Alamofire@5.9.1"));
+    assert!(raw.iter().any(|(s, d, ..)| d == "https://x/y@abc123"));
+}
+
+#[test]
+fn deno_lock_flat() {
+    let text = r#"{
+  "remote": {
+    "https://deno.land/x/fresh@1.6.8/mod.ts": { "headers": {} }
+  },
+  "npm": {
+    "npm:lodash@4.17.21": { "integrity": "sha512-x" }
+  }
+}"#;
+    let raw = strand_import::parse(text, Format::DenoLock).unwrap();
+    assert!(raw.iter().any(|(s, d, ..)| d == "https://deno.land/x/fresh@1.6.8/mod.ts"));
+    assert!(raw.iter().any(|(s, d, ..)| d == "npm:lodash@4.17.21"));
+}
+
+#[test]
+fn conan_lock_transitive() {
+    let text = r#"{
+  "graph_lock": {
+    "nodes": {
+      "0": {"ref": "app/1.0@user/stable", "requires": ["1"]},
+      "1": {"ref": "fmt/9.1.0@user/stable", "requires": []},
+      "2": {"ref": "zlib/1.2.13", "requires": []}
+    },
+    "root_node_ref": "0"
+  }
+}"#;
+    let e = edges(text, Format::ConanLock);
+    assert!(e.contains(&("app/1.0@user/stable".into(), "fmt/9.1.0@user/stable".into())));
+}
+
+#[test]
+fn gradle_verification_components() {
+    let text = r#"<?xml version="1.0"?>
+<verification-metadata xmlns="https://schema.gradle.org/dependency-verification" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://schema.gradle.org/dependency-verification https://schema.gradle.org/dependency-verification/dependency-verification.xsd">
+   <configuration><verify-metadata>true</verify-metadata></configuration>
+   <components>
+      <component group="com.google.guava" name="guava" version="31.1-jre"><artifact name="guava-31.1-jre.jar"><sha256 value="abc"/></artifact></component>
+      <component group="junit" name="junit" version="4.13.2"/>
+   </components>
+</verification-metadata>"#;
+    let raw = strand_import::parse(text, Format::GradleVerification).unwrap();
+    assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "com.google.guava:guava@31.1-jre"));
+    assert!(raw.iter().any(|(s, d, ..)| d == "junit:junit@4.13.2"));
+}
+
+#[test]
+fn flake_lock_inputs() {
+    let text = r#"{
+  "nodes": {
+    "root": { "inputs": { "nixpkgs": "nixpkgs" } },
+    "nixpkgs": {
+      "locked": { "owner": "NixOS", "repo": "nixpkgs", "rev": "abc", "narHash": "sha256-x" }
+    },
+    "flake-utils": {
+      "locked": { "owner": "numtide", "repo": "flake-utils", "rev": "def", "narHash": "sha256-y" }
+    }
+  },
+  "root": "root",
+  "version": 7
+}"#;
+    let e = edges(text, Format::FlakeLock);
+    assert!(e.contains(&("nixpkgs".into(), "NixOS/nixpkgs".into())));
+    assert!(e.contains(&("flake-utils".into(), "numtide/flake-utils".into())));
+}

@@ -53,6 +53,20 @@ pub enum Format {
     PodfileLock,
     /// `paket.lock` (JVM, packages.lock.json schema).
     PaketLock,
+    /// `stack.yaml.lock` (Haskell).
+    StackLock,
+    /// `mix.lock` (Elixir).
+    MixLock,
+    /// `Cartfile.resolved` (Carthage).
+    CartfileResolved,
+    /// `deno.lock`.
+    DenoLock,
+    /// `conan.lock`.
+    ConanLock,
+    /// `gradle/verification-metadata.xml`.
+    GradleVerification,
+    /// `flake.lock` (Nix).
+    FlakeLock,
     /// `webpack --json` stats output (per-module resolved deps).
     WebpackStats,
     /// `esbuild --metafile` JSON output (per-input imports).
@@ -86,6 +100,13 @@ pub fn parse(text: &str, format: Format) -> Result<EdgeList> {
         Format::BunLock => locks::bun_lock(text),
         Format::PodfileLock => locks::podfile_lock(text),
         Format::PaketLock => locks::nuget_lock(text),
+        Format::StackLock => locks::stack_lock(text),
+        Format::MixLock => locks::mix_lock(text),
+        Format::CartfileResolved => locks::cartfile_resolved(text),
+        Format::DenoLock => locks::deno_lock(text),
+        Format::ConanLock => locks::conan_lock(text),
+        Format::GradleVerification => locks::gradle_verification(text),
+        Format::FlakeLock => locks::flake_lock(text),
         Format::WebpackStats => bundler::webpack_stats(text),
         Format::EsbuildMeta => bundler::esbuild_meta(text),
     }
@@ -113,6 +134,13 @@ pub fn detect_format(path: &std::path::Path, text: &str) -> Format {
             "bun.lock" => return Format::BunLock,
             "podfile.lock" => return Format::PodfileLock,
             "paket.lock" => return Format::PaketLock,
+            "stack.yaml.lock" => return Format::StackLock,
+            "mix.lock" => return Format::MixLock,
+            "cartfile.resolved" => return Format::CartfileResolved,
+            "deno.lock" => return Format::DenoLock,
+            "conan.lock" => return Format::ConanLock,
+            "verification-metadata.xml" => return Format::GradleVerification,
+            "flake.lock" => return Format::FlakeLock,
             _ => {}
         }
     }
@@ -159,6 +187,18 @@ pub fn detect_format(path: &std::path::Path, text: &str) -> Format {
     }
     if t.contains("requires-python") && t.contains("[[package]]") {
         return Format::UvLock;
+    }
+    if t.contains("\"graph_lock\"") {
+        return Format::ConanLock;
+    }
+    if t.contains("\"nodes\"") && t.contains("\"locked\"") {
+        return Format::FlakeLock;
+    }
+    if t.contains("<verification-metadata") {
+        return Format::GradleVerification;
+    }
+    if t.contains("\"remote\"") && t.contains("\"npm\"") {
+        return Format::DenoLock;
     }
     // Bundler metadata before the cargo-JSON fallback.
     if let Some(f) = bundler::sniff(text) {

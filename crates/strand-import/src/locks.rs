@@ -1536,4 +1536,332 @@ fn indexed_edges(pkgs: &[PkgSpec]) -> EdgeList {
     }
     edges
 }
+
+// ---------- stack.yaml.lock (Haskell) ----------
+
+/// Parse `stack.yaml.lock`. `packages:` entries carry
+/// `original.hackage: name` (dep name) with `completed.hackage:
+/// name-version@hash`. No inter-package edges are recorded, so
+/// resolved `name@version` nodes hang off [`FLAT_SRC`].
+pub fn stack_lock(text: &str) -> Result<EdgeList> {
+    let doc: serde_yml::Value =
+        serde_yml::from_str(text).map_err(|e| err(format!("stack.yaml.lock: {e}")))?;
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    if let Some(pkgs) = doc.get("packages").and_then(|v| v.as_sequence()) {
+        for p in pkgs {
+            // Prefer completed (resolved) hackage `name-version`;
+            // fall back to the original dep name.
+            let node = p
+                .get("completed")
+                .and_then(|c| c.get("hackage"))
+                .and_then(|h| h.as_str())
+                .or_else(|| {
+                    p.get("original")
+                        .and_then(|o| o.get("hackage"))
+                        .and_then(|h| h.as_str())
+                })
+                .unwrap_or("");
+            if node.is_empty() {
+                continue;
+            }
+            // `name-1.2.3@sha256:...` -> `name@1.2.3`
+            let node = hackage_node(node);
+            if seen.insert(node.clone()) {
+                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+            }
+        }
+    }
+    // pantry/git/archive deps in `original` without hackage.
+    if let Some(pkgs) = doc.get("packages").and_then(|v| v.as_sequence()) {
+        for p in pkgs {
+            let orig = p.get("original");
+            for key in ["pantry", "git", "archive"] {
+                if let Some(v) = orig.and_then(|o| o.get(key)).and_then(|x| x.as_str()) {
+                    if !v.is_empty() && seen.insert(v.to_string()) {
+                        edges.push((
+                            FLAT_SRC.to_string(),
+                            v.to_string(),
+                            None,
+                            strand_core::EdgeKind::Static,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("stack.yaml.lock: no packages found"));
+    }
+    Ok(edges)
+}
+
+/// `aeson-2.2.1.0@sha256:abc` -> `aeson@2.2.1.0`; `text-2.0.2` ->
+/// `text@2.0.2`. Hackage versions start with a digit after the last
+/// `-` that precedes a digit.
+fn hackage_node(s: &str) -> String {
+    let s = s.split('@').next().unwrap_or(s).trim();
+    // Find the last '-' followed by a digit.
+    let bytes = s.as_bytes();
+    for i in (0..s.len()).rev() {
+        if bytes[i] == b'-' && i + 1 < s.len() && bytes[i + 1].is_ascii_digit() {
+            return format!("{}@{}", &s[..i], &s[i + 1..]);
+        }
+    }
+    s.to_string()
+}
+
+// ---------- mix.lock (Elixir/Erlang terms) ----------
+
+/// Parse `mix.lock`: `%{"name": {:hex, :name, "version", ...}}`.
+/// Entries record no dep relations, so `name@version` nodes hang
+/// off [`FLAT_SRC`].
+pub fn mix_lock(text: &str) -> Result<EdgeList> {
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        // `"decimal": {:hex, :decimal, "2.0.0", ...}` or
+        // `"phoenix": {:hex, :phoenix, "1.7.0", ...}`.
+        let t = line.trim();
+        let Some(q1) = t.find('"') else { continue };
+        let rest = &t[q1 + 1..];
+        let Some(q2) = rest.find('"') else { continue };
+        let name = &rest[..q2];
+        let after = &rest[q2..];
+        let Some(hex_pos) = after.find(":hex") else { continue };
+        // First quoted string after `:hex, :name,` is the version.
+        let tail = &after[hex_pos..];
+        let Some(q) = tail.find('"') else { continue };
+        let inner = &tail[q + 1..];
+        let Some(e) = inner.find('"') else { continue };
+        let ver = &inner[..e];
+        let node = nv(name, ver);
+        if seen.insert(node.clone()) {
+            edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("mix.lock: no hex packages found"));
+    }
+    Ok(edges)
+}
+
+// ---------- Cartfile.resolved (Carthage) ----------
+
+/// Parse `Cartfile.resolved`: `github "org/repo" "1.2.3"` lines.
+/// Flat - each pinned repo hangs off [`FLAT_SRC`].
+pub fn cartfile_resolved(text: &str) -> Result<EdgeList> {
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        // `github "org/repo" "version"` / `git "url" "version"` /
+        // `binary "name" "version"`.
+        let mut it = t.split_whitespace();
+        let Some(_kind) = it.next() else { continue };
+        let mut quoted = Vec::new();
+        let mut rest = t;
+        while let Some(q) = rest.find('"') {
+            let inner = &rest[q + 1..];
+            if let Some(e) = inner.find('"') {
+                quoted.push(&inner[..e]);
+                rest = &inner[e + 1..];
+            } else {
+                break;
+            }
+        }
+        if quoted.len() >= 2 {
+            let node = format!("{}@{}", quoted[0], quoted[1]);
+            if seen.insert(node.clone()) {
+                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("Cartfile.resolved: no entries found"));
+    }
+    Ok(edges)
+}
+
+// ---------- deno.lock ----------
+
+/// Parse `deno.lock` (JSON). `remote`/`npm`/`jsr`/`workspace`
+/// sections key resolved specifiers to integrity entries; emit each
+/// key as a node off [`FLAT_SRC`].
+pub fn deno_lock(text: &str) -> Result<EdgeList> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| err(format!("deno.lock: {e}")))?;
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for section in ["remote", "npm", "jsr", "workspace"] {
+        if let Some(obj) = v[section].as_object() {
+            for key in obj.keys() {
+                if seen.insert(key.clone()) {
+                    edges.push((
+                        FLAT_SRC.to_string(),
+                        key.clone(),
+                        None,
+                        strand_core::EdgeKind::Static,
+                    ));
+                }
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("deno.lock: no locked specifiers found"));
+    }
+    Ok(edges)
+}
+
+// ---------- conan.lock ----------
+
+/// Parse `conan.lock` (JSON `graph_lock`). `nodes` map id ->
+/// `{ref, requires: [ids]}`; emit `ref -> ref` edges so the full
+/// transitive graph resolves.
+pub fn conan_lock(text: &str) -> Result<EdgeList> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| err(format!("conan.lock: {e}")))?;
+    let nodes = &v["graph_lock"]["nodes"];
+    let Some(nodes) = nodes.as_object() else {
+        return Err(err("conan.lock: no graph_lock.nodes"));
+    };
+    // id -> ref
+    let mut refs: BTreeMap<String, String> = BTreeMap::new();
+    for (id, n) in nodes {
+        if let Some(r) = n["ref"].as_str() {
+            refs.insert(id.clone(), r.to_string());
+        }
+    }
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for (id, n) in nodes {
+        let Some(src) = refs.get(id) else { continue };
+        if let Some(reqs) = n["requires"].as_array() {
+            for r in reqs {
+                let Some(rid) = r.as_str() else { continue };
+                let Some(dst) = refs.get(rid) else { continue };
+                if seen.insert((src.clone(), dst.clone())) {
+                    edges.push((src.clone(), dst.clone(), None, strand_core::EdgeKind::Static));
+                }
+            }
+        }
+        // Node declaration for leaf/root packages.
+        if seen.insert((src.clone(), src.clone())) {
+            edges.push((src.clone(), src.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("conan.lock: no nodes found"));
+    }
+    Ok(edges)
+}
+
+// ---------- gradle/verification-metadata.xml ----------
+
+/// Parse `gradle/verification-metadata.xml`: `<component
+/// group=".." name=".." version="..">` entries are the fully
+/// resolved dependency set (no relations recorded). Nodes
+/// `group:name@version` hang off [`FLAT_SRC`].
+pub fn gradle_verification(text: &str) -> Result<EdgeList> {
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("<component") {
+        let after = &rest[i..];
+        if after["<component".len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric())
+        {
+            rest = &rest[i + 1..];
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        let attrs = &after[..gt];
+        let get = |attr: &str| -> Option<String> {
+            for q in ['"', '\''] {
+                let needle = format!("{attr}={q}");
+                if let Some(p) = attrs.find(&needle) {
+                    let val = &attrs[p + needle.len()..];
+                    if let Some(e) = val.find(q) {
+                        return Some(val[..e].to_string());
+                    }
+                }
+            }
+            None
+        };
+        if let (Some(g), Some(n), Some(ver)) =
+            (get("group"), get("name"), get("version"))
+        {
+            let id = format!("{g}:{n}");
+            let node = nv(&id, &ver);
+            if seen.insert(node.clone()) {
+                edges.push((
+                    FLAT_SRC.to_string(),
+                    node,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
+            }
+        }
+        rest = &after[gt + 1..];
+    }
+    if edges.is_empty() {
+        return Err(err("verification-metadata.xml: no components found"));
+    }
+    Ok(edges)
+}
+
+// ---------- flake.lock ----------
+
+/// Parse `flake.lock` (JSON). `nodes` keys are flake input names;
+/// each node's `locked` object carries `owner`/`repo`/`rev`/`narHash`
+/// or a `path`/`tarball`/`git`/`github`/`gitlab`/`sourcehut` source.
+/// Emit `input -> source-ref` edges: the flake's declared inputs
+/// resolved to their pinned sources.
+pub fn flake_lock(text: &str) -> Result<EdgeList> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| err(format!("flake.lock: {e}")))?;
+    let nodes = &v["nodes"];
+    let Some(nodes) = nodes.as_object() else {
+        return Err(err("flake.lock: no nodes"));
+    };
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for (name, node) in nodes {
+        // Root node has no locked source; skip it.
+        let locked = &node["locked"];
+        if locked.is_null() {
+            continue;
+        }
+        // Source ref: prefer owner/repo, else type-specific fields.
+        let mut dst = String::new();
+        if let (Some(o), Some(r)) = (
+            locked["owner"].as_str(),
+            locked["repo"].as_str(),
+        ) {
+            dst = format!("{o}/{r}");
+        } else if let Some(t) = locked["type"].as_str() {
+            dst = t.to_string();
+            for k in ["owner", "repo", "rev", "ref", "path", "url"] {
+                if let Some(val) = locked[k].as_str() {
+                    dst = format!("{dst}:{val}");
+                }
+            }
+        }
+        if dst.is_empty() {
+            dst = locked.to_string();
+        }
+        if seen.insert((name.clone(), dst.clone())) {
+            edges.push((name.clone(), dst, None, strand_core::EdgeKind::Static));
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("flake.lock: no locked inputs"));
+    }
+    Ok(edges)
+}
   

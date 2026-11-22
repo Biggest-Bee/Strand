@@ -73,11 +73,28 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
                 | "paket.dependencies"
                 | "libs.versions.toml"
                 | "setup.py"
+                | "flake.nix"
+                | "shell.nix"
+                | "stack.yaml"
+                | "mix.exs"
+                | "cartfile"
+                | "conanfile.txt"
+                | "vcpkg.json"
+                | "pubspec_overrides.yaml"
+                | ".python-version"
+                | ".nvmrc"
+                | ".tool-versions"
+                | "workspace"
+                | "workspace.bazel"
+                | "module.bazel"
                 | "directory.packages.props"
         ) || name.ends_with(".csproj")
             || name.ends_with(".gradle")
             || name.ends_with(".gradle.kts")
             || name.ends_with(".dockerfile")
+            || name.ends_with(".nix")
+            || name.ends_with(".tf")
+            || name.ends_with(".bzl")
             || (name.starts_with("requirements") && name.ends_with(".txt"))
             || (parent == "requirements" && name.ends_with(".txt"))
             || (norm_rel.starts_with(".github/workflows/") || norm_rel.contains("/.github/workflows/")
@@ -142,6 +159,32 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             version_catalog_deps(&text)
         } else if name == "setup.py" {
             setup_py_deps(&text)
+        } else if name.ends_with(".nix") {
+            nix_deps(&text)
+        } else if name == "stack.yaml" {
+            stack_yaml_deps(&text)
+        } else if name == "mix.exs" {
+            mix_exs_deps(&text)
+        } else if name == "cartfile" {
+            cartfile_deps(&text)
+        } else if name == "conanfile.txt" {
+            conanfile_deps(&text)
+        } else if name == "vcpkg.json" {
+            vcpkg_deps(&text)
+        } else if name == "pubspec_overrides.yaml" {
+            pubspec_deps(&text)
+        } else if name == ".python-version" {
+            runtime_pin_deps(&text, "python")
+        } else if name == ".nvmrc" {
+            runtime_pin_deps(&text, "node")
+        } else if name == ".tool-versions" {
+            tool_versions_deps(&text)
+        } else if name.ends_with(".tf") {
+            terraform_deps(&text)
+        } else if matches!(name.as_str(), "workspace" | "workspace.bazel" | "module.bazel")
+            || name.ends_with(".bzl")
+        {
+            bazel_deps(&text)
         } else if name == "package.swift" {
             package_swift_deps(&text)
         } else if name.ends_with(".csproj") || name == "directory.packages.props" {
@@ -390,13 +433,16 @@ fn pipfile_deps(text: &str) -> Vec<String> {
     out
 }
 
-/// `setup.cfg` `[options] install_requires` - inline or indented
+/// `setup.cfg` `[options] install_requires` plus
+/// `[options.extras_require]` extra dep lists - inline or indented
 /// continuation lines, comma-separated.
 fn setup_cfg_deps(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut in_options = false;
+    let mut section = String::new();
     let mut collecting = false;
     let mut buf = String::new();
+    // In extras_require every `key = csv` line's VALUE is a dep
+    // list; in [options] only install_requires counts.
     for line in text.lines() {
         let t = line.trim();
         if t.starts_with('[') {
@@ -405,10 +451,7 @@ fn setup_cfg_deps(text: &str) -> Vec<String> {
                 buf.clear();
                 collecting = false;
             }
-            in_options = t == "[options]";
-            continue;
-        }
-        if !in_options {
+            section = t.trim_matches(|c| c == '[' || c == ']').to_lowercase();
             continue;
         }
         if collecting {
@@ -424,7 +467,13 @@ fn setup_cfg_deps(text: &str) -> Vec<String> {
             collecting = false;
         }
         if let Some((k, v)) = t.split_once('=') {
-            if k.trim() == "install_requires" {
+            let key = k.trim();
+            // [options] install_requires and every
+            // [options.extras_require] `extra = deps` line both
+            // collect comma/continuation dep lists.
+            if (section == "options" && key == "install_requires")
+                || section == "options.extras_require"
+            {
                 collecting = true;
                 buf.push_str(v.trim());
             }
@@ -442,7 +491,17 @@ fn flush_cfg_requires(buf: &str, out: &mut Vec<String>) {
         if p.is_empty() || p.starts_with("file:") {
             continue;
         }
-        if let Some(n) = pep503_name(p) {
+        // Entries are comma-separated, but continuation lines can
+        // also be space-separated (`req1 req2` with no commas).
+        // Split on whitespace only when there's no `;` marker -
+        // markers contain spaces that would yield fake deps.
+        if !p.contains(';') {
+            for tok in p.split_whitespace() {
+                if let Some(n) = pep503_name(tok) {
+                    out.push(n);
+                }
+            }
+        } else if let Some(n) = pep503_name(p) {
             out.push(n);
         }
     }
@@ -679,6 +738,9 @@ fn podfile_deps(text: &str) -> Vec<String> {
         if let Some(q) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') {
             if let Some(end) = rest[1..].find(q) {
                 let name = &rest[1..1 + end];
+                // `pod 'Firebase/Core'` declares the Firebase pod;
+                // the `/Subspec` suffix is not part of the name.
+                let name = name.split('/').next().unwrap_or("");
                 if !name.is_empty() {
                     out.push(name.to_string());
                 }
@@ -1137,6 +1199,333 @@ fn setup_py_deps(text: &str) -> Vec<String> {
                 j += 1;
             }
             rest = &body[end + 1..];
+        }
+    }
+    out
+}
+
+// ---------- Nix / Haskell / Elixir / Apple / Conan / vcpkg / misc ----------
+
+/// `flake.nix`/`shell.nix`/any `.nix`: flake `inputs` url deps plus
+/// `pkgs.<name>` package references (last dotted segment; common
+/// non-package attrs like `pkgs.lib`/`pkgs.stdenv` excluded).
+fn nix_deps(text: &str) -> Vec<String> {
+    const NON_PKGS: &[&str] = &[
+        "lib", "stdenv", "callPackage", "mkShell", "mkDerivation",
+        "fetchurl", "fetchzip", "fetchgit", "fetchFromGitHub",
+        "fetchFromGitLab", "runCommand", "writeText", "writeScript",
+        "writers", "overlays", "newScope", "extend", "isLinux",
+        "isDarwin", "isWindows", "pkgsStatic", "gcc", "binutils",
+    ];
+    let mut out = Vec::new();
+    // flake inputs: `name.url = "..."` or `name = { url = "..."; }`.
+    // Track `{}` depth inside the `inputs = { ... }` attrset; only
+    // `url`-keyed values count (rev/ref/narHash are quoted too).
+    let mut in_inputs = false;
+    let mut inputs_depth = 0i32;
+    for line in text.lines() {
+        let t = line.trim();
+        if !in_inputs && t.contains("inputs") && t.contains('=') {
+            in_inputs = true;
+        }
+        if in_inputs {
+            // `url = "..."` or `foo.url = "..."` on this line.
+            let mut rest = t;
+            while let Some(eq) = rest.find('=') {
+                let key = rest[..eq].trim();
+                let val = rest[eq + 1..].trim_start();
+                let is_url_key = key == "url" || key.ends_with(".url");
+                if is_url_key && (val.starts_with('"') || val.starts_with('\'')) {
+                    let q = val.as_bytes()[0] as char;
+                    if let Some(e) = val[1..].find(q) {
+                        let u = val[1..1 + e].trim();
+                        if !u.is_empty() {
+                            out.push(u.to_string());
+                        }
+                    }
+                }
+                rest = &rest[eq + 1..];
+            }
+            inputs_depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
+            if inputs_depth <= 0 {
+                in_inputs = false;
+                inputs_depth = 0;
+            }
+        }
+    }
+    // pkgs.<a>.<b>... -> last segment as the package name.
+    let mut rest = text;
+    while let Some(i) = rest.find("pkgs.") {
+        let after = &rest[i + 5..];
+        let ident: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+            .collect();
+        rest = &rest[i + 5..];
+        let segs: Vec<&str> = ident.split('.').filter(|s| !s.is_empty()).collect();
+        if segs.is_empty() {
+            continue;
+        }
+        if NON_PKGS.contains(&segs[0]) {
+            continue;
+        }
+        if let Some(last) = segs.last() {
+            if !last.is_empty() && last.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                out.push(last.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `stack.yaml`: `extra-deps` entries (git/pantry/url/http).
+fn stack_yaml_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(deps) = doc.get("extra-deps").and_then(|v| v.as_sequence()) {
+        for d in deps {
+            // Entries are maps like `{git: "url"}` or scalars.
+            if let Some(s) = d.as_str() {
+                out.push(s.to_string());
+                continue;
+            }
+            if let Some(m) = d.as_mapping() {
+                for (_k, v) in m {
+                    if let Some(s) = v.as_str() {
+                        out.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `mix.exs`: inside `def deps`/`defp deps`, `{:name, "spec"}`
+/// tuples. `{:ok,`/`{:error,` style tuples outside deps are
+/// excluded by section tracking.
+fn mix_exs_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_deps = false;
+    let mut depth = 0i32;
+    for line in text.lines() {
+        let t = line.trim();
+        if !in_deps {
+            if t.starts_with("def deps") || t.starts_with("defp deps") {
+                in_deps = true;
+                depth = t.matches(" do").count() as i32;
+                if depth == 0 {
+                    depth = 1; // `def deps, do:` still opens a block
+                }
+            }
+            continue;
+        }
+        // dep tuples: `{:phoenix, "~> 1.7"}` anywhere on the line
+        // (they sit inside a `[ ... ]` keyword list).
+        let mut rest = t;
+        while let Some(i) = rest.find("{:") {
+            let after = &rest[i + 2..];
+            rest = after;
+            let name_end = after.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '?'));
+            if let Some(e) = name_end {
+                let name = &after[..e];
+                if !name.is_empty()
+                    && !matches!(name, "ok" | "error" | "nil" | "true" | "false")
+                {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        // Track `end` closing the def (deps bodies are flat lists).
+        depth += t.matches(" do").count() as i32;
+        if t == "end" || t.starts_with("end ") || t == "end," {
+            depth -= 1;
+            if depth <= 0 {
+                in_deps = false;
+            }
+        }
+    }
+    out
+}
+
+/// `Cartfile`: `github "org/repo"`, `git "url"`, `binary "name"`.
+fn cartfile_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        let mut it = t.split_whitespace();
+        let Some(kind) = it.next() else { continue };
+        if !matches!(kind, "github" | "git" | "binary") {
+            continue;
+        }
+        if let Some(q) = t.find('"') {
+            let inner = &t[q + 1..];
+            if let Some(e) = inner.find('"') {
+                let dep = &inner[..e];
+                if !dep.is_empty() {
+                    out.push(dep.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `conanfile.txt`: `[requires]` entries `pkg/version@user/channel`.
+/// Emitted verbatim so they match `conan.lock` `ref` node ids.
+fn conanfile_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_requires = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_requires = t == "[requires]";
+            continue;
+        }
+        if !in_requires || t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        // `pkg/version@user/channel` possibly with trailing comment.
+        let dep = t.split_whitespace().next().unwrap_or("");
+        let dep = dep.split('#').next().unwrap_or("").trim();
+        // Must look like name/version.
+        if dep.contains('/') && !dep.starts_with('/') {
+            out.push(dep.to_string());
+        }
+    }
+    out
+}
+
+/// `vcpkg.json`: `dependencies`/`overrides` name arrays.
+fn vcpkg_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in ["dependencies", "overrides"] {
+        if let Some(arr) = doc.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    if !s.is_empty() {
+                        out.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `.python-version`/`.nvmrc`/`.tool-versions` runtime pins ->
+/// `tool@version` dep nodes.
+fn runtime_pin_deps(text: &str, tool: &str) -> Vec<String> {
+    let v = text.trim().split_whitespace().next().unwrap_or("");
+    if v.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("{tool}@{v}")]
+    }
+}
+
+/// `.tool-versions`: `tool version` lines (asdf).
+fn tool_versions_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let mut it = t.split_whitespace();
+        if let (Some(tool), Some(ver)) = (it.next(), it.next()) {
+            out.push(format!("{tool}@{ver}"));
+        }
+    }
+    out
+}
+
+/// Terraform `.tf`: `source = "..."` values (module sources and
+/// `required_providers` sources).
+fn terraform_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("source") {
+        let after = &rest[i + 6..];
+        let trimmed = after.trim_start();
+        if !trimmed.starts_with('=') {
+            rest = after;
+            continue;
+        }
+        let val = trimmed[1..].trim_start();
+        if let Some(q) = val.find(['"', '\'']) {
+            let quote = val.as_bytes()[q];
+            let inner = &val[q + 1..];
+            if let Some(e) = inner.find(quote as char) {
+                let src = inner[..e].trim();
+                if !src.is_empty() {
+                    out.push(src.to_string());
+                }
+                rest = &inner[e + 1..];
+                continue;
+            }
+        }
+        rest = after;
+    }
+    out
+}
+
+/// Bazel `WORKSPACE`/`MODULE.bazel`/`*.bzl`: `load("@repo//...")`
+/// references plus `name = "x"` inside `http_archive`/`git_repository`/
+/// `bazel_dep`/`http_file` rules.
+fn bazel_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // load("@repo//path") -> repo
+    let mut rest = text;
+    while let Some(i) = rest.find("@") {
+        let after = &rest[i + 1..];
+        // Skip @@canonical labels - take repo part before //.
+        let repo: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.' || *c == '-')
+            .collect();
+        rest = after;
+        if repo.is_empty() || repo == "@" {
+            continue;
+        }
+        // Only count when followed by `//` (external repo label).
+        if rest.starts_with("//") || after[repo.len()..].starts_with("//") {
+            out.push(repo);
+        }
+    }
+    // name = "x" inside dep-rule calls.
+    for rule in ["http_archive", "git_repository", "bazel_dep", "http_file", "archive_override"] {
+        let mut rest = text;
+        let pat = format!("{rule}(");
+        while let Some(i) = rest.find(&pat) {
+            let after = &rest[i + pat.len()..];
+            let Some(end) = after.find(')') else { break };
+            let body = &after[..end];
+            if let Some(n) = body.find("name") {
+                let nb = &body[n + 4..];
+                let nb = nb.trim_start();
+                if let Some(eq) = nb.strip_prefix('=') {
+                    let v = eq.trim_start();
+                    if let Some(q) = v.find('"') {
+                        let inner = &v[q + 1..];
+                        if let Some(e) = inner.find('"') {
+                            let name = inner[..e].trim();
+                            if !name.is_empty() {
+                                out.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            rest = &after[end + 1..];
         }
     }
     out

@@ -102,7 +102,8 @@ fn pipfile_and_setup_cfg() {
     );
     let out = scan_manifests(root).unwrap();
     assert_eq!(deps_of(&out, "Pipfile"), vec!["pytest", "requests"]);
-    assert_eq!(deps_of(&out, "setup.cfg"), vec!["click", "requests"]);
+    // extras_require `dev = pytest` is now also extracted.
+    assert_eq!(deps_of(&out, "setup.cfg"), vec!["click", "pytest", "requests"]);
 }
 
 #[test]
@@ -417,4 +418,114 @@ fn version_catalog_and_setup_py() {
     assert!(deps.contains(&"requests"));
     assert!(deps.contains(&"flask@3.0")); // setup.py uses same pin path? no - check
     assert!(!deps.contains(&"python"));
+}
+
+#[test]
+fn nix_and_stack_mix_cartfile() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("flake.nix"),
+        "{ inputs = { nixpkgs.url = \"github:NixOS/nixpkgs/nixos-23.11\"; }; packages.x86_64-linux.default = pkgs.hello; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("shell.nix"),
+        "{ pkgs ? import <nixpkgs> {} }: pkgs.mkShell { buildInputs = [ pkgs.git pkgs.curl pkgs.lib.fakeSha256 ]; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("stack.yaml"),
+        "resolver: lts-21\nextra-deps:\n  - git: https://github.com/user/repo\n  - pantry: hackage@sha256:abc\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("mix.exs"),
+        "defmodule X.MixProject do\n  defp deps do\n    [{:phoenix, \"~> 1.7\"}, {:jason, \"~> 1.4\"}, {:ok, true}]\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Cartfile"),
+        "github \"Alamofire/Alamofire\"\ngit \"https://x/y.git\"\nbinary \"jq\"\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"github:NixOS/nixpkgs/nixos-23.11"));
+    assert!(deps.contains(&"hello"));
+    assert!(deps.contains(&"git"));
+    assert!(deps.contains(&"curl"));
+    assert!(!deps.contains(&"fakeSha256"));
+    assert!(deps.contains(&"https://github.com/user/repo"));
+    assert!(deps.contains(&"hackage@sha256:abc"));
+    assert!(deps.contains(&"phoenix"));
+    assert!(deps.contains(&"jason"));
+    assert!(!deps.contains(&"ok"));
+    assert!(deps.contains(&"Alamofire/Alamofire"));
+    assert!(deps.contains(&"jq"));
+}
+
+#[test]
+fn conan_vcpkg_runtime_tf_bazel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("conanfile.txt"),
+        "[requires]\nfmt/9.1.0@user/stable\nzlib/1.2.13\n[generators]\nCMakeDeps\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("vcpkg.json"),
+        "{\"name\":\"x\",\"dependencies\":[\"boost\",\"sdl2\"]}",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".python-version"), "3.12.1\n").unwrap();
+    std::fs::write(dir.path().join(".nvmrc"), "20\n").unwrap();
+    std::fs::write(
+        dir.path().join(".tool-versions"),
+        "python 3.12.1\nnodejs 20.11.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("main.tf"),
+        "module \"vpc\" {\n  source = \"terraform-aws-modules/vpc/aws\"\n  version = \"5.0.0\"\n}\nterraform {\n  required_providers {\n    aws = { source = \"hashicorp/aws\" }\n  }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("WORKSPACE"),
+        "load(\"@bazel_skylib//lib:git.bzl\", \"git_repository\")\ngit_repository(name = \"rules_cc\", remote = \"https://x\")\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"fmt/9.1.0@user/stable"));
+    assert!(deps.contains(&"zlib/1.2.13"));
+    assert!(!deps.contains(&"CMakeDeps"));
+    assert!(deps.contains(&"boost"));
+    assert!(deps.contains(&"sdl2"));
+    assert!(deps.contains(&"python@3.12.1"));
+    assert!(deps.contains(&"node@20"));
+    assert!(deps.contains(&"nodejs@20.11.0"));
+    assert!(deps.contains(&"terraform-aws-modules/vpc/aws"));
+    assert!(deps.contains(&"hashicorp/aws"));
+    assert!(deps.contains(&"bazel_skylib"));
+    assert!(deps.contains(&"rules_cc"));
+}
+
+#[test]
+fn setup_cfg_extras_require() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("setup.cfg"),
+        "[options]\ninstall_requires =\n    requests>=2\n    flask\n\n[options.extras_require]\ntest =\n    pytest\n    coverage\ndocs = sphinx, sphinx-rtd-theme\n",
+    )
+    .unwrap();
+    let out = scan_manifests(dir.path()).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    assert!(deps.contains(&"requests"));
+    assert!(deps.contains(&"flask"));
+    assert!(deps.contains(&"pytest"));
+    assert!(deps.contains(&"coverage"));
+    assert!(deps.contains(&"sphinx"));
+    assert!(deps.contains(&"sphinx-rtd-theme"));
+    assert!(!deps.contains(&"test"));
+    assert!(!deps.contains(&"docs"));
 }

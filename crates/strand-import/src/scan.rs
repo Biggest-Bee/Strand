@@ -130,6 +130,12 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         "pubspec.lock",
         "podfile.lock",
         "paket.lock",
+        "stack.yaml.lock",
+        "mix.lock",
+        "cartfile.resolved",
+        "deno.lock",
+        "conan.lock",
+        "flake.lock",
     ];
     let mut lock_files: Vec<(String, PathBuf)> = Vec::new();
     walk_files(root, root, &mut |rel, abs| {
@@ -148,6 +154,16 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
     let mut lock_nodes: HashMap<&'static str, HashMap<String, Vec<String>>> =
         HashMap::new();
     for (rel, abs) in &lock_files {
+        if abs
+            .file_name()
+            .map(|n| n.to_string_lossy().ends_with(".lockb"))
+            .unwrap_or(false)
+        {
+            warnings.push(format!(
+                "{rel}: binary lockfile (bun.lockb); regenerate with `bun install` to produce bun.lock"
+            ));
+            continue;
+        }
         let Ok(text) = fs::read_to_string(abs) else {
             continue;
         };
@@ -254,6 +270,12 @@ fn lock_group(fmt: crate::Format) -> Option<&'static str> {
         PubspecLock => Some("pub"),
         PodfileLock => Some("cocoapods"),
         PaketLock => Some("jvm"),
+        StackLock => Some("haskell"),
+        MixLock => Some("elixir"),
+        CartfileResolved => Some("carthage"),
+        DenoLock => Some("deno"),
+        ConanLock => Some("conan"),
+        GradleVerification => Some("gradle"),
         GoMod | GoSum => Some("go"),
         _ => None,
     }
@@ -263,7 +285,11 @@ fn lock_group(fmt: crate::Format) -> Option<&'static str> {
 /// (no recorded inter-package edges in the format itself).
 fn is_flat_lock(fmt: crate::Format) -> bool {
     use crate::Format::*;
-    matches!(fmt, SwiftResolved | PubspecLock)
+    matches!(
+        fmt,
+        SwiftResolved | PubspecLock | StackLock | MixLock | CartfileResolved
+            | DenoLock | GradleVerification
+    )
 }
 
 /// Ecosystem group a manifest edge source belongs to.
@@ -281,7 +307,15 @@ fn manifest_group(src: &str) -> Option<&'static str> {
         "package.swift" => Some("swift"),
         "directory.packages.props" | "packages.config" => Some("nuget"),
         "paket.dependencies" => Some("jvm"),
+        "stack.yaml" => Some("haskell"),
+        "mix.exs" => Some("elixir"),
+        "cartfile" => Some("carthage"),
+        "conanfile.txt" => Some("conan"),
+        "pubspec_overrides.yaml" => Some("pub"),
+        "deno.json" | "deno.jsonc" => Some("deno"),
         _ if f.ends_with(".csproj") => Some("nuget"),
+        _ if f.ends_with(".gradle") || f.ends_with(".gradle.kts")
+            || f == "libs.versions.toml" => Some("gradle"),
         _ if f == "setup.py" => Some("python"),
         _ if f.starts_with("requirements") && f.ends_with(".txt") => Some("python"),
         _ => None,
