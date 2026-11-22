@@ -31,6 +31,7 @@ proptest = "1"
 criterion = "0.5"
 petgraph = "0.6"
 libc = "0.2"
+serde_yml = "0.0.12"
 
 [profile.release]
 lto = "thin"

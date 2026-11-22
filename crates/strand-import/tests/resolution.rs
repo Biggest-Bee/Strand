@@ -95,3 +95,17 @@ fn py_runpy() {
     assert!(has_edge(&out, "runner.py", "pkg/mod.py"));
     assert!(has_edge(&out, "runner.py", "scripts/tool.py"));
 }
+
+#[test]
+fn py_spec_from_file_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    w(root, "plugins/tool.py", "print(1)\n");
+    w(
+        root,
+        "loader.py",
+        "import importlib.util\nspec = importlib.util.spec_from_file_location(\"tool\", \"plugins/tool.py\")\n",
+    );
+    let out = scan_lang(root, Lang::Python).unwrap();
+    assert!(has_edge(&out, "loader.py", "plugins/tool.py"));
+}

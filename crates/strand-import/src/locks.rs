@@ -572,3 +572,223 @@ pub(crate) fn unquote(s: &str) -> String {
         .unwrap_or(s)
         .to_string()
 }
+
+// ---------- yarn.lock (v1 + berry) ----------
+
+/// Parse `yarn.lock`. Block keys are comma-separated `name@range`
+/// specs (quoted); each block has `version "x"` and a `dependencies:`
+/// subsection of `name "range"` lines. Emits inter-package edges so
+/// `deps` walks the full transitive chain. Node ids are `name@version`.
+pub fn yarn_lock(text: &str) -> Result<EdgeList> {
+    use std::collections::HashMap;
+
+    struct Block {
+        name: String,
+        version: String,
+        deps: Vec<(String, String)>,
+    }
+
+    let mut blocks: Vec<Block> = Vec::new();
+    // spec string ("name@range") -> block index; name -> first block.
+    let mut spec_map: HashMap<String, usize> = HashMap::new();
+    let mut name_map: HashMap<String, usize> = HashMap::new();
+
+    let mut cur: Option<usize> = None;
+    let mut dep_indent = 0usize;
+    let mut in_deps = false;
+
+    let split_specs = |key: &str| -> Vec<String> {
+        key.split("\", \"")
+            .map(|s| {
+                s.trim()
+                    .trim_end_matches(':')
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    for raw in text.lines() {
+        if raw.starts_with('#') || raw.trim().is_empty() {
+            continue;
+        }
+        let ind = raw.len() - raw.trim_start().len();
+        let t = raw.trim();
+
+        if ind == 0 {
+            // New block: `"a@^1", "a@^2":` or `abbrev@1:`.
+            in_deps = false;
+            cur = None;
+            for spec in split_specs(t) {
+                // name@range: name ends at first '@' (second for
+                // scoped `@scope/name@range`).
+                let at = if spec.starts_with('@') {
+                    spec[1..].find('@').map(|i| i + 1)
+                } else {
+                    spec.find('@')
+                };
+                let Some(at) = at else { continue };
+                let name = spec[..at].to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let idx = blocks.len();
+                blocks.push(Block {
+                    name: name.clone(),
+                    version: String::new(),
+                    deps: Vec::new(),
+                });
+                spec_map.insert(spec, idx);
+                name_map.entry(name).or_insert(idx);
+                cur = Some(idx);
+            }
+            continue;
+        }
+
+        let Some(ci) = cur else { continue };
+        if in_deps {
+            if ind <= dep_indent {
+                in_deps = false;
+            } else {
+                // `"name" "range"` or `name "range"`.
+                let mut it = t.split_whitespace();
+                let name = it.next().map(unquote);
+                let range = it.next().map(unquote);
+                if let (Some(n), Some(r)) = (name, range) {
+                    if !n.is_empty() && !r.is_empty() {
+                        blocks[ci].deps.push((n, r));
+                    }
+                }
+                continue;
+            }
+        }
+        if t == "dependencies:" || t == "optionalDependencies:" || t == "peerDependencies:" {
+            in_deps = true;
+            dep_indent = ind;
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("version ") {
+            blocks[ci].version = unquote(v);
+        }
+    }
+
+    if blocks.is_empty() {
+        return Err(err("yarn.lock: no package blocks found"));
+    }
+
+    let node_of = |i: usize| -> String {
+        let b = &blocks[i];
+        if b.version.is_empty() {
+            b.name.clone()
+        } else {
+            format!("{}@{}", b.name, b.version)
+        }
+    };
+
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for (i, b) in blocks.iter().enumerate() {
+        for (dn, dr) in &b.deps {
+            let spec = format!("{dn}@{dr}");
+            let di = spec_map
+                .get(&spec)
+                .or_else(|| name_map.get(dn))
+                .copied();
+            let Some(di) = di else { continue };
+            if di == i {
+                continue;
+            }
+            let e = (node_of(i), node_of(di));
+            if seen.insert(e.clone()) {
+                edges.push((e.0, e.1, None, strand_core::EdgeKind::Static));
+            }
+        }
+    }
+    Ok(edges)
+}
+
+// ---------- pnpm-lock.yaml ----------
+
+/// Parse `pnpm-lock.yaml`. `importers` map project dirs to their
+/// direct deps (emits `<dir>/package.json -> name@version`);
+/// `snapshots` hold each package's resolved dependencies
+/// (emits `name@version -> dep@version`). Peer suffixes `( ... )`
+/// are stripped so dep references resolve to snapshot keys.
+pub fn pnpm_lock(text: &str) -> Result<EdgeList> {
+    let doc: serde_yml::Value =
+        serde_yml::from_str(text).map_err(|e| err(format!("pnpm-lock.yaml: {e}")))?;
+
+    // Normalize a pnpm version ref: strip peer-dep suffix `( ... )`.
+    fn norm_ver(v: &str) -> String {
+        v.split('(').next().unwrap_or(v).trim().to_string()
+    }
+    // `name@version` node id from a snapshot/package key or a
+    // `name` + `version` pair.
+    fn node_id(key: &str) -> String {
+        // Keys look like `name@1.2.3` or `@scope/name@1.2.3(peers)`.
+        let k = norm_ver(key);
+        k
+    }
+
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut push = |s: String, d: String| {
+        if s != d && seen.insert((s.clone(), d.clone())) {
+            edges.push((s, d, None, strand_core::EdgeKind::Static));
+        }
+    };
+
+    // importers: dir -> dep name -> {specifier, version}
+    if let Some(importers) = doc.get("importers").and_then(|v| v.as_mapping()) {
+        for (dir_v, imp) in importers {
+            let Some(dir) = dir_v.as_str() else { continue };
+            let src = if dir == "." {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            };
+            for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+                if let Some(deps) = imp.get(section).and_then(|v| v.as_mapping()) {
+                    for (name_v, meta) in deps {
+                        let Some(name) = name_v.as_str() else { continue };
+                        let ver = meta
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(norm_ver);
+                        if let Some(ver) = ver {
+                            if !ver.is_empty() && !ver.contains("://") {
+                                push(src.clone(), format!("{name}@{ver}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // snapshots: `name@ver(peers)` -> { dependencies: {name: ver} }
+    if let Some(snaps) = doc.get("snapshots").and_then(|v| v.as_mapping()) {
+        for (key_v, snap) in snaps {
+            let Some(key) = key_v.as_str() else { continue };
+            let src = node_id(key);
+            for section in ["dependencies", "optionalDependencies"] {
+                if let Some(deps) = snap.get(section).and_then(|v| v.as_mapping()) {
+                    for (name_v, ver_v) in deps {
+                        let (Some(name), Some(ver)) =
+                            (name_v.as_str(), ver_v.as_str())
+                        else {
+                            continue;
+                        };
+                        let ver = norm_ver(ver);
+                        if ver.is_empty() || ver.contains("://") {
+                            continue;
+                        }
+                        push(src.clone(), format!("{name}@{ver}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(edges)
+}

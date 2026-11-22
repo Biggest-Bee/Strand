@@ -99,13 +99,95 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         warnings.extend(out.warnings);
     }
     // Manifest deps (requirements.txt, package.json, Cargo.toml,
-    // pyproject.toml, ...) are language-agnostic: run once.
+    // pyproject.toml, ...) are language-agnostic: run once. Edges are
+    // held back so lockfile-pinned versions can replace bare dep
+    // names below (manifest -> name@version -> transitive).
+    let mut manifest_edges: EdgeList = Vec::new();
     if !langs.is_empty() {
         let m = crate::manifests::scan_manifests(root)?;
-        edges.extend(m.edges);
+        manifest_edges = m.edges;
         nodes.extend(m.nodes);
         warnings.extend(m.warnings);
     }
+    // Lockfiles anywhere in the tree: full transitive dep chains.
+    const LOCK_NAMES: &[&str] = &[
+        "cargo.lock",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "go.mod",
+        "pom.xml",
+    ];
+    let mut lock_files: Vec<(String, PathBuf)> = Vec::new();
+    walk_files(root, root, &mut |rel, abs| {
+        if abs
+            .file_name()
+            .map(|n| {
+                LOCK_NAMES.contains(&n.to_string_lossy().to_lowercase().as_str())
+            })
+            .unwrap_or(false)
+        {
+            lock_files.push((rel, abs));
+        }
+    });
+    lock_files.sort_by(|a, b| a.0.cmp(&b.0));
+    // group -> dep name -> pinned node ids, for manifest bridging.
+    let mut lock_nodes: HashMap<&'static str, HashMap<String, Vec<String>>> =
+        HashMap::new();
+    for (rel, abs) in &lock_files {
+        let Ok(text) = fs::read_to_string(abs) else {
+            continue;
+        };
+        let fmt = crate::detect_format(abs, &text);
+        match crate::parse(&text, fmt) {
+            Ok(es) => {
+                let group = lock_group(fmt);
+                for (s, d, _, _) in &es {
+                    nodes.push(s.clone());
+                    nodes.push(d.clone());
+                    if let Some(g) = group {
+                        for n in [s, d] {
+                            lock_nodes
+                                .entry(g)
+                                .or_default()
+                                .entry(lock_node_name(n).to_string())
+                                .or_default()
+                                .push(n.clone());
+                        }
+                    }
+                }
+                edges.extend(es);
+            }
+            Err(e) => warnings.push(format!("{rel}: lockfile parse: {e}")),
+        }
+    }
+    // Bridge: manifest `package.json -> my-app` becomes
+    // `package.json -> my-app@1.2.0` when a lockfile pins it, so
+    // `deps` walks manifest -> pinned -> full transitive chain.
+    let mut bridged: EdgeList = Vec::new();
+    let mut seen_bridge: BTreeSet<(String, String)> = BTreeSet::new();
+    for (src, dst, w, kind) in manifest_edges {
+        let pinned = manifest_group(&src)
+            .and_then(|g| lock_nodes.get(g))
+            .and_then(|m| m.get(&dst));
+        match pinned {
+            Some(nodes_for) if !nodes_for.is_empty() => {
+                for n in nodes_for {
+                    if seen_bridge.insert((src.clone(), n.clone())) {
+                        bridged.push((src.clone(), n.clone(), w, kind));
+                    }
+                }
+            }
+            _ => {
+                if seen_bridge.insert((src.clone(), dst.clone())) {
+                    bridged.push((src, dst, w, kind));
+                }
+            }
+        }
+    }
+    edges.extend(bridged);
     nodes.sort();
     nodes.dedup();
     Ok(ScanOutput {
@@ -113,6 +195,46 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         nodes,
         warnings,
     })
+}
+
+/// Ecosystem group a lockfile format feeds manifest bridging.
+fn lock_group(fmt: crate::Format) -> Option<&'static str> {
+    use crate::Format::*;
+    match fmt {
+        NpmLock | YarnLock | PnpmLock => Some("npm"),
+        CargoLock | Cargo => Some("cargo"),
+        PoetryLock => Some("python"),
+        _ => None,
+    }
+}
+
+/// Ecosystem group a manifest edge source belongs to.
+fn manifest_group(src: &str) -> Option<&'static str> {
+    let f = src.rsplit('/').next()?.to_lowercase();
+    match f.as_str() {
+        "package.json" => Some("npm"),
+        "cargo.toml" => Some("cargo"),
+        "pyproject.toml" | "pipfile" | "setup.cfg" | "environment.yml"
+        | "environment.yaml" => Some("python"),
+        _ if f.starts_with("requirements") && f.ends_with(".txt") => Some("python"),
+        _ => None,
+    }
+}
+
+/// Package name part of a lockfile node id: strips a trailing
+/// `@version` or ` version` suffix (`name@1.2.3` -> `name`,
+/// `@scope/name@1.2.3` -> `@scope/name`).
+fn lock_node_name(node: &str) -> &str {
+    if let Some(i) = node.rfind('@') {
+        if i > 0 && node[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return &node[..i];
+        }
+    }
+    // Space-separated `name version (source)` forms: name is first.
+    if let Some(i) = node.find(' ') {
+        return &node[..i];
+    }
+    node
 }
 
 fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
@@ -2297,6 +2419,35 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize) {
                     if let Ok(ft) = func.utf8_text(text.as_bytes()) {
                         if ft == "run_path" || ft.ends_with(".run_path") {
                             match py_first_arg(node)
+                                .and_then(|a| py_eval_strset(&env, a, text, 0))
+                            {
+                                Some(vals) => {
+                                    for v in vals {
+                                        out.push(PyRef::PathDep(v));
+                                    }
+                                }
+                                None => dynamic += 1,
+                            }
+                        }
+                        // `importlib.util.spec_from_file_location("n",
+                        // "path.py")` - second arg is the file path.
+                        if ft == "spec_from_file_location"
+                            || ft.ends_with(".spec_from_file_location")
+                        {
+                            let path_arg = node
+                                .child_by_field_name("arguments")
+                                .map(|args| {
+                                    let mut c = args.walk();
+                                    let kids: Vec<_> = args
+                                        .children(&mut c)
+                                        .filter(|k| {
+                                            !matches!(k.kind(), "(" | ")" | ",")
+                                        })
+                                        .collect();
+                                    kids.into_iter().nth(1)
+                                })
+                                .flatten();
+                            match path_arg
                                 .and_then(|a| py_eval_strset(&env, a, text, 0))
                             {
                                 Some(vals) => {

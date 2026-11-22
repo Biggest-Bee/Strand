@@ -23,6 +23,10 @@ pub enum Format {
     CargoLock,
     /// `package-lock.json` / `npm-shrinkwrap.json` (npm).
     NpmLock,
+    /// `yarn.lock` (v1 and berry).
+    YarnLock,
+    /// `pnpm-lock.yaml`.
+    PnpmLock,
     /// `poetry.lock` (TOML).
     PoetryLock,
     /// `go.mod`.
@@ -47,6 +51,8 @@ pub fn parse(text: &str, format: Format) -> Result<EdgeList> {
         Format::Cargo => cargo::parse(text),
         Format::CargoLock => locks::cargo_lock(text),
         Format::NpmLock => locks::package_lock(text),
+        Format::YarnLock => locks::yarn_lock(text),
+        Format::PnpmLock => locks::pnpm_lock(text),
         Format::PoetryLock => locks::poetry_lock(text),
         Format::GoMod => locks::go_mod(text),
         Format::Pom => locks::pom_xml(text),
@@ -62,6 +68,8 @@ pub fn detect_format(path: &std::path::Path, text: &str) -> Format {
         match name.as_str() {
             "cargo.lock" => return Format::CargoLock,
             "package-lock.json" | "npm-shrinkwrap.json" => return Format::NpmLock,
+            "yarn.lock" => return Format::YarnLock,
+            "pnpm-lock.yaml" => return Format::PnpmLock,
             "poetry.lock" => return Format::PoetryLock,
             "go.mod" => return Format::GoMod,
             "pom.xml" => return Format::Pom,
@@ -72,6 +80,13 @@ pub fn detect_format(path: &std::path::Path, text: &str) -> Format {
     let t = text.trim_start();
     if t.contains("\"lockfileVersion\"") {
         return Format::NpmLock;
+    }
+    if t.contains("yarn lockfile") {
+        return Format::YarnLock;
+    }
+    // pnpm yaml: `lockfileVersion: '9.0'` (unquoted key, colon form).
+    if t.contains("lockfileVersion:") {
+        return Format::PnpmLock;
     }
     if t.starts_with("module ") {
         return Format::GoMod;
