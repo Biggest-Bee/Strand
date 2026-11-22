@@ -78,6 +78,10 @@ enum InFormat {
     PoetryLock,
     GoMod,
     Pom,
+    /// `webpack --json` stats output.
+    Webpack,
+    /// `esbuild --metafile` JSON output.
+    Esbuild,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
@@ -179,6 +183,13 @@ struct ScanArgs {
     /// Language(s) to scan (default: all).
     #[arg(long, value_enum, default_value_t = ScanLang::All)]
     lang: ScanLang,
+    /// Additional edge-list inputs merged into the scan: CSV/TSV,
+    /// lockfiles, `cargo metadata`, `webpack --json` stats, or
+    /// `esbuild --metafile` JSON (format auto-detected). Repeatable.
+    /// Edges the static scan can't see (e.g. bundler-resolved dynamic
+    /// imports) come from these files.
+    #[arg(long = "import")]
+    imports: Vec<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -525,6 +536,8 @@ fn cmd_build(a: BuildArgs) -> strand_core::Result<()> {
             InFormat::PoetryLock => Format::PoetryLock,
             InFormat::GoMod => Format::GoMod,
             InFormat::Pom => Format::Pom,
+            InFormat::Webpack => Format::WebpackStats,
+            InFormat::Esbuild => Format::EsbuildMeta,
         };
         let edges = strand_import::parse(&text, format)?;
         eprintln!("{}: {} edges", input.display(), edges.len());
@@ -567,11 +580,19 @@ fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
     for w in &scan.warnings {
         eprintln!("warning: {w}");
     }
+    let mut edges = scan.edges;
+    for input in &a.imports {
+        let text = std::fs::read_to_string(input)?;
+        let format = strand_import::detect_format(input, &text);
+        let extra = strand_import::parse(&text, format)?;
+        eprintln!("{}: {} imported edge(s)", input.display(), extra.len());
+        edges.extend(extra);
+    }
     let mut b = GraphBuilder::new();
     for n in &scan.nodes {
         b.add_node(n.clone());
     }
-    strand_import::fill_builder(scan.edges, &mut b)?;
+    strand_import::fill_builder(edges, &mut b)?;
     let stats = b.build(&out)?;
     eprintln!(
         "scanned {}: {} nodes, {} edges -> {}",

@@ -174,6 +174,13 @@ strand impact deps.strand --git-diff origin/main --max-impact 25
 strand export deps.strand --format mermaid --impact serde_json --depth 2
 strand export deps.strand --format dot --why my-app serde_json
 
+# Ask the build tool: merge edges the project's bundler already
+# resolved. `webpack --json > stats.json` gives per-module deps
+# (aliases, dynamic requires, loader chains); `esbuild --metafile`
+# gives per-input imports. Edges import as `resolved` confidence:
+strand scan ./web-app -o app.strand --import stats.json
+strand build stats.json -o bundler.strand   # bundler edges alone
+
 # Enforce architecture rules (exit 1 on violations, CI-friendly):
 # strand.rules:
 #   forbid ui/ -> db/        # substring match on node names
@@ -620,7 +627,12 @@ cargo test
   `entry_points().select(group="x")` callers link to every target
   declared in that group across `pyproject.toml`, `setup.cfg`, and
   `setup.py`; a bare `entry_points()` links to all declared targets.
-  And
+  For JS/TS, `strand scan --import <file>` (or `strand build`)
+  accepts bundler metadata - `webpack --json` stats and
+  `esbuild --metafile` JSON - whose resolved module edges import as
+  `resolved` confidence. This is the escape hatch for what static
+  analysis structurally cannot see: ask the tool that already did
+  the resolution. And
   `# strand: depends-on <path>` /
   `// strand: depends-on <path>` comments add manual edges for the
   cases you know about (paths resolve relative to the file's dir,

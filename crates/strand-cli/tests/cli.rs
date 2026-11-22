@@ -537,3 +537,75 @@ fn cli_min_confidence_filters_edges() {
     let decl = String::from_utf8_lossy(&deps_decl.stdout);
     assert!(decl.contains("b.py") && decl.contains("c.py"), "{decl}");
 }
+
+#[test]
+fn cli_scan_import_merges_bundler_edges() {
+    // `strand scan --import stats.json` merges webpack-resolved edges
+    // the static scan can't see (e.g. dynamic require webpack sorted
+    // out). Skips the webpack part only if files are missing - the
+    // fixture is self-contained JSON, no webpack binary needed.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.js"), "require('./b');\n").unwrap();
+    std::fs::write(root.join("src/b.js"), "module.exports = 1;\n").unwrap();
+    std::fs::write(root.join("src/c.js"), "module.exports = 2;\n").unwrap();
+
+    // Webpack stats claiming a.js also depends on c.js - no static
+    // import exists for it (dynamic require webpack resolved).
+    let stats = dir.path().join("stats.json");
+    std::fs::write(
+        &stats,
+        r##"{"hash":"x","outputPath":"/proj/dist","modules":[
+            {"name":"./src/a.js","dependencies":[
+                {"module":"./src/b.js"},
+                {"module":"./src/c.js"}
+            ]},
+            {"name":"./src/b.js"},
+            {"name":"./src/c.js"}
+        ]}"##,
+    )
+    .unwrap();
+
+    let graph = dir.path().join("merged.strand");
+    let o = strand()
+        .args([
+            "scan",
+            root.to_str().unwrap(),
+            "-o",
+            graph.to_str().unwrap(),
+            "--import",
+            stats.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("imported edge(s)"));
+
+    let deps = strand()
+        .args(["deps", graph.to_str().unwrap(), "src/a.js"])
+        .output()
+        .unwrap();
+    assert!(deps.status.success());
+    let out = String::from_utf8_lossy(&deps.stdout);
+    assert!(
+        out.contains("src/b.js") && out.contains("src/c.js"),
+        "{out}"
+    );
+
+    // The bundler edge is Resolved (below Static): --min-confidence
+    // static hides it, declared keeps it.
+    let strict = strand()
+        .args([
+            "deps",
+            graph.to_str().unwrap(),
+            "src/a.js",
+            "--min-confidence",
+            "static",
+        ])
+        .output()
+        .unwrap();
+    let strict_out = String::from_utf8_lossy(&strict.stdout);
+    assert!(strict_out.contains("src/b.js"), "{strict_out}");
+    assert!(!strict_out.contains("src/c.js"), "{strict_out}");
+}
