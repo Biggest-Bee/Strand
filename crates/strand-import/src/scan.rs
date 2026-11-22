@@ -97,6 +97,14 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         nodes.extend(out.nodes);
         warnings.extend(out.warnings);
     }
+    // Manifest deps (requirements.txt, package.json, Cargo.toml,
+    // pyproject.toml, ...) are language-agnostic: run once.
+    if !langs.is_empty() {
+        let m = crate::manifests::scan_manifests(root)?;
+        edges.extend(m.edges);
+        nodes.extend(m.nodes);
+        warnings.extend(m.warnings);
+    }
     nodes.sort();
     nodes.dedup();
     Ok(ScanOutput {
@@ -432,6 +440,35 @@ fn walk_ext(
         }
     }
     Ok(())
+}
+
+/// Visit every file under `root` (respecting [`SKIP_DIRS`]) with its
+/// root-relative `/` path and absolute path. Used by the manifest
+/// scanner, which matches on file names rather than extensions.
+pub(crate) fn walk_files(
+    dir: &Path,
+    root: &Path,
+    f: &mut dyn FnMut(String, PathBuf),
+) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            let name = entry.file_name();
+            if SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            walk_files(&path, root, f);
+        } else if ft.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            f(rel, path);
+        }
+    }
 }
 
 /// Drop a Windows `\\?\` verbatim prefix from a path string.

@@ -7,6 +7,7 @@ pub mod bundler;
 pub mod cargo;
 pub mod csv;
 pub mod locks;
+pub mod manifests;
 pub mod scan;
 
 use strand_core::{Error, Result};
