@@ -120,10 +120,18 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             || name == "conanfile.py"
             || name == ".gitlab-ci.yml"
             || name == "project.toml"
+            || name == ".npmrc"
+            || name == "pip.conf"
+            || name == "pip.ini"
+            || name == ".pypirc"
             || (name.starts_with("requirements") && name.ends_with(".txt"))
             || (parent == "requirements" && name.ends_with(".txt"))
             || (norm_rel.starts_with(".github/workflows/") || norm_rel.contains("/.github/workflows/")
-                && (name.ends_with(".yml") || name.ends_with(".yaml")));
+                && (name.ends_with(".yml") || name.ends_with(".yaml")))
+            || norm_rel == ".cargo/config.toml"
+            || norm_rel.ends_with("/.cargo/config.toml")
+            || norm_rel == ".cargo/config"
+            || norm_rel.ends_with("/.cargo/config");
         if hit {
             files.push((rel, abs));
         }
@@ -221,6 +229,16 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             nuget_manifest_deps(&text)
         } else if name == "project.toml" {
             project_toml_deps(&text)
+        } else if name == ".npmrc"
+            || name == "pip.conf"
+            || name == "pip.ini"
+            || name == ".pypirc"
+            || rel_norm == ".cargo/config.toml"
+            || rel_norm.ends_with("/.cargo/config.toml")
+            || rel_norm == ".cargo/config"
+            || rel_norm.ends_with("/.cargo/config")
+        {
+            registry_config_deps(&text)
         } else if name == "deps.edn" || name == "bb.edn" {
             edn_lib_deps(&text)
         } else if name == "project.clj" {
@@ -2423,6 +2441,49 @@ fn gitlab_ci_deps(text: &str) -> Vec<String> {
         let img = rest.trim().trim_matches(|c| c == '"' || c == '\'');
         if !img.is_empty() && !img.starts_with('$') && seen.insert(img.to_string()) {
             out.push(img.to_string());
+        }
+    }
+    out
+}
+
+// ---------- registry / deploy configs ----------
+
+/// Registry endpoint configs: `.npmrc`, `pip.conf`/`pip.ini`,
+/// `.pypirc`, `.cargo/config(.toml)`. Emits `registry:<url>` deps
+/// so non-default registries (mirrors, proxies, private indexes)
+/// are visible - without them the scanner implicitly assumes the
+/// public registry served every package.
+fn registry_config_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+        // `key = value`, `key: value`, or TOML `key = "value"`.
+        let Some((k, v)) = t.split_once('=').or_else(|| t.split_once(':')) else {
+            continue;
+        };
+        let k = k.trim();
+        let v = v
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim_end_matches(',')
+            .trim();
+        if v.is_empty() || !v.contains("://") {
+            continue;
+        }
+        let is_registry_key = k == "registry"
+            || k.ends_with(":registry")
+            || matches!(k, "index-url" | "extra-index-url")
+            || (k == "index" && v.starts_with("http"));
+        if is_registry_key {
+            let node = format!("registry:{v}");
+            if seen.insert(node.clone()) {
+                out.push(node);
+            }
         }
     }
     out

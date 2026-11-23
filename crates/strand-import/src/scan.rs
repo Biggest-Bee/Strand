@@ -344,6 +344,61 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
             );
         }
     }
+    // Lockfile drift: a manifest `name@version` pin (requirements
+    // `==`, package.json exact versions, cargo `=x`) that matches no
+    // locked version of the same package is what `npm ci` / a frozen
+    // install would reject - manifest and lockfile disagree about
+    // what actually resolves.
+    {
+        let mut drift: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (src, dst, ..) in &manifest_edges {
+            let Some(g) = manifest_group(src) else {
+                continue;
+            };
+            // Only exact pins carry `@`+digit; bare/range specs skip.
+            let Some(i) = dst.rfind('@') else {
+                continue;
+            };
+            if i == 0 || !dst[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let bare = lock_node_name(dst).to_lowercase();
+            let Some(locked) = lock_nodes.get(g).and_then(|m| m.get(&bare)) else {
+                continue;
+            };
+            if locked.is_empty() || locked.iter().any(|n| n == dst) {
+                continue;
+            }
+            // Version-tolerant compare: `1.0` vs `1.0.0` are the same
+            // pin in most ecosystems.
+            let mv = ver_key(&dst[i + 1..]);
+            if locked.iter().any(|n| {
+                n.rfind('@').is_some_and(|j| {
+                    j > 0 && n[j + 1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+                        && ver_key(&n[j + 1..]) == mv
+                })
+            }) {
+                continue;
+            }
+            drift.entry(src.clone()).or_default().insert(dst.clone());
+        }
+        let total: usize = drift.values().map(|s| s.len()).sum();
+        let mut shown = 0usize;
+        'outer: for (src, dsts) in &drift {
+            for d in dsts {
+                if shown >= 20 {
+                    break 'outer;
+                }
+                warnings.push(format!(
+                    "{src}: {d} pinned in manifest but no lockfile agrees - possible drift"
+                ));
+                shown += 1;
+            }
+        }
+        if total > shown {
+            warnings.push(format!("lockfile drift check truncated at {shown} of {total} pins"));
+        }
+    }
     // Bridge: manifest `package.json -> my-app` becomes
     // `package.json -> my-app@1.2.0` when a lockfile pins it, so
     // `deps` walks manifest -> pinned -> full transitive chain.
@@ -435,6 +490,17 @@ fn ingest_lock_edges(
         }
     }
     edges.extend(es);
+}
+
+/// Version compare key for drift checks: strip trailing `.0`
+/// segments so `1.0`, `1.0.0`, `1` compare equal (version padding
+/// tolerance across ecosystems).
+fn ver_key(v: &str) -> String {
+    let mut s = v.trim();
+    while let Some(stripped) = s.strip_suffix(".0") {
+        s = stripped;
+    }
+    s.to_string()
 }
 
 /// Ecosystem group a lockfile format feeds manifest bridging.
@@ -619,6 +685,23 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
             }
         }
 
+        // `#[link(name = "foo")]` / `cargo:rustc-link-lib` - native
+        // library deps; internals stay opaque.
+        for lib in &refs.link_libs {
+            if !lib.is_empty() {
+                note_dep(&mut deps, format!("native:{lib}"), EdgeKind::Resolved);
+            }
+        }
+        // `include_str!`/`include_bytes!` - compile-time file reads.
+        // Edge only when the path exists on disk.
+        for inc in &refs.data_includes {
+            if let Some(dep) = normalize_rel(parent, inc)
+                .filter(|c| root.join(c.as_str()).is_file() && c.as_str() != rel.as_str())
+            {
+                note_dep(&mut deps, dep, EdgeKind::Resolved);
+            }
+        }
+
         // `// strand: depends-on path` manual edges. Paths resolve
         // relative to the file's dir, then project root.
         for spec in manual {
@@ -749,6 +832,11 @@ struct RustRefs {
     uses: Vec<Vec<String>>,
     /// String literals inside `include!(...)` calls.
     includes: Vec<String>,
+    /// `#[link(name = "foo")]` on extern blocks/items - native libs.
+    link_libs: Vec<String>,
+    /// `include_str!("x")`/`include_bytes!("x")` literals - data
+    /// files pulled into the binary at compile time.
+    data_includes: Vec<String>,
 }
 
 fn parse_rs_refs(text: &str) -> std::result::Result<RustRefs, syn::Error> {
@@ -779,14 +867,95 @@ impl<'ast> Visit<'ast> for RustRefVisitor {
         flatten_use(&i.tree, &mut prefix, &mut self.refs.uses);
     }
 
-    fn visit_macro(&mut self, i: &'ast syn::Macro) {
-        if i.path.segments.last().is_some_and(|s| s.ident == "include") {
-            if let Ok(lit) = syn::parse2::<syn::LitStr>(i.tokens.clone()) {
-                self.refs.includes.push(lit.value());
+    fn visit_item_foreign_mod(&mut self, i: &'ast syn::ItemForeignMod) {
+        // `#[link(name = "foo", kind = "dylib")] extern "C" { ... }` -
+        // the native library this block binds against.
+        for attr in &i.attrs {
+            if let Some(name) = link_attr_name(attr) {
+                self.refs.link_libs.push(name);
             }
         }
+        visit::visit_item_foreign_mod(self, i);
+    }
+
+    fn visit_macro(&mut self, i: &'ast syn::Macro) {
+        let last = i.path.segments.last().map(|s| s.ident.to_string());
+        match last.as_deref() {
+            Some("include") => {
+                if let Ok(lit) = syn::parse2::<syn::LitStr>(i.tokens.clone()) {
+                    self.refs.includes.push(lit.value());
+                }
+            }
+            Some("include_str") | Some("include_bytes") => {
+                if let Ok(lit) = syn::parse2::<syn::LitStr>(i.tokens.clone()) {
+                    self.refs.data_includes.push(lit.value());
+                }
+            }
+            _ => {}
+        }
+        // build.rs `println!("cargo:rustc-link-lib=dylib=foo")` -
+        // linker directives embedded in string literals.
+        self.refs.link_libs.extend(cargo_link_libs(i));
         visit::visit_macro(self, i);
     }
+}
+
+/// `#[link(name = "foo")]` -> `"foo"`.
+fn link_attr_name(attr: &syn::Attribute) -> Option<String> {
+    if !attr.path().is_ident("link") {
+        return None;
+    }
+    let nested = attr
+        .parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        )
+        .ok()?;
+    for m in nested {
+        if let syn::Meta::NameValue(nv) = m {
+            if nv.path.is_ident("name") {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) = nv.value
+                {
+                    return Some(s.value());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `cargo:rustc-link-lib=[KIND=]NAME` inside macro string literals
+/// (build.rs link directives). `KIND` is one of static/dylib/
+/// framework. Token text is inspected via `Display` so no
+/// proc-macro2 dependency is needed.
+fn cargo_link_libs(mac: &syn::Macro) -> Vec<String> {
+    let mut out = Vec::new();
+    for tt in mac.tokens.clone() {
+        let s = tt.to_string();
+        let s = s.trim();
+        if !s.starts_with('"') {
+            continue;
+        }
+        let s = s.trim_matches('"');
+        let Some(rest) = s.strip_prefix("cargo:rustc-link-lib=") else {
+            continue;
+        };
+        // `dylib=foo` / `static=foo` -> `foo`; bare `foo` stays.
+        let name = match rest.split_once('=') {
+            Some((kind, n))
+                if matches!(kind, "static" | "dylib" | "framework") =>
+            {
+                n
+            }
+            _ => rest,
+        };
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
 }
 
 /// `#[path = "..."]` -> the literal value, for `mod` items only.
@@ -1399,6 +1568,78 @@ fn js_import_specs_ts(
     (specs, globs, had_error, dynamic)
 }
 
+/// Native-library and data-file specs in JS/TS call expressions:
+/// `bindings("name")` (node-gyp addons), `process.dlopen(m, "x.node")`,
+/// and the `fs` read family (`readFileSync`, `fs.readFile`,
+/// `createReadStream`, `readdir`). Returns `(native_names,
+/// file_paths)`; literal args only - computed args are ignored (the
+/// file existence check filters noise anyway).
+fn js_native_file_specs(text: &str, lang: tree_sitter::Language) -> (Vec<String>, Vec<String>) {
+    let mut natives = Vec::new();
+    let mut files = Vec::new();
+    let Some(tree) = parse_ts(text, lang) else {
+        return (natives, files);
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            if let Some(func) = node.child_by_field_name("function") {
+                if let Ok(ft) = func.utf8_text(text.as_bytes()) {
+                    let args = node.child_by_field_name("arguments");
+                    let arg_str = |idx: usize| -> Option<String> {
+                        js_call_arg_str(args, idx, text)
+                    };
+                    if ft == "bindings" || ft.ends_with(".bindings") {
+                        if let Some(n) = arg_str(0) {
+                            natives.push(n);
+                        }
+                    } else if ft == "process.dlopen" || ft.ends_with(".dlopen") {
+                        // dlopen(module, path) - path is arg 1.
+                        if let Some(n) = arg_str(1).or_else(|| arg_str(0)) {
+                            natives.push(n);
+                        }
+                    } else {
+                        let is_fs = matches!(
+                            ft,
+                            "readFileSync"
+                                | "readFile"
+                                | "createReadStream"
+                                | "readdirSync"
+                                | "readdir"
+                        ) || ft.ends_with(".readFileSync")
+                            || ft.ends_with(".readFile")
+                            || ft.ends_with(".createReadStream")
+                            || ft.ends_with(".readdirSync")
+                            || ft.ends_with(".readdir");
+                        if is_fs {
+                            if let Some(p) = arg_str(0) {
+                                files.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    (natives, files)
+}
+
+/// Nth non-punctuation call argument as a string literal.
+fn js_call_arg_str(args: Option<tree_sitter::Node>, idx: usize, text: &str) -> Option<String> {
+    let args = args?;
+    let mut c = args.walk();
+    let found = args
+        .children(&mut c)
+        .filter(|c| !matches!(c.kind(), "(" | ")" | ","))
+        .nth(idx)
+        .and_then(|a| ts_string_literal(a, text));
+    found
+}
+
 /// Outcome of checking a call for bundler-style glob loading.
 enum TsGlob {
     /// Resolved glob patterns to expand against the file set.
@@ -1728,6 +1969,14 @@ enum PyRef {
     /// `runpy.run_path("script.py")` - a file path (not a module
     /// path) resolved file-dir relative, then project-root relative.
     PathDep(String),
+    /// `ctypes.CDLL("libfoo.so")` / `ctypes.windll.kernel32` -
+    /// native library load with a literal name. Emitted as a
+    /// `native:<name>` node; the library's internals stay opaque.
+    NativeLib(String),
+    /// `open("cfg.yaml")`, `Path("data/x")`, `pd.read_csv("t.csv")`
+    /// - literal file path; caller emits an edge only when the path
+    /// exists on disk (data-only coupling).
+    DataFile(String),
 }
 
 // ---------- Python constant propagation ----------
@@ -2589,14 +2838,19 @@ fn py_dict_values(
 /// degrade to ERROR nodes rather than wrong guesses. The third return
 /// value counts dynamic import sites (non-literal `import_module` /
 /// `__import__` args) so callers can warn that edges may be incomplete.
-fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize) {
+/// The fifth element counts dynamic native-library loads
+/// (`ctypes.CDLL(var)`) - reported separately since they aren't
+/// import sites.
+fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
     let mut out = Vec::new();
     let mut dynamic = 0usize;
     // Subset of `dynamic` whose argument reads env vars or config -
     // reported separately so warnings can say *why* it's invisible.
     let mut env_cfg = 0usize;
+    // Non-literal native lib loads (`ctypes.CDLL(name)`).
+    let mut native_dyn = 0usize;
     let Some(tree) = parse_ts(text, tree_sitter_python::LANGUAGE.into()) else {
-        return (out, true, dynamic, env_cfg);
+        return (out, true, dynamic, env_cfg, native_dyn);
     };
     let had_error = tree.root_node().has_error();
     // Const-prop environment for computed dynamic imports - built in
@@ -2683,10 +2937,21 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize) {
                 ) {
                     if l.kind() == "identifier" {
                         if let Ok(name) = l.utf8_text(text.as_bytes()) {
-                            if matches!(name, "pytest_plugins" | "INSTALLED_APPS") {
+                            if matches!(name, "pytest_plugins" | "INSTALLED_APPS" | "CELERY_IMPORTS") {
                                 if let Some(strings) = py_convention_strings(&env, r, text) {
                                     if !strings.is_empty() {
                                         out.push(PyRef::Convention(strings));
+                                    }
+                                }
+                            } else if matches!(
+                                name,
+                                "STATICFILES_DIRS" | "MEDIA_ROOT" | "STATIC_ROOT"
+                            ) {
+                                // Django path-valued settings - data
+                                // coupling, resolved against disk.
+                                if let Some(strings) = py_convention_strings(&env, r, text) {
+                                    for s in strings {
+                                        out.push(PyRef::DataFile(s));
                                     }
                                 }
                             }
@@ -2774,6 +3039,77 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize) {
                                     }
                                 }
                                 None => dynamic += 1,
+                            }
+                        }
+                        // Native library loads: `ctypes.CDLL("x.so")`,
+                        // `ctypes.PyDLL`, `ctypes.WinDLL`,
+                        // `ctypes.*.LoadLibrary("x.dll")` - literal
+                        // names become `native:` edges; computed names
+                        // are invisible edges worth a warning.
+                        // `CDLL(None)` is the main-program handle, not
+                        // a library - skipped entirely.
+                        let is_lib_load = ft == "CDLL"
+                            || ft == "PyDLL"
+                            || ft == "WinDLL"
+                            || ft == "LoadLibrary"
+                            || ft.ends_with(".CDLL")
+                            || ft.ends_with(".PyDLL")
+                            || ft.ends_with(".WinDLL")
+                            || ft.ends_with(".LoadLibrary");
+                        if is_lib_load {
+                            let arg = py_first_arg(node);
+                            let is_none = arg.is_some_and(|a| a.kind() == "none");
+                            match arg.and_then(|a| py_eval_strset(&env, a, text, 0)) {
+                                Some(vals) => {
+                                    for v in vals {
+                                        out.push(PyRef::NativeLib(v));
+                                    }
+                                }
+                                None if !is_none => native_dyn += 1,
+                                _ => {}
+                            }
+                        }
+                        // File reads: `open`/`io.open`/`*.open`,
+                        // `Path(...)`, `os.open`, and the
+                        // `read_csv`/`read_excel`/`*.load` family.
+                        // Literal paths become data-file edges only
+                        // when the file exists on disk.
+                        let is_file_call = ft == "open"
+                            || ft == "Path"
+                            || ft.ends_with(".open")
+                            || ft.ends_with(".Path")
+                            || matches!(
+                                ft,
+                                "read_csv"
+                                    | "read_excel"
+                                    | "read_json"
+                                    | "read_parquet"
+                                    | "read_table"
+                                    | "read_feather"
+                                    | "read_hdf"
+                                    | "read_stata"
+                                    | "read_sas"
+                                    | "read_spss"
+                                    | "read_html"
+                                    | "read_xml"
+                                    | "read_sql"
+                                    | "read_clipboard"
+                            )
+                            || (ft.contains('.')
+                                && (ft.ends_with(".read_csv")
+                                    || ft.ends_with(".read_excel")
+                                    || ft.ends_with(".read_json")
+                                    || ft.ends_with(".read_parquet")
+                                    || ft.ends_with(".read_table")
+                                    || ft.ends_with(".load")
+                                    || ft.ends_with(".imread")));
+                        if is_file_call {
+                            if let Some(arg) = py_first_arg(node) {
+                                if let Some(vals) = py_eval_strset(&env, arg, text, 0) {
+                                    for v in vals {
+                                        out.push(PyRef::DataFile(v));
+                                    }
+                                }
                             }
                         }
                     }
@@ -2899,6 +3235,24 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize) {
                     }
                 }
             }
+            "attribute" => {
+                // `ctypes.windll.kernel32` / `ctypes.cdll.msvcrt` /
+                // `ctypes.oledll.X` / `ctypes.pydll.X` - attribute
+                // access itself performs the library load (unlike
+                // `cdll.LoadLibrary`, a method needing a call).
+                if let Ok(t) = node.utf8_text(text.as_bytes()) {
+                    if let Some(rest) = t.strip_prefix("ctypes.") {
+                        let segs: Vec<&str> = rest.split('.').collect();
+                        if segs.len() == 2
+                            && matches!(segs[0], "windll" | "cdll" | "oledll" | "pydll")
+                            && segs[1] != "LoadLibrary"
+                            && !segs[1].is_empty()
+                        {
+                            out.push(PyRef::NativeLib(segs[1].to_string()));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         let mut c = node.walk();
@@ -2907,7 +3261,7 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize) {
         }
     }
     dynamic += getattr_objs.iter().filter(|o| bound.contains(*o)).count();
-    (out, had_error, dynamic, env_cfg)
+    (out, had_error, dynamic, env_cfg, native_dyn)
 }
 
 /// `a.b.c` node text -> segments, or `None` if not a plain dotted path.
@@ -3308,19 +3662,20 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
         .map(|(rel, abs)| {
             let text = fs::read_to_string(abs)
                 .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-            let (refs, had_error, dynamic, env_cfg) = py_import_refs(&text);
+            let (refs, had_error, dynamic, env_cfg, native_dyn) = py_import_refs(&text);
             Ok((
                 rel.clone(),
                 refs,
                 had_error,
                 dynamic,
                 env_cfg,
+                native_dyn,
                 manual_dep_specs(&text),
             ))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for (rel_s, refs, had_error, dynamic, env_cfg, manual) in extracted {
+    for (rel_s, refs, had_error, dynamic, env_cfg, native_dyn, manual) in extracted {
         let rel = &rel_s;
         if had_error {
             warnings.push(format!("{rel}: parse errors (partial scan)"));
@@ -3333,6 +3688,11 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
             };
             warnings.push(format!(
                 "{rel}: {dynamic} dynamic import site(s){hint} - edges may be incomplete"
+            ));
+        }
+        if native_dyn > 0 {
+            warnings.push(format!(
+                "{rel}: {native_dyn} dynamic native-library load(s) - edges may be incomplete"
             ));
         }
         let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
@@ -3397,6 +3757,35 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
                     {
                         if dep != *rel {
                             note_dep(&mut deps, dep, EdgeKind::Static);
+                        }
+                    }
+                }
+                PyRef::NativeLib(name) => {
+                    // `ctypes.CDLL("/usr/lib/libfoo.so.1")` -> the
+                    // basename is the loadable name; the library's
+                    // internals stay opaque (honest edge, no
+                    // fabrication of function-level links).
+                    let base = name
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(name.as_str());
+                    if !base.is_empty() {
+                        note_dep(&mut deps, format!("native:{base}"), EdgeKind::Resolved);
+                    }
+                }
+                PyRef::DataFile(spec) => {
+                    // Data coupling: the literal path must exist on
+                    // disk or the edge would be invented. Resolved
+                    // file-dir relative, then project-root relative.
+                    for cand in [parent, ""]
+                        .iter()
+                        .filter_map(|b| normalize_rel(b, &spec))
+                    {
+                        if root.join(&cand).is_file() {
+                            if cand != *rel {
+                                note_dep(&mut deps, cand, EdgeKind::Resolved);
+                            }
+                            break;
                         }
                     }
                 }
@@ -3601,21 +3990,48 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
 
     // `entry_points(group="x")` callers depend on every target
     // declared in that group; no group selects all declared targets.
-    if !ep_lookups.is_empty() && !ep_targets.is_empty() {
+    // Installed distributions' `entry_points.txt` files declare the
+    // same groups from the provider side - consumer -> `name@version`
+    // edges bridge plugin use into the lockfile dep graph.
+    if !ep_lookups.is_empty() {
+        let providers = crate::caches::entry_point_providers(root);
+        let mut prov_by_group: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (g, n) in &providers {
+            prov_by_group.entry(g.as_str()).or_default().insert(n.as_str());
+        }
         for (rel, groups) in ep_lookups {
             let mut targets: BTreeSet<String> = BTreeSet::new();
-            if groups.is_empty() {
-                for t in ep_targets.values() {
-                    targets.extend(t.iter().cloned());
-                }
-            } else {
-                for g in &groups {
-                    if let Some(t) = ep_targets.get(g) {
+            if !ep_targets.is_empty() {
+                if groups.is_empty() {
+                    for t in ep_targets.values() {
                         targets.extend(t.iter().cloned());
+                    }
+                } else {
+                    for g in &groups {
+                        if let Some(t) = ep_targets.get(g) {
+                            targets.extend(t.iter().cloned());
+                        }
+                    }
+                }
+                targets.remove(&rel);
+            }
+            if !providers.is_empty() {
+                if groups.is_empty() {
+                    for t in prov_by_group.values() {
+                        for n in t {
+                            targets.insert((*n).to_string());
+                        }
+                    }
+                } else {
+                    for g in &groups {
+                        if let Some(t) = prov_by_group.get(g.as_str()) {
+                            for n in t {
+                                targets.insert((*n).to_string());
+                            }
+                        }
                     }
                 }
             }
-            targets.remove(&rel);
             for dep in targets {
                 edges.push((rel.clone(), dep, None, EdgeKind::Resolved));
             }
@@ -4080,18 +4496,21 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
                 .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
             let (specs, globs, had_error, dynamic) =
                 js_import_specs_ts(&text, js_language_for(rel));
+            let (natives, data_files) = js_native_file_specs(&text, js_language_for(rel));
             Ok((
                 rel.clone(),
                 specs,
                 globs,
                 had_error,
                 dynamic,
+                natives,
+                data_files,
                 manual_dep_specs(&text),
             ))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for (rel_s, specs, globs, had_error, dynamic, manual) in extracted {
+    for (rel_s, specs, globs, had_error, dynamic, natives, data_files, manual) in extracted {
         let rel = &rel_s;
         if had_error {
             warnings.push(format!("{rel}: parse errors (partial scan)"));
@@ -4106,6 +4525,16 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
         let resolver = alias_cache.for_dir(parent);
 
         for spec in specs {
+            // `require("./addon.node")` / `import("x.node")` -
+            // native addons aren't JS modules; emit a `native:` edge
+            // instead of letting the spec drop silently.
+            if spec.ends_with(".node") && (spec.starts_with(".") || spec.contains('/')) {
+                let base = spec.rsplit('/').next().unwrap_or(spec.as_str());
+                if !base.is_empty() {
+                    note_dep(&mut deps, format!("native:{base}"), EdgeKind::Resolved);
+                }
+                continue;
+            }
             // Relative specs ('./x', '../x') are always intra-project.
             if spec.starts_with(".") {
                 let Some(norm) = normalize_rel(parent, &spec) else {
@@ -4125,6 +4554,28 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
             if let Some(dep) = resolve_js_alias(&resolver, &names, &spec) {
                 if dep != *rel {
                     note_dep(&mut deps, dep, EdgeKind::Static);
+                }
+            }
+        }
+
+        // Native addons (`bindings`, `process.dlopen`) and fs reads
+        // (`readFileSync`, `createReadStream`) - literal args only.
+        for n in &natives {
+            let base = n.rsplit(['/', '\\']).next().unwrap_or(n.as_str());
+            if !base.is_empty() {
+                note_dep(&mut deps, format!("native:{base}"), EdgeKind::Resolved);
+            }
+        }
+        for p in &data_files {
+            for cand in [parent, ""]
+                .iter()
+                .filter_map(|b| normalize_rel(b, p))
+            {
+                if root.join(&cand).is_file() {
+                    if cand != *rel {
+                        note_dep(&mut deps, cand, EdgeKind::Resolved);
+                    }
+                    break;
                 }
             }
         }

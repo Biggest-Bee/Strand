@@ -994,7 +994,7 @@ pub fn erlang_app_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
 // ---------- pip site-packages (venv dist-info) ----------
 
 /// PEP 503 normalize a distribution name.
-fn pep503(name: &str) -> String {
+pub(crate) fn pep503(name: &str) -> String {
     name.trim()
         .to_lowercase()
         .chars()
@@ -1024,6 +1024,91 @@ fn requires_dist_name(req: &str) -> Option<String> {
     } else {
         Some(pep503(name))
     }
+}
+
+/// Site-packages dirs under a project root's virtualenvs:
+/// `<root>/{.venv,venv,env,.env}/lib/python*/site-packages` and the
+/// Windows `<root>/<venv>/Lib/site-packages` layout.
+pub(crate) fn site_packages_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut sp_dirs: Vec<PathBuf> = Vec::new();
+    for venv in [".venv", "venv", "env", ".env"] {
+        let v = root.join(venv);
+        let lib = v.join("lib");
+        if let Ok(py_dirs) = fs::read_dir(&lib) {
+            for py in py_dirs.flatten() {
+                let sp = py.path().join("site-packages");
+                if sp.is_dir() {
+                    sp_dirs.push(sp);
+                }
+            }
+        }
+        let win = v.join("Lib/site-packages");
+        if win.is_dir() {
+            sp_dirs.push(win);
+        }
+    }
+    sp_dirs
+}
+
+/// `(group, dist node)` pairs declared by installed packages'
+/// `entry_points.txt` files - the provider side of plugin groups.
+/// Dist node is `pep503name@version` matching the pip lockfile
+/// namespace. Bounded by MAX_PARSE dist-infos.
+pub(crate) fn entry_point_providers(root: &Path) -> Vec<(String, String)> {
+    const MAX_PARSE: usize = 2000;
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for dir in site_packages_dirs(root) {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            if out.len() >= MAX_PARSE {
+                return out;
+            }
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let fname = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !fname.ends_with(".dist-info") {
+                continue;
+            }
+            // `name-version.dist-info` -> `pep503(name)@version`.
+            let stem = &fname[..fname.len() - ".dist-info".len()];
+            let Some((nm, ver)) = stem.rsplit_once('-') else {
+                continue;
+            };
+            if ver.is_empty() || !ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let node = nv(&pep503(nm), ver);
+            let ep = p.join("entry_points.txt");
+            let Ok(text) = fs::read_to_string(&ep) else { continue };
+            let mut group = String::new();
+            for line in text.lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') {
+                    continue;
+                }
+                if t.starts_with('[') && t.ends_with(']') {
+                    group = t[1..t.len() - 1].trim().to_string();
+                    continue;
+                }
+                if group.is_empty() {
+                    continue;
+                }
+                // `name = module:attr` (or `module`); the target
+                // module isn't resolvable offline, the provider dist
+                // is what matters.
+                if seen.insert((group.clone(), node.clone())) {
+                    out.push((group.clone(), node.clone()));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One installed dist-info record.
@@ -1064,26 +1149,7 @@ fn parse_dist_info(text: &str) -> Option<DistInfo> {
 /// dist (the venv graph is real metadata), bounded.
 pub fn pip_site_packages_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
     const MAX_PARSE: usize = 3000;
-    // Find site-packages dirs under candidate venvs.
-    let mut sp_dirs: Vec<PathBuf> = Vec::new();
-    for venv in [".venv", "venv", "env", ".env"] {
-        let v = root.join(venv);
-        // lib/python*/site-packages
-        let lib = v.join("lib");
-        if let Ok(py_dirs) = fs::read_dir(&lib) {
-            for py in py_dirs.flatten() {
-                let sp = py.path().join("site-packages");
-                if sp.is_dir() {
-                    sp_dirs.push(sp);
-                }
-            }
-        }
-        // Lib/site-packages (Windows layout).
-        let win = v.join("Lib/site-packages");
-        if win.is_dir() {
-            sp_dirs.push(win);
-        }
-    }
+    let sp_dirs = site_packages_dirs(root);
     if sp_dirs.is_empty() {
         return Vec::new();
     }
