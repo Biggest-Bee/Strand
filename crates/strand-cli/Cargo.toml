@@ -22,6 +22,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 ureq = "3.5.2"
 tempfile.workspace = true
+tree-sitter = "0.27.2"
+tree-sitter-python = "0.25.0"
+rayon.workspace = true
+toml = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -3661,12 +3661,16 @@ version = "0.3.14"
 dependencies = [
  "clap",
  "libc",
+ "rayon",
  "serde",
  "serde_json",
  "strand-core",
  "strand-import",
  "tempfile",
  "thiserror 2.0.21",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-python",
  "ureq",
 ]
 

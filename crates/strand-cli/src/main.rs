@@ -11,6 +11,7 @@ use strand_core::{EdgeKind, Graph, GraphBuilder, MergeOp};
 use strand_import::{self, Format};
 
 mod check;
+mod deep;
 mod export;
 mod trace;
 mod update_check;
@@ -38,6 +39,10 @@ enum Commands {
     /// and merge observed runtime edges into the graph.
     /// Usage: `strand trace <dir> -- <command...>` (e.g. `-- pytest`).
     Trace(TraceArgs),
+    /// Deep scan: static graph plus Python interprocedural analysis
+    /// (call graph, dynamic-import resolution, taint/null/leak
+    /// findings). Slower than `scan`; use for security/bug review.
+    Deep(DeepArgs),
     /// Show graph statistics.
     Info(InfoArgs),
     /// List every node name in the graph.
@@ -204,6 +209,29 @@ struct TraceArgs {
     /// Command to run under the Python import tracer (after `--`).
     #[arg(last = true, required = true)]
     cmd: Vec<String>,
+}
+
+#[derive(Parser)]
+struct DeepArgs {
+    /// Project directory to deep-scan (default: current directory).
+    #[arg(default_value = ".")]
+    dir: PathBuf,
+    /// Output .strand file (default: <dir-name>.strand).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Only run IPA and the taint/null/leak solver; skip writing
+    /// the graph.
+    #[arg(long)]
+    ipa_only: bool,
+    /// Dump resolved call edges as `module.func -> module.func`.
+    #[arg(long)]
+    dump_callgraph: bool,
+    /// Run taint/null/leak analysis and print findings.
+    #[arg(long)]
+    analyze: bool,
+    /// Model directory for `--analyze` (default: embedded python.toml).
+    #[arg(long)]
+    models: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -480,6 +508,7 @@ fn run(cmd: Commands) -> strand_core::Result<()> {
         Commands::Build(a) => cmd_build(a),
         Commands::Scan(a) => cmd_scan(a),
         Commands::Trace(a) => cmd_trace(a),
+        Commands::Deep(a) => cmd_deep(a),
         Commands::Info(a) => cmd_info(a),
         Commands::Nodes(a) => cmd_nodes(a),
         Commands::Deps(a) => cmd_deps(a),
@@ -817,6 +846,149 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
         Some(s) => PathBuf::from(s),
         None => p,
     }
+}
+
+fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
+    use deep::{callgraph, ipa, models, solver};
+    use strand_import::scan::{scan_project_with_py, Lang};
+
+    let root = strip_verbatim(a.dir.canonicalize()?);
+    let out = a
+        .output
+        .unwrap_or_else(|| root.join(format!("{}.strand", root_name(&root))));
+
+    // Phase 0: static scan; the returned trees are reused by IPA so
+    // no file is parsed twice.
+    let t_scan = std::time::Instant::now();
+    let (scan, py_src) =
+        scan_project_with_py(&root, &[Lang::Python, Lang::Js, Lang::Rust, Lang::Go])?;
+    eprintln!(
+        "scan: {} nodes, {} edges, {} warnings ({:.1?})",
+        scan.nodes.len(),
+        scan.edges.len(),
+        scan.warnings.len(),
+        t_scan.elapsed()
+    );
+    for w in &scan.warnings {
+        eprintln!("  warn: {w}");
+    }
+
+    let file_set: BTreeSet<String> = scan
+        .nodes
+        .iter()
+        .filter(|n| n.ends_with(".py"))
+        .cloned()
+        .collect();
+    let parsed = ipa::parse_all_sources(py_src);
+
+    let cg = callgraph::build(&parsed);
+    eprintln!(
+        "callgraph: {} edges, {} calls - {:.1}% resolved",
+        cg.edges.len(),
+        cg.stats.total,
+        cg.stats.resolution_rate() * 100.0
+    );
+    if a.dump_callgraph {
+        for ((cm, cf), (tm, tf)) in &cg.edges {
+            println!("{cm}.{cf} -> {tm}.{tf}");
+        }
+    }
+
+    if a.analyze {
+        let model = match &a.models {
+            Some(dir) => {
+                let models = models::load_dir(dir).map_err(strand_core::Error::Usage)?;
+                models
+                    .get("python")
+                    .cloned()
+                    .or_else(|| models::python_default().ok())
+                    .ok_or_else(|| {
+                        strand_core::Error::Usage("no python model".to_string())
+                    })?
+            }
+            None => models::python_default()
+                .map_err(strand_core::Error::Usage)?,
+        };
+        let t1 = std::time::Instant::now();
+        let sol = solver::solve(&parsed, &model);
+        eprintln!(
+            "solve: {} functions, {} SCCs ({} cyclic), {} iters, {} findings ({:.1?})",
+            sol.stats.functions,
+            sol.stats.sccs,
+            sol.stats.cyclic_sccs,
+            sol.stats.fixpoint_iters,
+            sol.stats.findings,
+            t1.elapsed()
+        );
+        let unknown_funcs = sol
+            .summaries
+            .values()
+            .filter(|s| s.touches_unknown)
+            .count();
+        eprintln!(
+            "blind spots: {} functions touched unresolvable calls; {} param-flow sinks pending instantiation",
+            unknown_funcs,
+            sol.summaries
+                .values()
+                .map(|s| s.param_sinks.values().map(|v| v.len()).sum::<usize>())
+                .sum::<usize>()
+        );
+        for f in &sol.findings {
+            println!(
+                "[{:?}] {}:{} {} - {} (via {}) [{:.0}%]",
+                f.class,
+                f.file,
+                f.line,
+                f.sink,
+                f.source,
+                f.via.join(" -> "),
+                f.confidence * 100.0
+            );
+        }
+    }
+
+    let t_ipa = std::time::Instant::now();
+    let res = ipa::analyze_parsed(&parsed, &file_set);
+    eprintln!(
+        "ipa: {} edges inferred, {} resolved, {} unresolved ({:.1?})",
+        res.edges.len(),
+        res.resolved,
+        res.unresolved.len(),
+        t_ipa.elapsed()
+    );
+    for u in res.unresolved.iter().take(20) {
+        eprintln!("  unresolved: {u}");
+    }
+
+    if a.ipa_only {
+        for (s, d, k) in &res.edges {
+            println!("{s} -> {d} [{k:?}]");
+        }
+        return Ok(());
+    }
+
+    let mut b = GraphBuilder::new();
+    for n in &scan.nodes {
+        b.add_node(n.clone());
+    }
+    strand_import::fill_builder(scan.edges, &mut b)?;
+    for (s, d, k) in &res.edges {
+        b.add_edge_weighted_kind(s.clone(), d.clone(), 1.0, *k);
+    }
+    let stats = b.build(&out)?;
+    eprintln!(
+        "wrote {} ({} nodes, {} edges)",
+        out.display(),
+        stats.n_nodes,
+        stats.n_edges
+    );
+    Ok(())
+}
+
+fn root_name(root: &Path) -> String {
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "deep".to_string())
 }
 
 fn cmd_info(a: InfoArgs) -> strand_core::Result<()> {
