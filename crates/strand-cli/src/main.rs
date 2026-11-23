@@ -879,14 +879,22 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
         .filter(|n| n.ends_with(".py"))
         .cloned()
         .collect();
+    let t_parse = std::time::Instant::now();
     let parsed = ipa::parse_all_sources(py_src);
+    eprintln!(
+        "parse_all: {} files ({:.1?})",
+        parsed.len(),
+        t_parse.elapsed()
+    );
 
+    let t_cg = std::time::Instant::now();
     let cg = callgraph::build(&parsed);
     eprintln!(
-        "callgraph: {} edges, {} calls - {:.1}% resolved",
+        "callgraph: {} edges, {} calls - {:.1}% resolved ({:.1?})",
         cg.edges.len(),
         cg.stats.total,
-        cg.stats.resolution_rate() * 100.0
+        cg.stats.resolution_rate() * 100.0,
+        t_cg.elapsed()
     );
     if a.dump_callgraph {
         for ((cm, cf), (tm, tf)) in &cg.edges {

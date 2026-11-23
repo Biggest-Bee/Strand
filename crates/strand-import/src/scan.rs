@@ -1544,9 +1544,28 @@ fn normalize_rel(base: &str, p: &str) -> Option<String> {
 /// `None` only if the parser itself fails (tree-sitter is error-tolerant,
 /// so syntax errors still produce a usable tree).
 fn parse_ts(text: &str, lang: tree_sitter::Language) -> Option<tree_sitter::Tree> {
-    let mut p = tree_sitter::Parser::new();
-    p.set_language(&lang).ok()?;
-    p.parse(text, None)
+    // Parser setup (lexer alloc + language bind) costs more than a
+    // trivial parse, and scans parse thousands of files - keep one
+    // parser per language per thread instead of rebuilding it.
+    thread_local! {
+        static PARSERS: std::cell::RefCell<
+            Vec<(tree_sitter::Language, tree_sitter::Parser)>,
+        > = std::cell::RefCell::new(Vec::new());
+    }
+    PARSERS.with(|cell| {
+        let mut parsers = cell.borrow_mut();
+        let idx = parsers.iter().position(|(l, _)| *l == lang);
+        let p = match idx {
+            Some(i) => &mut parsers[i].1,
+            None => {
+                let mut p = tree_sitter::Parser::new();
+                p.set_language(&lang).ok()?;
+                parsers.push((lang, p));
+                &mut parsers.last_mut().unwrap().1
+            }
+        };
+        p.parse(text, None)
+    })
 }
 
 /// Text of a string-ish node (`string`, `template_string`) with its
@@ -2986,27 +3005,58 @@ fn py_import_refs<'t>(
     // appear textually after the call.
     let mut bound: BTreeSet<String> = BTreeSet::new();
     let mut getattr_objs: Vec<String> = Vec::new();
-    // Enumerate only the node kinds the match below inspects - a
-    // tree-sitter query walks the tree in C and yields just these,
-    // skipping per-node Rust overhead for the ~95% of nodes
-    // (identifiers, strings, operators) that are never examined.
-    // Document order differs from the old DFS order but every
-    // consumer is a set, a count, or sorted downstream.
-    static NODE_QUERY: std::sync::OnceLock<tree_sitter::Query> = std::sync::OnceLock::new();
-    let node_query = NODE_QUERY.get_or_init(|| {
+    // File-level gates for the rare node kinds: `attribute` nodes are
+    // the most numerous in a typical tree but only matter for
+    // `ctypes.windll.X` loads, and `assignment` nodes only matter for
+    // the convention/settings names below. Skipping their queries on
+    // files that cannot contain them avoids hundreds of thousands of
+    // capture callbacks per scan. Ref order within a file is
+    // irrelevant downstream (deps collect into a BTreeMap keyed by
+    // name with max-kind merge; dynamic/native counts are sums).
+    let want_assign = [
+        "pytest_plugins",
+        "INSTALLED_APPS",
+        "CELERY_IMPORTS",
+        "STATICFILES_DIRS",
+        "MEDIA_ROOT",
+        "STATIC_ROOT",
+    ]
+    .iter()
+    .any(|n| text.contains(n));
+    let want_attr = text.contains("ctypes.");
+    static MAIN_QUERY: std::sync::OnceLock<tree_sitter::Query> = std::sync::OnceLock::new();
+    static ASSIGN_QUERY: std::sync::OnceLock<tree_sitter::Query> = std::sync::OnceLock::new();
+    static ATTR_QUERY: std::sync::OnceLock<tree_sitter::Query> = std::sync::OnceLock::new();
+    let lang = tree_sitter_python::LANGUAGE.into();
+    let main_query = MAIN_QUERY.get_or_init(|| {
         tree_sitter::Query::new(
-            &tree_sitter_python::LANGUAGE.into(),
-            "(import_statement) @n (import_from_statement) @n (assignment) @n (call) @n (attribute) @n",
+            &lang,
+            "(import_statement) @n (import_from_statement) @n (call) @n",
         )
-        .expect("python node query")
+        .expect("python main query")
     });
+    let queries: Vec<&tree_sitter::Query> = {
+        let mut v = vec![main_query];
+        if want_assign {
+            v.push(ASSIGN_QUERY.get_or_init(|| {
+                tree_sitter::Query::new(&lang, "(assignment) @n").expect("python assign query")
+            }));
+        }
+        if want_attr {
+            v.push(ATTR_QUERY.get_or_init(|| {
+                tree_sitter::Query::new(&lang, "(attribute) @n").expect("python attr query")
+            }));
+        }
+        v
+    };
     let mut qcursor = tree_sitter::QueryCursor::new();
-    let mut matches = qcursor.matches(node_query, tree.root_node(), text.as_bytes());
-    use tree_sitter::StreamingIterator as _;
-    while let Some(m) = matches.next() {
-        for cap in m.captures() {
-            let node = cap.node;
-            match node.kind() {
+    for query in queries {
+        let mut matches = qcursor.matches(query, tree.root_node(), text.as_bytes());
+        use tree_sitter::StreamingIterator as _;
+        while let Some(m) = matches.next() {
+            for cap in m.captures() {
+                let node = cap.node;
+                match node.kind() {
                 "import_statement" => {
                     let mut cursor = node.walk();
                     for name in node.children_by_field_name("name", &mut cursor) {
@@ -3400,6 +3450,7 @@ fn py_import_refs<'t>(
                 }
                 _ => {}
             }
+        }
         }
     }
     dynamic += getattr_objs.iter().filter(|o| bound.contains(*o)).count();
@@ -4507,6 +4558,8 @@ fn scan_python_impl(
 
     // Parse all files in parallel (rayon); resolution below stays
     // sequential so edge order is deterministic.
+    let parse_ns = std::sync::atomic::AtomicU64::new(0);
+    let refs_ns = std::sync::atomic::AtomicU64::new(0);
     let extracted = files
         .par_iter()
         .map(|(rel, abs)| {
@@ -4515,11 +4568,15 @@ fn scan_python_impl(
             let text = fs::read(abs)
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
+            let tp = std::time::Instant::now();
             let tree = parse_ts(&text, tree_sitter_python::LANGUAGE.into());
+            parse_ns.fetch_add(tp.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let tr = std::time::Instant::now();
             let (refs, had_error, dynamic, env_cfg, native_dyn) = match &tree {
                 Some(t) => py_import_refs(t, &text),
                 None => (Vec::new(), true, 0, 0, 0),
             };
+            refs_ns.fetch_add(tr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             Ok(PyExtract {
                 rel: rel.clone(),
                 refs,
@@ -4534,7 +4591,12 @@ fn scan_python_impl(
         })
         .collect::<Result<Vec<_>>>()?;
     if prof {
-        eprintln!("py extract: {:?}", t_all.elapsed());
+        eprintln!(
+            "py extract: {:?} (parse {:.1?}, refs {:.1?})",
+            t_all.elapsed(),
+            std::time::Duration::from_nanos(parse_ns.load(std::sync::atomic::Ordering::Relaxed)),
+            std::time::Duration::from_nanos(refs_ns.load(std::sync::atomic::Ordering::Relaxed))
+        );
     }
 
     // Resolution is per-file independent (read-only shared state),
