@@ -394,7 +394,7 @@ fn packages_config_and_paket() {
     .unwrap();
     let out = scan_manifests(dir.path()).unwrap();
     let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
-    assert!(deps.contains(&"Newtonsoft.Json"));
+    assert!(deps.contains(&"Newtonsoft.Json@13.0.3"));
     assert!(deps.contains(&"akka/akka"));
 }
 

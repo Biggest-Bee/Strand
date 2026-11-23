@@ -53,7 +53,7 @@ fn push_edge(edges: &mut EdgeList, src: &str, dst: String) {
 pub(crate) const FLAT_SRC: &str = "(lockfile)";
 
 /// `name@version` node id; bare `name` when version is empty.
-fn nv(name: &str, version: &str) -> String {
+pub(crate) fn nv(name: &str, version: &str) -> String {
     if version.is_empty() {
         name.to_string()
     } else {
@@ -64,7 +64,7 @@ fn nv(name: &str, version: &str) -> String {
 /// Split a `name@version` node id. The `@` must be followed by a
 /// digit so scoped names (`@scope/name`) and `name@range` specs are
 /// not mistaken for pinned ids.
-fn split_nv(node: &str) -> (&str, &str) {
+pub(crate) fn split_nv(node: &str) -> (&str, &str) {
     if let Some(i) = node.rfind('@') {
         if i > 0 && node[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
             return (&node[..i], &node[i + 1..]);

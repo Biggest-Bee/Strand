@@ -4,6 +4,7 @@
 //! Edge direction convention everywhere: `A -> B` means "A depends on B".
 
 pub mod bundler;
+pub mod caches;
 pub mod cargo;
 pub mod csv;
 pub mod locks;

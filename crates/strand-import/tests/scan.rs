@@ -1308,3 +1308,39 @@ fn scan_python_env_config_warning_hint() {
         .expect("expected dynamic warning");
     assert!(w.contains("env vars/config"), "{w}");
 }
+
+#[test]
+fn scan_pub_cache_edges_end_to_end() {
+    // pubspec.lock is flat, but the pub cache's hosted pubspec.yaml
+    // files carry real deps - scan_project should BFS them.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.join("pubspec.lock"),
+        "packages:\n  http:\n    dependency: \"direct main\"\n    description:\n      name: http\n      sha256: \"00\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"1.2.3\"\n  collection:\n    dependency: transitive\n    description:\n      name: collection\n      sha256: \"00\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"1.19.0\"\n",
+    )
+    .unwrap();
+    let hp = cache.path().join("hosted/pub.dev/http-1.2.3/pubspec.yaml");
+    std::fs::create_dir_all(hp.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hp,
+        "name: http\nversion: 1.2.3\ndependencies:\n  collection: ^1.0.0\n",
+    )
+    .unwrap();
+    let cp = cache.path().join("hosted/pub.dev/collection-1.19.0/pubspec.yaml");
+    std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
+    std::fs::write(&cp, "name: collection\nversion: 1.19.0\n").unwrap();
+
+    std::env::set_var("PUB_CACHE", cache.path());
+    let out = strand_import::scan::scan_project(
+        root,
+        &[strand_import::scan::Lang::Python],
+    )
+    .unwrap();
+    std::env::remove_var("PUB_CACHE");
+    let has = |s: &str, d: &str| {
+        out.edges.iter().any(|(a, b, ..)| a == s && b == d)
+    };
+    assert!(has("http@1.2.3", "collection@1.19.0"), "edges: {:?}", out.edges);
+}

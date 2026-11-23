@@ -231,6 +231,80 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
             }
         }
     }
+    // Local package caches: flat lockfiles (pubspec.lock,
+    // Package.resolved, mix.lock, Cartfile.resolved, go.sum,
+    // paket.lock, packages.config/lock.json) record pins but no dep
+    // relations; ecosystem caches and project checkouts hold real
+    // metadata, so BFS them for component->component edges.
+    {
+        let coords_of = |g: &str| -> BTreeSet<String> {
+            lock_nodes
+                .get(g)
+                .map(|m| m.values().flatten().cloned().collect())
+                .unwrap_or_default()
+        };
+        // (ecosystem group, seed coords, cache-derived edges)
+        let mut probes: Vec<(&'static str, EdgeList)> = Vec::new();
+        let pub_c = coords_of("pub");
+        if !pub_c.is_empty() {
+            if let Some(root) = crate::caches::pub_cache_root() {
+                probes.push(("pub", crate::caches::pub_cache_edges(&pub_c, &root)));
+            }
+        }
+        let go_c = coords_of("go");
+        if !go_c.is_empty() {
+            if let Some(root) = crate::caches::go_mod_cache_root() {
+                probes.push(("go", crate::caches::go_cache_edges(&go_c, &root)));
+            }
+        }
+        // NuGet seeds also come from packages.config manifest deps
+        // (`id@version` dsts only; bare ids can't locate cache dirs).
+        let mut nuget_seed = coords_of("nuget");
+        for (s, d, ..) in &manifest_edges {
+            if manifest_group(s) == Some("nuget") && d.contains('@') {
+                nuget_seed.insert(d.clone());
+            }
+        }
+        if !nuget_seed.is_empty() {
+            if let Some(root) = crate::caches::nuget_cache_root() {
+                probes.push(("nuget", crate::caches::nuget_cache_edges(&nuget_seed, &root)));
+            }
+        }
+        let jvm_c = coords_of("jvm");
+        if !jvm_c.is_empty() {
+            if let Some(root) = crate::caches::maven_repo_root() {
+                probes.push(("jvm", crate::caches::maven_cache_edges(&jvm_c, &root)));
+            }
+        }
+        // Project-local checkouts (deps/, .build, SourcePackages).
+        let proj = PathBuf::from(root);
+        let mix_c = coords_of("elixir");
+        if !mix_c.is_empty() {
+            probes.push(("elixir", crate::caches::mix_deps_edges(&mix_c, &proj)));
+        }
+        let swift_c = coords_of("swift");
+        if !swift_c.is_empty() {
+            probes.push(("swift", crate::caches::swift_checkout_edges(&swift_c, &proj)));
+        }
+        let carthage_c = coords_of("carthage");
+        if !carthage_c.is_empty() {
+            probes.push(("carthage", crate::caches::carthage_checkout_edges(&carthage_c, &proj)));
+        }
+        for (group, edges_out) in probes {
+            if edges_out.is_empty() {
+                continue;
+            }
+            ingest_lock_edges(
+                "(cache)",
+                edges_out,
+                Some(group),
+                false,
+                &mut nodes,
+                &mut edges,
+                &mut lock_nodes,
+            );
+        }
+    }
     // Bridge: manifest `package.json -> my-app` becomes
     // `package.json -> my-app@1.2.0` when a lockfile pins it, so
     // `deps` walks manifest -> pinned -> full transitive chain.

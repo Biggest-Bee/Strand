@@ -702,7 +702,7 @@ fn gemfile_deps(text: &str) -> Vec<String> {
 }
 
 /// `pubspec.yaml`: `dependencies` + `dev_dependencies` map keys.
-fn pubspec_deps(text: &str) -> Vec<String> {
+pub(crate) fn pubspec_deps(text: &str) -> Vec<String> {
     let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(text) else {
         return Vec::new();
     };
@@ -752,7 +752,7 @@ fn podfile_deps(text: &str) -> Vec<String> {
 
 /// `Package.swift`: `.package(url: "https://.../Name.git", ...)` -
 /// dep name is the last URL path component minus `.git`.
-fn package_swift_deps(text: &str) -> Vec<String> {
+pub(crate) fn package_swift_deps(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for m in text.match_indices(".package(") {
         // Scan the call's text for `url:` then a quoted string.
@@ -1065,17 +1065,28 @@ fn packages_config_deps(text: &str) -> Vec<String> {
         }
         let Some(gt) = after.find('>') else { break };
         let attrs = &after[..gt];
-        for q in ['"', '\''] {
-            let needle = format!("id={q}");
-            if let Some(p) = attrs.find(&needle) {
-                let val = &attrs[p + needle.len()..];
-                if let Some(end) = val.find(q) {
-                    let id = val[..end].trim();
-                    if !id.is_empty() {
-                        out.push(id.to_string());
+        let attr = |name: &str| -> Option<String> {
+            for q in ['"', '\''] {
+                let needle = format!("{name}={q}");
+                if let Some(p) = attrs.find(&needle) {
+                    let val = &attrs[p + needle.len()..];
+                    if let Some(end) = val.find(q) {
+                        return Some(val[..end].trim().to_string());
                     }
                 }
-                break;
+            }
+            None
+        };
+        if let Some(id) = attr("id") {
+            if !id.is_empty() {
+                // Exact pins become `id@version` nodes so they bridge
+                // to packages.lock.json / the NuGet cache probe.
+                match attr("version") {
+                    Some(v) if v.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
+                        out.push(format!("{id}@{v}"));
+                    }
+                    _ => out.push(id),
+                }
             }
         }
         rest = &after[gt + 1..];
@@ -1306,7 +1317,7 @@ fn stack_yaml_deps(text: &str) -> Vec<String> {
 /// `mix.exs`: inside `def deps`/`defp deps`, `{:name, "spec"}`
 /// tuples. `{:ok,`/`{:error,` style tuples outside deps are
 /// excluded by section tracking.
-fn mix_exs_deps(text: &str) -> Vec<String> {
+pub(crate) fn mix_exs_deps(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_deps = false;
     let mut depth = 0i32;
@@ -1351,7 +1362,7 @@ fn mix_exs_deps(text: &str) -> Vec<String> {
 }
 
 /// `Cartfile`: `github "org/repo"`, `git "url"`, `binary "name"`.
-fn cartfile_deps(text: &str) -> Vec<String> {
+pub(crate) fn cartfile_deps(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
         let t = line.trim();
