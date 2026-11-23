@@ -386,7 +386,10 @@ fn composer_lock_transitive() {
   "content-hash": "abc"
 }"#;
     let e = edges(text, Format::ComposerLock);
-    assert!(e.contains(&("laravel/framework@10.0.0".into(), "symfony/console@6.4.0".into())));
+    assert!(e.contains(&(
+        "laravel/framework@10.0.0".into(),
+        "symfony/console@6.4.0".into()
+    )));
     assert!(e.contains(&("laravel/framework@10.0.0".into(), "psr/log@3.0.0".into())));
     assert!(e.contains(&("symfony/console@6.4.0".into(), "psr/log@3.0.0".into())));
 }
@@ -442,7 +445,10 @@ fn nuget_lock_transitive() {
   }
 }"#;
     let e = edges(text, Format::NugetLock);
-    assert!(e.contains(&("Newtonsoft.Json@13.0.3".into(), "System.Runtime.CompilerServices.Unsafe@6.0.0".into())));
+    assert!(e.contains(&(
+        "Newtonsoft.Json@13.0.3".into(),
+        "System.Runtime.CompilerServices.Unsafe@6.0.0".into()
+    )));
 }
 
 #[test]
@@ -458,7 +464,9 @@ fn swift_resolved_flat() {
     // Flat format: the only edge hangs off the (lockfile) placeholder.
     let raw = strand_import::parse(text, Format::SwiftResolved).unwrap();
     assert_eq!(
-        raw.iter().map(|(s, d, ..)| (s.as_str(), d.as_str())).collect::<Vec<_>>(),
+        raw.iter()
+            .map(|(s, d, ..)| (s.as_str(), d.as_str()))
+            .collect::<Vec<_>>(),
         vec![("(lockfile)", "alamofire@5.9.1")]
     );
 }
@@ -480,7 +488,9 @@ sdks:
   dart: ">=3.0.0"
 "#;
     let raw = strand_import::parse(text, Format::PubspecLock).unwrap();
-    assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "chars@1.4.0"));
+    assert!(raw
+        .iter()
+        .any(|(s, d, ..)| s == "(lockfile)" && d == "chars@1.4.0"));
     assert!(raw.iter().any(|(_, d, ..)| d == "collection@1.19.0"));
 }
 
@@ -489,7 +499,10 @@ fn go_sum_versions() {
     let text = "github.com/a/b v1.2.3 h1:abc=\ngithub.com/a/b v1.2.3/go.mod h1:def=\ngithub.com/c/d v0.0.0-20200101 h1:x=\n";
     let e = edges(text, Format::GoSum);
     assert!(e.contains(&("github.com/a/b".into(), "github.com/a/b v1.2.3".into())));
-    assert!(e.contains(&("github.com/c/d".into(), "github.com/c/d v0.0.0-20200101".into())));
+    assert!(e.contains(&(
+        "github.com/c/d".into(),
+        "github.com/c/d v0.0.0-20200101".into()
+    )));
     assert_eq!(e.len(), 2); // /go.mod dup deduped
 }
 
@@ -567,7 +580,10 @@ fn new_lock_detect() {
     for (name, text) in [
         ("composer.lock", "{\"content-hash\":\"x\",\"packages\":[]}"),
         ("go.sum", "m v1 h1:x=\n"),
-        ("uv.lock", "version = 1\nrequires-python = \">=3.9\"\n[[package]]\nname=\"a\"\n"),
+        (
+            "uv.lock",
+            "version = 1\nrequires-python = \">=3.9\"\n[[package]]\nname=\"a\"\n",
+        ),
         ("bun.lock", "{\"lockfileVersion\": 1, \"workspaces\": {}}"),
         ("Podfile.lock", "PODS:\n\nPODFILE CHECKSUM: x\n"),
         ("packages.lock.json", "{\"version\":2,\"dependencies\":{}}"),
@@ -592,7 +608,9 @@ snapshot:
   url: https://example.com/snapshot.yaml
 "#;
     let raw = strand_import::parse(text, Format::StackLock).unwrap();
-    assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "aeson@2.2.1.0"));
+    assert!(raw
+        .iter()
+        .any(|(s, d, ..)| s == "(lockfile)" && d == "aeson@2.2.1.0"));
     assert!(raw.iter().any(|(_, d, ..)| d == "text@2.0.2"));
 }
 
@@ -608,7 +626,9 @@ fn mix_lock_flat() {
 fn cartfile_resolved_flat() {
     let text = "github \"Alamofire/Alamofire\" \"5.9.1\"\ngit \"https://x/y\" \"abc123\"\n";
     let raw = strand_import::parse(text, Format::CartfileResolved).unwrap();
-    assert!(raw.iter().any(|(_, d, ..)| d == "Alamofire/Alamofire@5.9.1"));
+    assert!(raw
+        .iter()
+        .any(|(_, d, ..)| d == "Alamofire/Alamofire@5.9.1"));
     assert!(raw.iter().any(|(_, d, ..)| d == "https://x/y@abc123"));
 }
 
@@ -623,7 +643,9 @@ fn deno_lock_flat() {
   }
 }"#;
     let raw = strand_import::parse(text, Format::DenoLock).unwrap();
-    assert!(raw.iter().any(|(_, d, ..)| d == "https://deno.land/x/fresh@1.6.8/mod.ts"));
+    assert!(raw
+        .iter()
+        .any(|(_, d, ..)| d == "https://deno.land/x/fresh@1.6.8/mod.ts"));
     // npm:-prefixed keys normalize to bare name@version nodes.
     assert!(raw.iter().any(|(_, d, ..)| d == "lodash@4.17.21"));
 }
@@ -655,7 +677,9 @@ fn gradle_verification_components() {
    </components>
 </verification-metadata>"#;
     let raw = strand_import::parse(text, Format::GradleVerification).unwrap();
-    assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "com.google.guava:guava@31.1-jre"));
+    assert!(raw
+        .iter()
+        .any(|(s, d, ..)| s == "(lockfile)" && d == "com.google.guava:guava@31.1-jre"));
     assert!(raw.iter().any(|(_, d, ..)| d == "junit:junit@4.13.2"));
 }
 
@@ -826,24 +850,25 @@ fn deno_lock_dependency_edges() {
     assert!(has("@actions/glob@0.5.0", "@actions/core@1.11.1"));
     assert!(has("@actions/glob@0.5.0", "minimatch@3.1.2"));
     // workspace root deps resolved through specifiers
-    assert!(e.iter().any(|(a, d)| {
-        (a.contains("deno") || a == "(lockfile)") && d == "chalk@5.6.2"
-    }));
+    assert!(e
+        .iter()
+        .any(|(a, d)| { (a.contains("deno") || a == "(lockfile)") && d == "chalk@5.6.2" }));
     assert!(e.iter().any(|(_, d)| d == "debug@4.4.3"));
     // node declarations for leaf packages (self-loops, filtered
     // out of edges() so check the raw parse)
     let raw = strand_import::parse(text, Format::DenoLock).unwrap();
-    assert!(raw.iter().any(|(a, b, ..)| a == "ms@2.1.3" && b == "ms@2.1.3"));
-    assert!(raw.iter().any(|(a, b, ..)| a == "chalk@5.6.2" && b == "chalk@5.6.2"));
+    assert!(raw
+        .iter()
+        .any(|(a, b, ..)| a == "ms@2.1.3" && b == "ms@2.1.3"));
+    assert!(raw
+        .iter()
+        .any(|(a, b, ..)| a == "chalk@5.6.2" && b == "chalk@5.6.2"));
 }
 
 #[test]
 fn gradle_lockfile_flat() {
     let text = "# lockfile\ncom.google.guava:guava:31.1-jre=compileClasspath,runtimeClasspath\norg.slf4j:slf4j-api:1.7.36=runtimeClasspath\n\n";
-    let f = strand_import::detect_format(
-        std::path::Path::new("gradle.lockfile"),
-        text,
-    );
+    let f = strand_import::detect_format(std::path::Path::new("gradle.lockfile"), text);
     assert_eq!(f, Format::GradleLockfile);
     let e = edges(text, Format::GradleLockfile);
     let dsts: Vec<&str> = e.iter().map(|(_, d)| d.as_str()).collect();
@@ -868,8 +893,16 @@ fn gradle_module_and_pom_deps() {
       ]
     }"#;
     let deps = strand_import::locks::gradle_module_deps(module);
-    assert!(deps.contains(&("com.google.guava".into(), "failureaccess".into(), "1.0.1".into())));
-    assert!(deps.contains(&("org.checkerframework".into(), "checker-qual".into(), "3.12.0".into())));
+    assert!(deps.contains(&(
+        "com.google.guava".into(),
+        "failureaccess".into(),
+        "1.0.1".into()
+    )));
+    assert!(deps.contains(&(
+        "org.checkerframework".into(),
+        "checker-qual".into(),
+        "3.12.0".into()
+    )));
     assert_eq!(deps.len(), 3);
 
     let pom = r#"<project><dependencies>
@@ -878,7 +911,11 @@ fn gradle_module_and_pom_deps() {
       <dependency><groupId>com.google.code.gson</groupId><artifactId>gson</artifactId></dependency>
     </dependencies></project>"#;
     let deps = strand_import::locks::pom_deps(pom);
-    assert!(deps.contains(&("org.apache.commons".into(), "commons-lang3".into(), "3.12.0".into())));
+    assert!(deps.contains(&(
+        "org.apache.commons".into(),
+        "commons-lang3".into(),
+        "3.12.0".into()
+    )));
     assert!(deps.contains(&("com.google.code.gson".into(), "gson".into(), "".into())));
     assert_eq!(deps.len(), 2); // test-scoped junit skipped
 }
@@ -920,7 +957,10 @@ dependencies = [
     // Direct reference `certifi @ url` is skipped; bare `anyio`
     // resolves to the unique pin.
     assert!(has("requests@2.32.0", "anyio@4.13.0"));
-    assert!(!edges.iter().any(|(_, d, ..)| d.contains("certifi")), "{edges:?}");
+    assert!(
+        !edges.iter().any(|(_, d, ..)| d.contains("certifi")),
+        "{edges:?}"
+    );
 }
 
 #[test]
@@ -1000,7 +1040,10 @@ fn rebar_lock_pkg_and_git_entries() {
     let nodes: Vec<&str> = edges.iter().map(|(_, d, ..)| d.as_str()).collect();
     assert!(nodes.contains(&"cowboy@2.13.0"), "{edges:?}");
     assert!(nodes.contains(&"ranch@2.2.0"));
-    assert!(nodes.contains(&"app_config@git:6c4aee8fc3d08b59e22183a530cb4ce29d4b348b"), "{edges:?}");
+    assert!(
+        nodes.contains(&"app_config@git:6c4aee8fc3d08b59e22183a530cb4ce29d4b348b"),
+        "{edges:?}"
+    );
 }
 
 #[test]

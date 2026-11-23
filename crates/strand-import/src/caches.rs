@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use strand_core::EdgeKind;
 
-use crate::EdgeList;
 use crate::locks::{nv, split_nv};
+use crate::EdgeList;
 
 /// User home directory (`USERPROFILE`/`HOME`).
 pub fn home_dir_public() -> Option<PathBuf> {
@@ -100,7 +100,8 @@ impl Probe {
         }
         self.declared.insert(dst.clone());
         if self.seen.insert((src.to_string(), dst.clone())) {
-            self.edges.push((src.to_string(), dst, None, EdgeKind::Static));
+            self.edges
+                .push((src.to_string(), dst, None, EdgeKind::Static));
         }
     }
 
@@ -122,12 +123,8 @@ impl Probe {
                 for pin in vs {
                     self.declared.insert(pin.clone());
                     if self.seen.insert((bare.clone(), pin.clone())) {
-                        self.edges.push((
-                            bare.clone(),
-                            pin.clone(),
-                            None,
-                            EdgeKind::Static,
-                        ));
+                        self.edges
+                            .push((bare.clone(), pin.clone(), None, EdgeKind::Static));
                     }
                 }
                 vec![bare]
@@ -148,7 +145,8 @@ impl Probe {
     fn finish(mut self) -> EdgeList {
         for n in std::mem::take(&mut self.declared) {
             if self.seen.insert((n.clone(), n.clone())) {
-                self.edges.push((n.clone(), n.clone(), None, EdgeKind::Static));
+                self.edges
+                    .push((n.clone(), n.clone(), None, EdgeKind::Static));
             }
         }
         self.edges
@@ -256,10 +254,7 @@ fn go_mod_requires(text: &str) -> Vec<(String, String)> {
             }
             continue;
         }
-        if line == "require"
-            || line.starts_with("require (")
-            || line.starts_with("require [")
-        {
+        if line == "require" || line.starts_with("require (") || line.starts_with("require [") {
             in_block = true;
             continue;
         }
@@ -314,7 +309,9 @@ pub fn go_cache_edges(seed: &BTreeSet<String>, mod_cache: &Path) -> EdgeList {
         // github.com/a/mod@v1.0.0/go.mod.
         let dir = mod_cache.join(format!("{}@{}", go_escape(&module), ver));
         let gomod = dir.join("go.mod");
-        let Ok(text) = fs::read_to_string(&gomod) else { continue };
+        let Ok(text) = fs::read_to_string(&gomod) else {
+            continue;
+        };
         for (dm, dv) in go_mod_requires(&text) {
             let dst = format!("{dm} {dv}");
             probe.edge(&coord, dst.clone());
@@ -397,11 +394,10 @@ pub fn nuget_cache_edges(seed: &BTreeSet<String>, cache_root: &Path) -> EdgeList
         parsed += 1;
         // ~/.nuget/packages/<id-lower>/<version>/<id>.<version>.nuspec
         let leaf = format!("{}.{}.nuspec", id.to_lowercase(), ver);
-        let nuspec = cache_root
-            .join(id.to_lowercase())
-            .join(&ver)
-            .join(&leaf);
-        let Ok(text) = fs::read_to_string(&nuspec) else { continue };
+        let nuspec = cache_root.join(id.to_lowercase()).join(&ver).join(&leaf);
+        let Ok(text) = fs::read_to_string(&nuspec) else {
+            continue;
+        };
         for (did, dv) in nuspec_deps(&text) {
             let dsts: Vec<String> = if !dv.is_empty() {
                 let node = nv(&did, &dv);
@@ -463,7 +459,9 @@ pub fn maven_cache_edges(seed: &BTreeSet<String>, repo: &Path) -> EdgeList {
             .join(&a)
             .join(&v)
             .join(format!("{a}-{v}.pom"));
-        let Ok(text) = fs::read_to_string(&pom) else { continue };
+        let Ok(text) = fs::read_to_string(&pom) else {
+            continue;
+        };
         for (dg, da, dv) in crate::locks::pom_deps(&text) {
             let dsts: Vec<String> = if !dv.is_empty() {
                 let node = nv(&format!("{dg}:{da}"), &dv);
@@ -514,7 +512,9 @@ pub fn mix_deps_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
         // deps/<app-name>/mix.exs - dir name is the OTP app name,
         // which matches the hex package name for hex deps.
         let mixexs = deps_dir.join(&name).join("mix.exs");
-        let Ok(text) = fs::read_to_string(&mixexs) else { continue };
+        let Ok(text) = fs::read_to_string(&mixexs) else {
+            continue;
+        };
         for dep in crate::manifests::mix_exs_deps(&text) {
             for dst in probe.resolve(&dep) {
                 probe.edge(&coord, dst.clone());
@@ -568,7 +568,9 @@ pub fn swift_checkout_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
     }
     let mut parsed = 0usize;
     while let Some(node) = queue.pop() {
-        let Some((identity, _ver)) = split_name_ver(&node) else { continue };
+        let Some((identity, _ver)) = split_name_ver(&node) else {
+            continue;
+        };
         let coord = node.clone();
         if !probe.visited.insert(coord.clone()) {
             continue;
@@ -577,13 +579,12 @@ pub fn swift_checkout_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
             break;
         }
         parsed += 1;
-        let Some((_, psw)) = dirs
-            .iter()
-            .find(|(id, _)| id == &identity.to_lowercase())
-        else {
+        let Some((_, psw)) = dirs.iter().find(|(id, _)| id == &identity.to_lowercase()) else {
             continue;
         };
-        let Ok(text) = fs::read_to_string(psw) else { continue };
+        let Ok(text) = fs::read_to_string(psw) else {
+            continue;
+        };
         for dep in crate::manifests::package_swift_deps(&text) {
             let dep_id = dep.to_lowercase();
             for dst in probe.resolve(&dep_id) {
@@ -602,9 +603,7 @@ pub fn swift_checkout_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
 /// Strip a trailing `-<hexhash>` checkout suffix (6+ hex chars).
 fn strip_hash_suffix(name: &str) -> String {
     name.rsplit_once('-')
-        .filter(|(_, h)| {
-            h.len() >= 6 && h.chars().all(|c| c.is_ascii_hexdigit())
-        })
+        .filter(|(_, h)| h.len() >= 6 && h.chars().all(|c| c.is_ascii_hexdigit()))
         .map(|(b, _)| b.to_string())
         .unwrap_or_else(|| name.to_string())
 }
@@ -645,7 +644,9 @@ pub fn carthage_checkout_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList
     }
     let mut parsed = 0usize;
     while let Some(node) = queue.pop() {
-        let Some((org_repo, _ver)) = split_name_ver(&node) else { continue };
+        let Some((org_repo, _ver)) = split_name_ver(&node) else {
+            continue;
+        };
         let coord = node.clone();
         if !probe.visited.insert(coord.clone()) {
             continue;
@@ -655,8 +656,12 @@ pub fn carthage_checkout_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList
         }
         parsed += 1;
         let org_repo_l = org_repo.to_lowercase();
-        let Some(repo) = org_repo_l.rsplit('/').next() else { continue };
-        let Some(dir) = by_repo.get(&repo.to_lowercase()) else { continue };
+        let Some(repo) = org_repo_l.rsplit('/').next() else {
+            continue;
+        };
+        let Some(dir) = by_repo.get(&repo.to_lowercase()) else {
+            continue;
+        };
         // Prefer Cartfile (github "org/repo" pins), fall back to
         // Package.swift (.package url deps).
         let mut deps: Vec<String> = Vec::new();
@@ -778,7 +783,9 @@ fn find_pkgdbs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > 5 {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if !p.is_dir() {
@@ -798,14 +805,22 @@ fn find_pkgdbs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// `depends:` fields are real edges. Dep entries are installed
 /// package ids `name-version` possibly with a `-unithash` suffix;
 /// resolved by prefix match against the conf index.
-pub fn stack_pkgdb_edges(seed: &BTreeSet<String>, stack_home: &Path, project_root: &Path) -> EdgeList {
+pub fn stack_pkgdb_edges(
+    seed: &BTreeSet<String>,
+    stack_home: &Path,
+    project_root: &Path,
+) -> EdgeList {
     const MAX_PARSE: usize = 4000;
     // Candidate pkgdb dirs. Snapshot layout is
     // snapshots/<platform>/<ghc>/<hash>/pkgdb (variable depth), so
     // walk it bounded like the install tree.
     let mut pkgdbs: Vec<PathBuf> = Vec::new();
     find_pkgdbs(&stack_home.join("snapshots"), 0, &mut pkgdbs);
-    find_pkgdbs(&stack_home.join("global-project/.stack-work/install"), 0, &mut pkgdbs);
+    find_pkgdbs(
+        &stack_home.join("global-project/.stack-work/install"),
+        0,
+        &mut pkgdbs,
+    );
     // <project>/.stack-work/install/**/pkgdb - the install tree has
     // variable depth (platform/ghc/hash), so walk it bounded.
     find_pkgdbs(&project_root.join(".stack-work/install"), 0, &mut pkgdbs);
@@ -819,7 +834,9 @@ pub fn stack_pkgdb_edges(seed: &BTreeSet<String>, stack_home: &Path, project_roo
             if confs.len() >= MAX_PARSE {
                 break;
             }
-            let Ok(text) = fs::read_to_string(&f) else { continue };
+            let Ok(text) = fs::read_to_string(&f) else {
+                continue;
+            };
             let mut c = parse_pkg_conf(&text);
             if c.name.is_empty() {
                 continue;
@@ -862,7 +879,9 @@ pub fn stack_pkgdb_edges(seed: &BTreeSet<String>, stack_home: &Path, project_roo
     }
     let mut parsed = 0usize;
     while let Some(node) = queue.pop() {
-        let Some((name, ver)) = split_name_ver(&node) else { continue };
+        let Some((name, ver)) = split_name_ver(&node) else {
+            continue;
+        };
         let coord = node.clone();
         if !probe.visited.insert(coord.clone()) {
             continue;
@@ -872,10 +891,7 @@ pub fn stack_pkgdb_edges(seed: &BTreeSet<String>, stack_home: &Path, project_roo
         }
         parsed += 1;
         // Find the conf matching this pin.
-        let Some(c) = confs
-            .iter()
-            .find(|c| c.name == name && c.ver == ver)
-        else {
+        let Some(c) = confs.iter().find(|c| c.name == name && c.ver == ver) else {
             continue;
         };
         for dep in &c.deps {
@@ -896,19 +912,23 @@ pub fn stack_pkgdb_edges(seed: &BTreeSet<String>, stack_home: &Path, project_roo
 /// file (Erlang term, usually one line).
 fn app_applications(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let Some(i) = text.find("{applications,") else { return out };
+    let Some(i) = text.find("{applications,") else {
+        return out;
+    };
     let rest = &text[i + "{applications,".len()..];
     let Some(bi) = rest.find('[') else { return out };
     let after = &rest[bi + 1..];
-    let Some(ei) = after.find(']') else { return out };
+    let Some(ei) = after.find(']') else {
+        return out;
+    };
     for atom in after[..ei].split(',') {
-        let a = atom
-            .trim()
-            .trim_matches(|c| c == '\'' || c == '"')
-            .trim();
+        let a = atom.trim().trim_matches(|c| c == '\'' || c == '"').trim();
         if !a.is_empty()
             && a.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && !matches!(a, "kernel" | "stdlib" | "compiler" | "syntax_tools" | "tools")
+            && !matches!(
+                a,
+                "kernel" | "stdlib" | "compiler" | "syntax_tools" | "tools"
+            )
         {
             out.push(a.to_string());
         }
@@ -967,7 +987,9 @@ pub fn erlang_app_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
     }
     let mut parsed = 0usize;
     while let Some(node) = queue.pop() {
-        let Some((app, _ver)) = split_name_ver(&node) else { continue };
+        let Some((app, _ver)) = split_name_ver(&node) else {
+            continue;
+        };
         let coord = node.clone();
         if !probe.visited.insert(coord.clone()) {
             continue;
@@ -1059,7 +1081,9 @@ pub(crate) fn entry_point_providers(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     for dir in site_packages_dirs(root) {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             if out.len() >= MAX_PARSE {
                 return out;
@@ -1085,7 +1109,9 @@ pub(crate) fn entry_point_providers(root: &Path) -> Vec<(String, String)> {
             }
             let node = nv(&pep503(nm), ver);
             let ep = p.join("entry_points.txt");
-            let Ok(text) = fs::read_to_string(&ep) else { continue };
+            let Ok(text) = fs::read_to_string(&ep) else {
+                continue;
+            };
             let mut group = String::new();
             for line in text.lines() {
                 let t = line.trim();
@@ -1113,8 +1139,8 @@ pub(crate) fn entry_point_providers(root: &Path) -> Vec<(String, String)> {
 
 /// One installed dist-info record.
 struct DistInfo {
-    node: String,          // normname@version
-    deps: Vec<String>,     // normalized dep names
+    node: String,      // normname@version
+    deps: Vec<String>, // normalized dep names
 }
 
 /// Parse a dist-info METADATA file.
@@ -1157,7 +1183,9 @@ pub fn pip_site_packages_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList
     let mut infos: Vec<DistInfo> = Vec::new();
     let mut known: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for dir in &sp_dirs {
-        let Ok(entries) = fs::read_dir(dir) else { continue };
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             if infos.len() >= MAX_PARSE {
                 break;
@@ -1166,13 +1194,20 @@ pub fn pip_site_packages_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList
             if !p.is_dir() {
                 continue;
             }
-            let fname = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let fname = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             if !fname.ends_with(".dist-info") {
                 continue;
             }
             let meta = p.join("METADATA");
-            let Ok(text) = fs::read_to_string(&meta) else { continue };
-            let Some(info) = parse_dist_info(&text) else { continue };
+            let Ok(text) = fs::read_to_string(&meta) else {
+                continue;
+            };
+            let Some(info) = parse_dist_info(&text) else {
+                continue;
+            };
             known
                 .entry(pep503(split_nv(&info.node).0))
                 .or_default()
@@ -1194,7 +1229,11 @@ pub fn pip_site_packages_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList
     let mut probe = Probe::new(seed, |n| pep503(split_nv(n).0));
     // Merge discovered dist nodes into known.
     for (k, vs) in &known {
-        probe.known.entry(k.clone()).or_default().extend(vs.iter().cloned());
+        probe
+            .known
+            .entry(k.clone())
+            .or_default()
+            .extend(vs.iter().cloned());
     }
     let mut queue: Vec<String> = Vec::new();
     for n in seed {
@@ -1272,7 +1311,9 @@ pub fn renv_library_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
     }
     let mut parsed = 0usize;
     while let Some(node) = queue.pop() {
-        let Some((pkg, _ver)) = split_name_ver(&node) else { continue };
+        let Some((pkg, _ver)) = split_name_ver(&node) else {
+            continue;
+        };
         let coord = node.clone();
         if !probe.visited.insert(coord.clone()) {
             continue;
@@ -1287,7 +1328,9 @@ pub fn renv_library_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
         else {
             continue;
         };
-        let Ok(text) = fs::read_to_string(desc) else { continue };
+        let Ok(text) = fs::read_to_string(desc) else {
+            continue;
+        };
         for dep in crate::manifests::description_deps(&text) {
             for dst in probe.resolve(&dep.to_lowercase()) {
                 probe.edge(&coord, dst.clone());

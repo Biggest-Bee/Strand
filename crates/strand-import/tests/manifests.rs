@@ -53,7 +53,10 @@ fn requirements_subdir() {
     let root = dir.path();
     w(root, "requirements/dev.txt", "pytest\nruff\n");
     let out = scan_manifests(root).unwrap();
-    assert_eq!(deps_of(&out, "requirements/dev.txt"), vec!["pytest", "ruff"]);
+    assert_eq!(
+        deps_of(&out, "requirements/dev.txt"),
+        vec!["pytest", "ruff"]
+    );
 }
 
 #[test]
@@ -103,7 +106,10 @@ fn pipfile_and_setup_cfg() {
     let out = scan_manifests(root).unwrap();
     assert_eq!(deps_of(&out, "Pipfile"), vec!["pytest", "requests"]);
     // extras_require `dev = pytest` is now also extracted.
-    assert_eq!(deps_of(&out, "setup.cfg"), vec!["click", "pytest", "requests"]);
+    assert_eq!(
+        deps_of(&out, "setup.cfg"),
+        vec!["click", "pytest", "requests"]
+    );
 }
 
 #[test]
@@ -186,9 +192,10 @@ fn scan_project_includes_manifests() {
     w(root, "requirements.txt", "requests\n");
     let out =
         strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Python]).unwrap();
-    assert!(out.edges.iter().any(|(s, d, _, _)| {
-        s == "requirements.txt" && d == "requests"
-    }));
+    assert!(out
+        .edges
+        .iter()
+        .any(|(s, d, _, _)| { s == "requirements.txt" && d == "requests" }));
 }
 
 #[test]

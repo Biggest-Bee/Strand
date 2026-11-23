@@ -1328,21 +1328,22 @@ fn scan_pub_cache_edges_end_to_end() {
         "name: http\nversion: 1.2.3\ndependencies:\n  collection: ^1.0.0\n",
     )
     .unwrap();
-    let cp = cache.path().join("hosted/pub.dev/collection-1.19.0/pubspec.yaml");
+    let cp = cache
+        .path()
+        .join("hosted/pub.dev/collection-1.19.0/pubspec.yaml");
     std::fs::create_dir_all(cp.parent().unwrap()).unwrap();
     std::fs::write(&cp, "name: collection\nversion: 1.19.0\n").unwrap();
 
     std::env::set_var("PUB_CACHE", cache.path());
-    let out = strand_import::scan::scan_project(
-        root,
-        &[strand_import::scan::Lang::Python],
-    )
-    .unwrap();
+    let out =
+        strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Python]).unwrap();
     std::env::remove_var("PUB_CACHE");
-    let has = |s: &str, d: &str| {
-        out.edges.iter().any(|(a, b, ..)| a == s && b == d)
-    };
-    assert!(has("http@1.2.3", "collection@1.19.0"), "edges: {:?}", out.edges);
+    let has = |s: &str, d: &str| out.edges.iter().any(|(a, b, ..)| a == s && b == d);
+    assert!(
+        has("http@1.2.3", "collection@1.19.0"),
+        "edges: {:?}",
+        out.edges
+    );
 }
 
 #[test]
@@ -1350,7 +1351,8 @@ fn scan_python_native_libs_and_data_files() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/app.py"),
+    std::fs::write(
+        root.join("src/app.py"),
         "import ctypes\n\
          lib = ctypes.CDLL(\"/usr/lib/libfoo.so.1\")\n\
          k32 = ctypes.windll.kernel32\n\
@@ -1360,7 +1362,8 @@ fn scan_python_native_libs_and_data_files() {
          f = open(\"config/app.yaml\")\n\
          p = __import__('pathlib').Path(\"data/input.csv\")\n\
          df = __import__('pandas').read_csv(\"missing.csv\")\n\
-         dyn = ctypes.CDLL(get_lib_name())\n")
+         dyn = ctypes.CDLL(get_lib_name())\n",
+    )
     .unwrap();
     // Data files that exist on disk.
     std::fs::create_dir_all(root.join("config")).unwrap();
@@ -1368,33 +1371,62 @@ fn scan_python_native_libs_and_data_files() {
     std::fs::create_dir_all(root.join("data")).unwrap();
     std::fs::write(root.join("data/input.csv"), "a,b\n").unwrap();
 
-    let out = strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Python]).unwrap();
+    let out =
+        strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Python]).unwrap();
     let has = |s: &str, d: &str| out.edges.iter().any(|(a, b, ..)| a == s && b == d);
     // Native lib edges: literal loads only; CDLL(None) skipped.
-    assert!(has("src/app.py", "native:libfoo.so.1"), "edges: {:?}", out.edges);
-    assert!(has("src/app.py", "native:kernel32"), "edges: {:?}", out.edges);
+    assert!(
+        has("src/app.py", "native:libfoo.so.1"),
+        "edges: {:?}",
+        out.edges
+    );
+    assert!(
+        has("src/app.py", "native:kernel32"),
+        "edges: {:?}",
+        out.edges
+    );
     assert!(has("src/app.py", "native:msvcrt"), "edges: {:?}", out.edges);
-    assert!(!out.edges.iter().any(|(_, d, ..)| d == "native:None" || d == "native:"), "edges: {:?}", out.edges);
+    assert!(
+        !out.edges
+            .iter()
+            .any(|(_, d, ..)| d == "native:None" || d == "native:"),
+        "edges: {:?}",
+        out.edges
+    );
     // Data file edges only for paths that exist.
-    assert!(has("src/app.py", "config/app.yaml"), "edges: {:?}", out.edges);
-    assert!(has("src/app.py", "data/input.csv"), "edges: {:?}", out.edges);
+    assert!(
+        has("src/app.py", "config/app.yaml"),
+        "edges: {:?}",
+        out.edges
+    );
+    assert!(
+        has("src/app.py", "data/input.csv"),
+        "edges: {:?}",
+        out.edges
+    );
     assert!(!has("src/app.py", "missing.csv"), "edges: {:?}", out.edges);
     // Computed lib name -> dynamic warning.
-    assert!(out.warnings.iter().any(|w| w.contains("native-library")), "warnings: {:?}", out.warnings);
+    assert!(
+        out.warnings.iter().any(|w| w.contains("native-library")),
+        "warnings: {:?}",
+        out.warnings
+    );
 }
 
 #[test]
 fn scan_js_native_and_data_files() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    std::fs::write(root.join("index.js"),
+    std::fs::write(
+        root.join("index.js"),
         "const addon = require('./native/addon.node');\n\
          const bindings = require('bindings');\n\
          const foo = bindings('foo');\n\
          process.dlopen(module, '/opt/x/extra.node');\n\
          const fs = require('fs');\n\
          const cfg = fs.readFileSync('conf/settings.json', 'utf8');\n\
-         fs.createReadStream('logs/out.txt');\n")
+         fs.createReadStream('logs/out.txt');\n",
+    )
     .unwrap();
     std::fs::create_dir_all(root.join("conf")).unwrap();
     std::fs::write(root.join("conf/settings.json"), "{}").unwrap();
@@ -1415,11 +1447,13 @@ fn scan_rust_native_libs_and_data_includes() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"),
+    std::fs::write(
+        root.join("src/lib.rs"),
         "#[link(name = \"sqlite3\", kind = \"dylib\")]\n\
          extern \"C\" { fn sqlite3_open(); }\n\
          pub static POLICY: &str = include_str!(\"policy.txt\");\n\
-         pub static CERT: &[u8] = include_bytes!(\"certs/ca.pem\");\n")
+         pub static CERT: &[u8] = include_bytes!(\"certs/ca.pem\");\n",
+    )
     .unwrap();
     std::fs::write(root.join("src/policy.txt"), "allow").unwrap();
     std::fs::create_dir_all(root.join("src/certs")).unwrap();
@@ -1430,34 +1464,64 @@ fn scan_rust_native_libs_and_data_includes() {
 
     let out = strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Rust]).unwrap();
     let has = |s: &str, d: &str| out.edges.iter().any(|(a, b, ..)| a == s && b == d);
-    assert!(has("src/lib.rs", "native:sqlite3"), "edges: {:?}", out.edges);
-    assert!(has("src/lib.rs", "src/policy.txt"), "edges: {:?}", out.edges);
-    assert!(has("src/lib.rs", "src/certs/ca.pem"), "edges: {:?}", out.edges);
+    assert!(
+        has("src/lib.rs", "native:sqlite3"),
+        "edges: {:?}",
+        out.edges
+    );
+    assert!(
+        has("src/lib.rs", "src/policy.txt"),
+        "edges: {:?}",
+        out.edges
+    );
+    assert!(
+        has("src/lib.rs", "src/certs/ca.pem"),
+        "edges: {:?}",
+        out.edges
+    );
     assert!(has("build.rs", "native:ssl"), "edges: {:?}", out.edges);
     // link-search is a dir, not a lib - no edge.
-    assert!(!out.edges.iter().any(|(_, d, ..)| d.contains("link-search") || d == "native:/usr/lib"), "edges: {:?}", out.edges);
+    assert!(
+        !out.edges
+            .iter()
+            .any(|(_, d, ..)| d.contains("link-search") || d == "native:/usr/lib"),
+        "edges: {:?}",
+        out.edges
+    );
 }
 
 #[test]
 fn scan_python_entry_point_providers() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    std::fs::write(root.join("plugin_host.py"),
+    std::fs::write(
+        root.join("plugin_host.py"),
         "from importlib.metadata import entry_points\n\
-         eps = entry_points(group=\"myapp.filters\")\n")
+         eps = entry_points(group=\"myapp.filters\")\n",
+    )
     .unwrap();
     // Installed provider dist with entry_points.txt.
     let di = root.join(".venv/lib/python3.11/site-packages/textpipe_future-1.2.0.dist-info");
     std::fs::create_dir_all(&di).unwrap();
-    std::fs::write(di.join("METADATA"), "Name: textpipe-future\nVersion: 1.2.0\n").unwrap();
+    std::fs::write(
+        di.join("METADATA"),
+        "Name: textpipe-future\nVersion: 1.2.0\n",
+    )
+    .unwrap();
     std::fs::write(di.join("entry_points.txt"),
         "[myapp.filters]\nsummarize = textpipe_future:Summarize\n\n[console_scripts]\ncli = textpipe_future:main\n")
     .unwrap();
 
-    let out = strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Python]).unwrap();
+    let out =
+        strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Python]).unwrap();
     // Consumer -> provider dist node (pep503-normalized name@version).
-    assert!(out.edges.iter().any(|(a, b, ..)| a == "plugin_host.py" && b == "textpipe-future@1.2.0"),
-        "edges: {:?}", out.edges);
+    assert!(
+        out.edges
+            .iter()
+            .any(|(a, b, ..)| a == "plugin_host.py" && b == "textpipe-future@1.2.0"),
+        "edges: {:?}",
+        out.edges
+    );
 }
 
 #[test]
@@ -1471,26 +1535,56 @@ fn scan_lockfile_drift_warning() {
     .unwrap();
     std::fs::write(root.join("app.py"), "import urllib3\n").unwrap();
 
-    let out = strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Python]).unwrap();
-    assert!(out.warnings.iter().any(|w| w.contains("drift") || w.contains("no lockfile agrees")),
-        "warnings: {:?}", out.warnings);
+    let out =
+        strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Python]).unwrap();
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("drift") || w.contains("no lockfile agrees")),
+        "warnings: {:?}",
+        out.warnings
+    );
 }
 
 #[test]
 fn scan_registry_configs() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    std::fs::write(root.join(".npmrc"), "registry=https://npm.corp.example.com/\n@corp:registry=https://npm.corp.example.com/\n").unwrap();
-    std::fs::write(root.join("pip.conf"), "[global]\nindex-url = https://pypi.corp.example.com/simple\n").unwrap();
+    std::fs::write(
+        root.join(".npmrc"),
+        "registry=https://npm.corp.example.com/\n@corp:registry=https://npm.corp.example.com/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pip.conf"),
+        "[global]\nindex-url = https://pypi.corp.example.com/simple\n",
+    )
+    .unwrap();
     let cargo_dir = root.join(".cargo");
     std::fs::create_dir_all(&cargo_dir).unwrap();
     std::fs::write(cargo_dir.join("config.toml"),
         "[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"sparse+https://cargo.corp.example.com/\"\n").unwrap();
-    std::fs::write(root.join("package.json"), "{\"dependencies\":{\"left-pad\":\"1.3.0\"}}").unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        "{\"dependencies\":{\"left-pad\":\"1.3.0\"}}",
+    )
+    .unwrap();
 
     let out = strand_import::scan::scan_project(root, &[strand_import::scan::Lang::Js]).unwrap();
     let has = |d: &str| out.edges.iter().any(|(_, b, ..)| b == d);
-    assert!(has("registry:https://npm.corp.example.com/"), "edges: {:?}", out.edges);
-    assert!(has("registry:https://pypi.corp.example.com/simple"), "edges: {:?}", out.edges);
-    assert!(has("registry:sparse+https://cargo.corp.example.com/"), "edges: {:?}", out.edges);
+    assert!(
+        has("registry:https://npm.corp.example.com/"),
+        "edges: {:?}",
+        out.edges
+    );
+    assert!(
+        has("registry:https://pypi.corp.example.com/simple"),
+        "edges: {:?}",
+        out.edges
+    );
+    assert!(
+        has("registry:sparse+https://cargo.corp.example.com/"),
+        "edges: {:?}",
+        out.edges
+    );
 }

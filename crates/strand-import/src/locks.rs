@@ -22,7 +22,6 @@ fn strip_line_comment(line: &str) -> &str {
     line.split("//").next().unwrap_or("")
 }
 
-
 /// Inner content of each `"..."` string in a TOML-ish array fragment.
 fn quoted_strings(s: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -66,7 +65,12 @@ pub(crate) fn nv(name: &str, version: &str) -> String {
 /// not mistaken for pinned ids.
 pub(crate) fn split_nv(node: &str) -> (&str, &str) {
     if let Some(i) = node.rfind('@') {
-        if i > 0 && node[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        if i > 0
+            && node[i + 1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        {
             return (&node[..i], &node[i + 1..]);
         }
     }
@@ -143,10 +147,10 @@ pub fn cargo_lock(text: &str) -> Result<EdgeList> {
     let mut have_pkg = false;
 
     let flush = |pkgs: &mut Vec<Pkg>,
-                     name: &mut String,
-                     ver: &mut String,
-                     deps: &mut Vec<String>,
-                     have: &mut bool| {
+                 name: &mut String,
+                 ver: &mut String,
+                 deps: &mut Vec<String>,
+                 have: &mut bool| {
         if *have {
             pkgs.push(Pkg {
                 name: std::mem::take(name),
@@ -169,7 +173,13 @@ pub fn cargo_lock(text: &str) -> Result<EdgeList> {
             continue;
         }
         if t == "[[package]]" {
-            flush(&mut pkgs, &mut cur_name, &mut cur_ver, &mut cur_deps, &mut have_pkg);
+            flush(
+                &mut pkgs,
+                &mut cur_name,
+                &mut cur_ver,
+                &mut cur_deps,
+                &mut have_pkg,
+            );
             continue;
         }
         if t.starts_with('[') {
@@ -195,7 +205,13 @@ pub fn cargo_lock(text: &str) -> Result<EdgeList> {
             }
         }
     }
-    flush(&mut pkgs, &mut cur_name, &mut cur_ver, &mut cur_deps, &mut have_pkg);
+    flush(
+        &mut pkgs,
+        &mut cur_name,
+        &mut cur_ver,
+        &mut cur_deps,
+        &mut have_pkg,
+    );
 
     let mut index = VerIndex::default();
     let nodes: Vec<String> = pkgs.iter().map(|p| nv(&p.name, &p.version)).collect();
@@ -221,7 +237,8 @@ pub fn cargo_lock(text: &str) -> Result<EdgeList> {
                 continue;
             }
             let ver = toks.get(1).copied().unwrap_or("");
-            let dsts = if !ver.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            let dsts = if !ver.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
                 vec![nv(name, ver)]
             } else {
                 index.resolve(name, &mut edges, &mut seen)
@@ -259,10 +276,10 @@ pub fn poetry_lock(text: &str) -> Result<EdgeList> {
     let mut depth = 0i32; // {} [] nesting inside a dep value
 
     let flush = |pkgs: &mut Vec<Pkg>,
-                     name: &mut String,
-                     ver: &mut String,
-                     deps: &mut Vec<String>,
-                     have: &mut bool| {
+                 name: &mut String,
+                 ver: &mut String,
+                 deps: &mut Vec<String>,
+                 have: &mut bool| {
         if *have {
             pkgs.push(Pkg {
                 name: std::mem::take(name),
@@ -780,12 +797,7 @@ pub fn yarn_lock(text: &str) -> Result<EdgeList> {
 
     let split_specs = |key: &str| -> Vec<String> {
         key.split("\", \"")
-            .map(|s| {
-                s.trim()
-                    .trim_end_matches(':')
-                    .trim_matches('"')
-                    .to_string()
-            })
+            .map(|s| s.trim().trim_end_matches(':').trim_matches('"').to_string())
             .filter(|s| !s.is_empty())
             .collect()
     };
@@ -872,10 +884,7 @@ pub fn yarn_lock(text: &str) -> Result<EdgeList> {
     for (i, b) in blocks.iter().enumerate() {
         for (dn, dr) in &b.deps {
             let spec = format!("{dn}@{dr}");
-            let di = spec_map
-                .get(&spec)
-                .or_else(|| name_map.get(dn))
-                .copied();
+            let di = spec_map.get(&spec).or_else(|| name_map.get(dn)).copied();
             let Some(di) = di else { continue };
             if di == i {
                 continue;
@@ -932,11 +941,10 @@ pub fn pnpm_lock(text: &str) -> Result<EdgeList> {
             for section in ["dependencies", "devDependencies", "optionalDependencies"] {
                 if let Some(deps) = imp.get(section).and_then(|v| v.as_mapping()) {
                     for (name_v, meta) in deps {
-                        let Some(name) = name_v.as_str() else { continue };
-                        let ver = meta
-                            .get("version")
-                            .and_then(|v| v.as_str())
-                            .map(norm_ver);
+                        let Some(name) = name_v.as_str() else {
+                            continue;
+                        };
+                        let ver = meta.get("version").and_then(|v| v.as_str()).map(norm_ver);
                         if let Some(ver) = ver {
                             if !ver.is_empty() && !ver.contains("://") {
                                 push(src.clone(), format!("{name}@{ver}"));
@@ -956,9 +964,7 @@ pub fn pnpm_lock(text: &str) -> Result<EdgeList> {
             for section in ["dependencies", "optionalDependencies"] {
                 if let Some(deps) = snap.get(section).and_then(|v| v.as_mapping()) {
                     for (name_v, ver_v) in deps {
-                        let (Some(name), Some(ver)) =
-                            (name_v.as_str(), ver_v.as_str())
-                        else {
+                        let (Some(name), Some(ver)) = (name_v.as_str(), ver_v.as_str()) else {
                             continue;
                         };
                         let ver = norm_ver(ver);
@@ -1132,7 +1138,12 @@ pub fn nuget_lock(text: &str) -> Result<EdgeList> {
     for (node, deps) in &pkgs {
         for dst in deps {
             if seen.insert((node.clone(), dst.clone())) {
-                edges.push((node.clone(), dst.clone(), None, strand_core::EdgeKind::Static));
+                edges.push((
+                    node.clone(),
+                    dst.clone(),
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
             }
         }
     }
@@ -1188,7 +1199,9 @@ pub fn pubspec_lock(text: &str) -> Result<EdgeList> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     if let Some(pkgs) = doc.get("packages").and_then(|v| v.as_mapping()) {
         for (name_v, meta) in pkgs {
-            let Some(name) = name_v.as_str() else { continue };
+            let Some(name) = name_v.as_str() else {
+                continue;
+            };
             let ver = meta.get("version").and_then(|v| v.as_str()).unwrap_or("");
             let node = nv(name, ver);
             if seen.insert(node.clone()) {
@@ -1337,12 +1350,7 @@ pub fn bun_lock(text: &str) -> Result<EdgeList> {
                         }
                         for dst in resolve_spec(&index, name, spec, &mut edges, &mut seen) {
                             if src != dst && seen.insert((src.clone(), dst.clone())) {
-                                edges.push((
-                                    src.clone(),
-                                    dst,
-                                    None,
-                                    strand_core::EdgeKind::Static,
-                                ));
+                                edges.push((src.clone(), dst, None, strand_core::EdgeKind::Static));
                             }
                         }
                     }
@@ -1365,12 +1373,7 @@ pub fn bun_lock(text: &str) -> Result<EdgeList> {
                         let spec = spec.as_str().unwrap_or("");
                         for dst in resolve_spec(&index, name, spec, &mut edges, &mut seen) {
                             if key != &dst && seen.insert((key.clone(), dst.clone())) {
-                                edges.push((
-                                    key.clone(),
-                                    dst,
-                                    None,
-                                    strand_core::EdgeKind::Static,
-                                ));
+                                edges.push((key.clone(), dst, None, strand_core::EdgeKind::Static));
                             }
                         }
                     }
@@ -1522,7 +1525,12 @@ fn indexed_edges(pkgs: &[PkgSpec]) -> EdgeList {
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     for p in pkgs {
         if seen.insert((p.node.clone(), p.node.clone())) {
-            edges.push((p.node.clone(), p.node.clone(), None, strand_core::EdgeKind::Static));
+            edges.push((
+                p.node.clone(),
+                p.node.clone(),
+                None,
+                strand_core::EdgeKind::Static,
+            ));
         }
     }
     for p in pkgs {
@@ -1568,7 +1576,12 @@ pub fn stack_lock(text: &str) -> Result<EdgeList> {
             // `name-1.2.3@sha256:...` -> `name@1.2.3`
             let node = hackage_node(node);
             if seen.insert(node.clone()) {
-                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+                edges.push((
+                    FLAT_SRC.to_string(),
+                    node,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
             }
         }
     }
@@ -1628,7 +1641,9 @@ pub fn mix_lock(text: &str) -> Result<EdgeList> {
         let Some(q2) = rest.find('"') else { continue };
         let name = &rest[..q2];
         let after = &rest[q2..];
-        let Some(hex_pos) = after.find(":hex") else { continue };
+        let Some(hex_pos) = after.find(":hex") else {
+            continue;
+        };
         // First quoted string after `:hex, :name,` is the version.
         let tail = &after[hex_pos..];
         let Some(q) = tail.find('"') else { continue };
@@ -1637,7 +1652,12 @@ pub fn mix_lock(text: &str) -> Result<EdgeList> {
         let ver = &inner[..e];
         let node = nv(name, ver);
         if seen.insert(node.clone()) {
-            edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+            edges.push((
+                FLAT_SRC.to_string(),
+                node,
+                None,
+                strand_core::EdgeKind::Static,
+            ));
         }
     }
     if edges.is_empty() {
@@ -1676,7 +1696,12 @@ pub fn cartfile_resolved(text: &str) -> Result<EdgeList> {
         if quoted.len() >= 2 {
             let node = format!("{}@{}", quoted[0], quoted[1]);
             if seen.insert(node.clone()) {
-                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+                edges.push((
+                    FLAT_SRC.to_string(),
+                    node,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
             }
         }
     }
@@ -1708,15 +1733,11 @@ fn deno_url_node(key: &str) -> Option<String> {
     for w in 1..=2usize.min(segs.len()) {
         let joined = segs[..w].join("/");
         if let Some((n, v)) = joined.rsplit_once('@') {
-            if !n.is_empty()
-                && v.chars().next().is_some_and(|c| c.is_ascii_digit())
-            {
+            if !n.is_empty() && v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 return Some(nv(n, v));
             }
         }
-        if w < segs.len()
-            && segs[w].chars().next().is_some_and(|c| c.is_ascii_digit())
-        {
+        if w < segs.len() && segs[w].chars().next().is_some_and(|c| c.is_ascii_digit()) {
             return Some(nv(&joined, segs[w]));
         }
     }
@@ -1736,11 +1757,7 @@ fn deno_split_key(key: &str) -> (String, String) {
     let bytes = key.as_bytes();
     let mut cut = None;
     for (i, &c) in bytes.iter().enumerate().skip(1) {
-        if c == b'@'
-            && bytes
-                .get(i + 1)
-                .is_some_and(|d| d.is_ascii_digit())
-        {
+        if c == b'@' && bytes.get(i + 1).is_some_and(|d| d.is_ascii_digit()) {
             cut = Some(i);
         }
     }
@@ -1776,19 +1793,14 @@ pub fn deno_lock(text: &str) -> Result<EdgeList> {
     let mut nodes: BTreeSet<String> = BTreeSet::new();
 
     let push = |edges: &mut EdgeList,
-                    seen: &mut BTreeSet<(String, String)>,
-                    nodes: &mut BTreeSet<String>,
-                    src: &str,
-                    dst: String| {
+                seen: &mut BTreeSet<(String, String)>,
+                nodes: &mut BTreeSet<String>,
+                src: &str,
+                dst: String| {
         if !dst.is_empty() {
             nodes.insert(dst.clone());
             if seen.insert((src.to_string(), dst.clone())) {
-                edges.push((
-                    src.to_string(),
-                    dst,
-                    None,
-                    strand_core::EdgeKind::Static,
-                ));
+                edges.push((src.to_string(), dst, None, strand_core::EdgeKind::Static));
             }
         }
     };
@@ -1809,7 +1821,9 @@ pub fn deno_lock(text: &str) -> Result<EdgeList> {
 
     // npm/jsr packages: node declarations + dependencies edges.
     for section in ["npm", "jsr"] {
-        let Some(obj) = v[section].as_object() else { continue };
+        let Some(obj) = v[section].as_object() else {
+            continue;
+        };
         for (key, meta) in obj {
             let (n, ver) = deno_split_key(key);
             let node = nv(&n, &ver);
@@ -1888,7 +1902,9 @@ pub fn deno_lock(text: &str) -> Result<EdgeList> {
     // normalized name@version nodes. workspace.members keys are
     // local paths, emitted as flat nodes too.
     for section in ["remote", "workspace"] {
-        let Some(obj) = v[section].as_object() else { continue };
+        let Some(obj) = v[section].as_object() else {
+            continue;
+        };
         let entries: Vec<&String> = if section == "workspace" {
             obj.get("members")
                 .and_then(|m| m.as_object())
@@ -1898,19 +1914,19 @@ pub fn deno_lock(text: &str) -> Result<EdgeList> {
             obj.keys().collect()
         };
         for key in entries {
-                if nodes.insert(key.clone()) {
-                    if seen.insert((FLAT_SRC.to_string(), key.clone())) {
-                        edges.push((
-                            FLAT_SRC.to_string(),
-                            key.clone(),
-                            None,
-                            strand_core::EdgeKind::Static,
-                        ));
-                    }
+            if nodes.insert(key.clone()) {
+                if seen.insert((FLAT_SRC.to_string(), key.clone())) {
+                    edges.push((
+                        FLAT_SRC.to_string(),
+                        key.clone(),
+                        None,
+                        strand_core::EdgeKind::Static,
+                    ));
                 }
-                if let Some(n) = deno_url_node(key) {
-                    push(&mut edges, &mut seen, &mut nodes, FLAT_SRC, n);
-                }
+            }
+            if let Some(n) = deno_url_node(key) {
+                push(&mut edges, &mut seen, &mut nodes, FLAT_SRC, n);
+            }
         }
     }
 
@@ -1955,13 +1971,23 @@ pub fn conan_lock(text: &str) -> Result<EdgeList> {
                 let Some(rid) = r.as_str() else { continue };
                 let Some(dst) = refs.get(rid) else { continue };
                 if seen.insert((src.clone(), dst.clone())) {
-                    edges.push((src.clone(), dst.clone(), None, strand_core::EdgeKind::Static));
+                    edges.push((
+                        src.clone(),
+                        dst.clone(),
+                        None,
+                        strand_core::EdgeKind::Static,
+                    ));
                 }
             }
         }
         // Node declaration for leaf/root packages.
         if seen.insert((src.clone(), src.clone())) {
-            edges.push((src.clone(), src.clone(), None, strand_core::EdgeKind::Static));
+            edges.push((
+                src.clone(),
+                src.clone(),
+                None,
+                strand_core::EdgeKind::Static,
+            ));
         }
     }
     if edges.is_empty() {
@@ -2004,9 +2030,7 @@ pub fn gradle_verification(text: &str) -> Result<EdgeList> {
             }
             None
         };
-        if let (Some(g), Some(n), Some(ver)) =
-            (get("group"), get("name"), get("version"))
-        {
+        if let (Some(g), Some(n), Some(ver)) = (get("group"), get("name"), get("version")) {
             let id = format!("{g}:{n}");
             let node = nv(&id, &ver);
             if seen.insert(node.clone()) {
@@ -2050,10 +2074,7 @@ pub fn flake_lock(text: &str) -> Result<EdgeList> {
         }
         // Source ref: prefer owner/repo, else type-specific fields.
         let mut dst = String::new();
-        if let (Some(o), Some(r)) = (
-            locked["owner"].as_str(),
-            locked["repo"].as_str(),
-        ) {
+        if let (Some(o), Some(r)) = (locked["owner"].as_str(), locked["repo"].as_str()) {
             dst = format!("{o}/{r}");
         } else if let Some(t) = locked["type"].as_str() {
             dst = t.to_string();
@@ -2075,7 +2096,6 @@ pub fn flake_lock(text: &str) -> Result<EdgeList> {
     }
     Ok(edges)
 }
-  
 
 // ---------- bun.lockb (binary, format v2) ----------
 
@@ -2175,7 +2195,11 @@ fn lockb_resolution(res: &[u8], string_bytes: &[u8]) -> Result<String> {
                 out.push('/');
             }
             out.push_str(&repo);
-            let sha = if !resolved.is_empty() { &resolved } else { &commitish };
+            let sha = if !resolved.is_empty() {
+                &resolved
+            } else {
+                &commitish
+            };
             if !sha.is_empty() {
                 out.push('#');
                 out.push_str(sha);
@@ -2215,11 +2239,7 @@ pub fn bun_lockb(bytes: &[u8]) -> Result<EdgeList> {
     if align != 8 || field_count != 8 {
         return Err(err("bun.lockb: unexpected table shape"));
     }
-    if list_len == 0
-        || list_len > 1_000_000
-        || begin_at >= end_at
-        || end_at > bytes.len()
-    {
+    if list_len == 0 || list_len > 1_000_000 || begin_at >= end_at || end_at > bytes.len() {
         return Err(err("bun.lockb: invalid package table range"));
     }
 
@@ -2303,7 +2323,9 @@ pub fn bun_lockb(bytes: &[u8]) -> Result<EdgeList> {
         let count = u32::from_le_bytes([f[4], f[5], f[6], f[7]]) as usize;
         for j in 0..count {
             let k = start + j;
-            let Some(&dst_idx) = resolutions.get(k) else { break };
+            let Some(&dst_idx) = resolutions.get(k) else {
+                break;
+            };
             let dst_idx = dst_idx as usize;
             if dst_idx == 0 || dst_idx >= list_len || dst_idx == i {
                 continue;
@@ -2387,10 +2409,7 @@ pub fn gradle_module_deps(text: &str) -> Vec<(String, String, String)> {
             continue;
         };
         for d in deps {
-            let (Some(g), Some(m)) = (
-                d["group"].as_str(),
-                d["module"].as_str(),
-            ) else {
+            let (Some(g), Some(m)) = (d["group"].as_str(), d["module"].as_str()) else {
                 continue;
             };
             let ver = d["version"]["requires"]
@@ -2411,10 +2430,7 @@ pub fn gradle_module_deps(text: &str) -> Vec<(String, String, String)> {
 /// and build sections; `import`-scoped BOM entries skipped.
 pub fn pom_deps(text: &str) -> Vec<(String, String, String)> {
     let no_parent = strip_section(text, "parent");
-    let clean = strip_section(
-        &strip_section(&no_parent, "dependencyManagement"),
-        "build",
-    );
+    let clean = strip_section(&strip_section(&no_parent, "dependencyManagement"), "build");
     let mut out = Vec::new();
     let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
     for block in xml_blocks(&clean, "dependencies") {
@@ -2473,11 +2489,7 @@ fn pep508_name(req: &str) -> Option<String> {
             break;
         }
     }
-    let name = req[..end]
-        .split('[')
-        .next()
-        .unwrap_or("")
-        .trim();
+    let name = req[..end].split('[').next().unwrap_or("").trim();
     if name.is_empty() {
         None
     } else {
@@ -2488,8 +2500,7 @@ fn pep508_name(req: &str) -> Option<String> {
 /// `pdm.lock` (TOML): `[[package]]` entries with `name`, `version`,
 /// and `dependencies = ["req; marker", ...]` - real edges.
 pub fn pdm_lock(text: &str) -> Result<EdgeList> {
-    let doc: toml::Table =
-        toml::from_str(text).map_err(|e| err(format!("pdm.lock: {e}")))?;
+    let doc: toml::Table = toml::from_str(text).map_err(|e| err(format!("pdm.lock: {e}")))?;
     let mut index = VerIndex::default();
     let mut pkgs: Vec<(String, String, Vec<String>)> = Vec::new();
     if let Some(arr) = doc.get("package").and_then(|p| p.as_array()) {
@@ -2531,7 +2542,12 @@ pub fn pdm_lock(text: &str) -> Result<EdgeList> {
             }
         }
         if seen.insert((node.clone(), node.clone())) {
-            edges.push((node.clone(), node.clone(), None, strand_core::EdgeKind::Static));
+            edges.push((
+                node.clone(),
+                node.clone(),
+                None,
+                strand_core::EdgeKind::Static,
+            ));
         }
     }
     Ok(edges)
@@ -2548,32 +2564,31 @@ pub fn conda_lock(text: &str) -> Result<EdgeList> {
         serde_yml::from_str(text).map_err(|e| err(format!("conda-lock.yml: {e}")))?;
     let mut index = VerIndex::default();
     let mut pkgs: Vec<(String, Vec<String>)> = Vec::new();
-    let push_pkg = |index: &mut VerIndex,
-                        pkgs: &mut Vec<(String, Vec<String>)>,
-                        p: &serde_yml::Value| {
-        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("");
-        if name.is_empty() {
-            return;
-        }
-        let node = nv(name, ver);
-        index.add(&node);
-        let deps: Vec<String> = p
-            .get("dependencies")
-            .map(|d| match d {
-                serde_yml::Value::Mapping(m) => m
-                    .keys()
-                    .filter_map(|k| k.as_str().map(String::from))
-                    .collect(),
-                serde_yml::Value::Sequence(s) => s
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect(),
-                _ => Vec::new(),
-            })
-            .unwrap_or_default();
-        pkgs.push((node, deps));
-    };
+    let push_pkg =
+        |index: &mut VerIndex, pkgs: &mut Vec<(String, Vec<String>)>, p: &serde_yml::Value| {
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                return;
+            }
+            let node = nv(name, ver);
+            index.add(&node);
+            let deps: Vec<String> = p
+                .get("dependencies")
+                .map(|d| match d {
+                    serde_yml::Value::Mapping(m) => m
+                        .keys()
+                        .filter_map(|k| k.as_str().map(String::from))
+                        .collect(),
+                    serde_yml::Value::Sequence(s) => s
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default();
+            pkgs.push((node, deps));
+        };
     // `package:` may be a sequence (v1 unified) or a map keyed by
     // name (older per-platform style).
     match doc.get("package") {
@@ -2625,7 +2640,12 @@ pub fn conda_lock(text: &str) -> Result<EdgeList> {
             }
         }
         if seen.insert((node.clone(), node.clone())) {
-            edges.push((node.clone(), node.clone(), None, strand_core::EdgeKind::Static));
+            edges.push((
+                node.clone(),
+                node.clone(),
+                None,
+                strand_core::EdgeKind::Static,
+            ));
         }
     }
     Ok(edges)
@@ -2637,8 +2657,7 @@ pub fn conda_lock(text: &str) -> Result<EdgeList> {
 /// version, deps = ["DepName", ...]}`. `deps` entries are bare
 /// package names resolved through the manifest's own index.
 pub fn julia_manifest(text: &str) -> Result<EdgeList> {
-    let doc: toml::Table =
-        toml::from_str(text).map_err(|e| err(format!("Manifest.toml: {e}")))?;
+    let doc: toml::Table = toml::from_str(text).map_err(|e| err(format!("Manifest.toml: {e}")))?;
     let Some(deps_tbl) = doc.get("deps").and_then(|d| d.as_table()) else {
         return Err(err("Manifest.toml: no [deps] table"));
     };
@@ -2647,11 +2666,17 @@ pub fn julia_manifest(text: &str) -> Result<EdgeList> {
     for (name, entry) in deps_tbl {
         // `[[deps.X]]` yields an array-of-tables; `[deps.X]`
         // yields a plain table. Normalize to the entry table.
-        let entry_tbl = entry
-            .as_table()
-            .or_else(|| entry.as_array().and_then(|a| a.first()).and_then(|v| v.as_table()));
+        let entry_tbl = entry.as_table().or_else(|| {
+            entry
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_table())
+        });
         let Some(entry_tbl) = entry_tbl else { continue };
-        let ver = entry_tbl.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        let ver = entry_tbl
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let node = nv(name, ver);
         index.add(&node);
         let deps: Vec<String> = entry_tbl
@@ -2679,7 +2704,12 @@ pub fn julia_manifest(text: &str) -> Result<EdgeList> {
             }
         }
         if seen.insert((node.clone(), node.clone())) {
-            edges.push((node.clone(), node.clone(), None, strand_core::EdgeKind::Static));
+            edges.push((
+                node.clone(),
+                node.clone(),
+                None,
+                strand_core::EdgeKind::Static,
+            ));
         }
     }
     Ok(edges)
@@ -2716,7 +2746,12 @@ pub fn rebar_lock(text: &str) -> Result<EdgeList> {
                 None => n.clone(),
             };
             if seen.insert(node.clone()) {
-                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+                edges.push((
+                    FLAT_SRC.to_string(),
+                    node,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
             }
         }
         rest = &rest[i + close + 1..];
@@ -2745,7 +2780,12 @@ pub fn rebar_lock(text: &str) -> Result<EdgeList> {
                 _ => n.clone(),
             };
             if seen.insert(node.clone()) {
-                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+                edges.push((
+                    FLAT_SRC.to_string(),
+                    node,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
             }
         }
         rest = &rest[i + 4..];
@@ -2770,7 +2810,12 @@ pub fn renv_lock(text: &str) -> Result<EdgeList> {
             let ver = meta.get("Version").and_then(|x| x.as_str()).unwrap_or("");
             let node = nv(name, ver);
             if seen.insert(node.clone()) {
-                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+                edges.push((
+                    FLAT_SRC.to_string(),
+                    node,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
             }
         }
     }

@@ -30,7 +30,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::locks::nv;
-use crate::scan::{ScanOutput, walk_files};
+use crate::scan::{walk_files, ScanOutput};
 use crate::EdgeList;
 use strand_core::EdgeKind;
 
@@ -126,8 +126,9 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             || name == ".pypirc"
             || (name.starts_with("requirements") && name.ends_with(".txt"))
             || (parent == "requirements" && name.ends_with(".txt"))
-            || (norm_rel.starts_with(".github/workflows/") || norm_rel.contains("/.github/workflows/")
-                && (name.ends_with(".yml") || name.ends_with(".yaml")))
+            || (norm_rel.starts_with(".github/workflows/")
+                || norm_rel.contains("/.github/workflows/")
+                    && (name.ends_with(".yml") || name.ends_with(".yaml")))
             || norm_rel == ".cargo/config.toml"
             || norm_rel.ends_with("/.cargo/config.toml")
             || norm_rel == ".cargo/config"
@@ -214,8 +215,10 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             tool_versions_deps(&text)
         } else if name.ends_with(".tf") {
             terraform_deps(&text)
-        } else if matches!(name.as_str(), "workspace" | "workspace.bazel" | "module.bazel")
-            || name.ends_with(".bzl")
+        } else if matches!(
+            name.as_str(),
+            "workspace" | "workspace.bazel" | "module.bazel"
+        ) || name.ends_with(".bzl")
         {
             bazel_deps(&text)
         } else if name == "package.swift" {
@@ -277,7 +280,9 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             gitlab_ci_deps(&text)
         } else if name.ends_with(".gradle") || name.ends_with(".gradle.kts") {
             gradle_deps(&text)
-        } else if rel_norm.starts_with(".github/workflows/") || rel_norm.contains("/.github/workflows/") {
+        } else if rel_norm.starts_with(".github/workflows/")
+            || rel_norm.contains("/.github/workflows/")
+        {
             workflow_deps(&text)
         } else if name == "dockerfile" || name.ends_with(".dockerfile") {
             dockerfile_deps(&text)
@@ -319,7 +324,16 @@ fn pep503_name(spec: &str) -> Option<String> {
     let s = s.split('@').next().unwrap_or("").trim();
     // Name ends at first version specifier, bracket, or whitespace.
     let end = s
-        .find(|c: char| c == '[' || c == '<' || c == '>' || c == '=' || c == '!' || c == '~' || c == '^' || c == ' ')
+        .find(|c: char| {
+            c == '['
+                || c == '<'
+                || c == '>'
+                || c == '='
+                || c == '!'
+                || c == '~'
+                || c == '^'
+                || c == ' '
+        })
         .unwrap_or(s.len());
     let name = &s[..end];
     if name.is_empty() {
@@ -404,7 +418,10 @@ fn requirements_deps(text: &str, abs: &Path, root: &Path, depth: usize) -> Vec<S
                     out.push(n);
                 }
             } else {
-                let p = rest.trim().trim_start_matches(['.', '/']).trim_end_matches('/');
+                let p = rest
+                    .trim()
+                    .trim_start_matches(['.', '/'])
+                    .trim_end_matches('/');
                 if let Some(n) = p.rsplit('/').next() {
                     if !n.is_empty() {
                         out.push(n.to_lowercase());
@@ -478,7 +495,10 @@ fn pyproject_deps(text: &str) -> Vec<String> {
 
     if let Some(project) = doc.get("project") {
         dep_list(project.get("dependencies"), &mut out);
-        if let Some(opt) = project.get("optional-dependencies").and_then(|v| v.as_table()) {
+        if let Some(opt) = project
+            .get("optional-dependencies")
+            .and_then(|v| v.as_table())
+        {
             for (_, arr) in opt {
                 dep_list(Some(arr), &mut out);
             }
@@ -705,10 +725,7 @@ fn cargo_toml_deps(text: &str) -> Vec<String> {
     let collect = |tbl: Option<&toml::value::Table>, out: &mut Vec<String>| {
         let Some(tbl) = tbl else { return };
         for (key, val) in tbl {
-            let name = val
-                .get("package")
-                .and_then(|p| p.as_str())
-                .unwrap_or(key);
+            let name = val.get("package").and_then(|p| p.as_str()).unwrap_or(key);
             out.push(name.to_string());
         }
     };
@@ -722,10 +739,7 @@ fn cargo_toml_deps(text: &str) -> Vec<String> {
         .and_then(|v| v.as_table())
     {
         for (key, val) in ws {
-            let name = val
-                .get("package")
-                .and_then(|p| p.as_str())
-                .unwrap_or(key);
+            let name = val.get("package").and_then(|p| p.as_str()).unwrap_or(key);
             out.push(name.to_string());
         }
     }
@@ -847,10 +861,14 @@ pub(crate) fn package_swift_deps(text: &str) -> Vec<String> {
         let call = &rest[..end];
         let Some(u) = call.find("url:") else { continue };
         let after = &call[u + 4..];
-        let Some(q) = after.find(['\'', '"']) else { continue };
+        let Some(q) = after.find(['\'', '"']) else {
+            continue;
+        };
         let quote = after.as_bytes()[q];
         let inner = &after[q + 1..];
-        let Some(close) = inner.find(quote as char) else { continue };
+        let Some(close) = inner.find(quote as char) else {
+            continue;
+        };
         let url = inner[..close].trim();
         if url.is_empty() || url.starts_with("path:") {
             continue;
@@ -906,9 +924,7 @@ fn nuget_manifest_deps(text: &str) -> Vec<String> {
                     // nodes so they bridge to packages.lock.json and
                     // seed the NuGet cache probe; ranges stay bare.
                     match get_attr(attrs, "Version") {
-                        Some(v)
-                            if v.chars().next().is_some_and(|c| c.is_ascii_digit()) =>
-                        {
+                        Some(v) if v.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
                             out.push(format!("{id}@{v}"));
                         }
                         _ => out.push(id),
@@ -954,12 +970,16 @@ fn gradle_deps(text: &str) -> Vec<String> {
         while let Some(q) = rest.find(['\'', '"']) {
             let quote = rest.as_bytes()[q];
             let inner = &rest[q + 1..];
-            let Some(end) = inner.find(quote as char) else { break };
+            let Some(end) = inner.find(quote as char) else {
+                break;
+            };
             let s = inner[..end].trim();
             let parts: Vec<&str> = s.split(':').collect();
             if parts.len() >= 3
                 && parts.iter().all(|p| !p.is_empty() && !p.contains(' '))
-                && parts[0].chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                && parts[0]
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
             {
                 out.push(format!("{}:{}", parts[0], parts[1]));
             }
@@ -1027,10 +1047,7 @@ fn deno_json_deps(text: &str) -> Vec<String> {
         for (_, spec) in imports {
             let specs: Vec<&str> = match spec {
                 serde_json::Value::String(s) => vec![s.as_str()],
-                serde_json::Value::Object(o) => o
-                    .values()
-                    .filter_map(|v| v.as_str())
-                    .collect(),
+                serde_json::Value::Object(o) => o.values().filter_map(|v| v.as_str()).collect(),
                 _ => vec![],
             };
             for s in specs {
@@ -1110,9 +1127,7 @@ fn brewfile_deps(text: &str) -> Vec<String> {
         if t.starts_with('#') {
             continue;
         }
-        let rest = t
-            .strip_prefix("brew")
-            .or_else(|| t.strip_prefix("cask"));
+        let rest = t.strip_prefix("brew").or_else(|| t.strip_prefix("cask"));
         let Some(rest) = rest else { continue };
         let rest = rest.trim_start();
         if !rest.starts_with(['\'', '"']) {
@@ -1148,12 +1163,8 @@ fn compose_deps(text: &str) -> Vec<String> {
             // nodes keep them distinct from image/package refs.
             if let Some(dep) = cfg.get("depends_on") {
                 let names: Vec<&str> = match dep {
-                    serde_yml::Value::Sequence(s) => {
-                        s.iter().filter_map(|v| v.as_str()).collect()
-                    }
-                    serde_yml::Value::Mapping(m) => {
-                        m.keys().filter_map(|k| k.as_str()).collect()
-                    }
+                    serde_yml::Value::Sequence(s) => s.iter().filter_map(|v| v.as_str()).collect(),
+                    serde_yml::Value::Mapping(m) => m.keys().filter_map(|k| k.as_str()).collect(),
                     serde_yml::Value::String(s) => vec![s.as_str()],
                     _ => Vec::new(),
                 };
@@ -1304,7 +1315,11 @@ fn setup_py_deps(text: &str) -> Vec<String> {
             let Some(open) = after_eq.find(['[', '(']) else {
                 break;
             };
-            let close = if after_eq.as_bytes()[open] == b'[' { ']' } else { ')' };
+            let close = if after_eq.as_bytes()[open] == b'[' {
+                ']'
+            } else {
+                ')'
+            };
             let body = &after_eq[open + 1..];
             let Some(end) = body.find(close) else { break };
             let list = &body[..end];
@@ -1344,11 +1359,29 @@ fn setup_py_deps(text: &str) -> Vec<String> {
 /// non-package attrs like `pkgs.lib`/`pkgs.stdenv` excluded).
 fn nix_deps(text: &str) -> Vec<String> {
     const NON_PKGS: &[&str] = &[
-        "lib", "stdenv", "callPackage", "mkShell", "mkDerivation",
-        "fetchurl", "fetchzip", "fetchgit", "fetchFromGitHub",
-        "fetchFromGitLab", "runCommand", "writeText", "writeScript",
-        "writers", "overlays", "newScope", "extend", "isLinux",
-        "isDarwin", "isWindows", "pkgsStatic", "gcc", "binutils",
+        "lib",
+        "stdenv",
+        "callPackage",
+        "mkShell",
+        "mkDerivation",
+        "fetchurl",
+        "fetchzip",
+        "fetchgit",
+        "fetchFromGitHub",
+        "fetchFromGitLab",
+        "runCommand",
+        "writeText",
+        "writeScript",
+        "writers",
+        "overlays",
+        "newScope",
+        "extend",
+        "isLinux",
+        "isDarwin",
+        "isWindows",
+        "pkgsStatic",
+        "gcc",
+        "binutils",
     ];
     let mut out = Vec::new();
     // flake inputs: `name.url = "..."` or `name = { url = "..."; }`.
@@ -1403,7 +1436,11 @@ fn nix_deps(text: &str) -> Vec<String> {
             continue;
         }
         if let Some(last) = segs.last() {
-            if !last.is_empty() && last.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            if !last.is_empty()
+                && last
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            {
                 out.push(last.to_string());
             }
         }
@@ -1464,9 +1501,7 @@ pub(crate) fn mix_exs_deps(text: &str) -> Vec<String> {
             let name_end = after.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '?'));
             if let Some(e) = name_end {
                 let name = &after[..e];
-                if !name.is_empty()
-                    && !matches!(name, "ok" | "error" | "nil" | "true" | "false")
-                {
+                if !name.is_empty() && !matches!(name, "ok" | "error" | "nil" | "true" | "false") {
                     out.push(name.to_string());
                 }
             }
@@ -1635,7 +1670,13 @@ fn bazel_deps(text: &str) -> Vec<String> {
         }
     }
     // name = "x" inside dep-rule calls.
-    for rule in ["http_archive", "git_repository", "bazel_dep", "http_file", "archive_override"] {
+    for rule in [
+        "http_archive",
+        "git_repository",
+        "bazel_dep",
+        "http_file",
+        "archive_override",
+    ] {
         let mut rest = text;
         let pat = format!("{rule}(");
         while let Some(i) = rest.find(&pat) {
@@ -1702,14 +1743,48 @@ fn edn_symbol(text: &str, i: usize) -> Option<(String, usize)> {
     }
     let c = bytes[i];
     // Symbol constituent chars ( EDN: alnum + `*+!-_?/<>=.` etc).
-    if !(c.is_ascii_alphanumeric() || matches!(c, b'.' | b'*' | b'+' | b'!' | b'-' | b'_' | b'?' | b'/' | b'<' | b'>' | b'=' | b':' | b'$' | b'&' | b'%' )) {
+    if !(c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            b'.' | b'*'
+                | b'+'
+                | b'!'
+                | b'-'
+                | b'_'
+                | b'?'
+                | b'/'
+                | b'<'
+                | b'>'
+                | b'='
+                | b':'
+                | b'$'
+                | b'&'
+                | b'%'
+        ))
+    {
         return None;
     }
     let mut j = i;
     while j < bytes.len() {
         let c = bytes[j];
         if c.is_ascii_alphanumeric()
-            || matches!(c, b'.' | b'*' | b'+' | b'!' | b'-' | b'_' | b'?' | b'/' | b'<' | b'>' | b'=' | b':' | b'$' | b'&' | b'%')
+            || matches!(
+                c,
+                b'.' | b'*'
+                    | b'+'
+                    | b'!'
+                    | b'-'
+                    | b'_'
+                    | b'?'
+                    | b'/'
+                    | b'<'
+                    | b'>'
+                    | b'='
+                    | b':'
+                    | b'$'
+                    | b'&'
+                    | b'%'
+            )
         {
             j += 1;
         } else {
@@ -1785,20 +1860,14 @@ fn edn_lib_deps(text: &str) -> Vec<String> {
         let take = rest.len().min(300);
         let seg = &rest[..take];
         let ver = if let Some(mp) = seg.find(":mvn/version") {
-            seg[mp..]
-                .find('"')
-                .and_then(|a| {
-                    seg[mp + a + 1..]
-                        .find('"')
-                        .map(|b| &seg[mp + a + 1..mp + a + 1 + b])
-                })
+            seg[mp..].find('"').and_then(|a| {
+                seg[mp + a + 1..]
+                    .find('"')
+                    .map(|b| &seg[mp + a + 1..mp + a + 1 + b])
+            })
         } else {
             seg.find('"')
-                .and_then(|a| {
-                    seg[a + 1..]
-                        .find('"')
-                        .map(|b| &seg[a + 1..a + 1 + b])
-                })
+                .and_then(|a| seg[a + 1..].find('"').map(|b| &seg[a + 1..a + 1 + b]))
         };
         if let Some(node) = clj_coord(&lib, ver) {
             if seen.insert(node.clone()) {
@@ -1910,7 +1979,11 @@ fn rebar_config_deps(text: &str) -> Vec<String> {
                 let name = inner
                     .split(',')
                     .next()
-                    .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>').to_string())
+                    .map(|s| {
+                        s.trim()
+                            .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>')
+                            .to_string()
+                    })
                     .filter(|n| {
                         !n.is_empty()
                             && n.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -1949,17 +2022,28 @@ fn rebar_config_deps(text: &str) -> Vec<String> {
         } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             // Bare atom dep like `cowboy,` inside the deps list.
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
             let atom = &region[start..i];
             // Only inside deps list: after `{deps,` we are in region.
             let prefix = region[..start].trim_end();
-            if !matches!(atom, "deps" | "pkg" | "git" | "hg" | "git_subdir" | "ref" | "branch" | "tag" | "erl_opts" | "src_dirs" | "out_dir" | "extra_src_dirs")
-                && (prefix.is_empty()
-                    || prefix.ends_with(|c: char| c == ',' || c == '[' || c == '{'))
+            if !matches!(
+                atom,
+                "deps"
+                    | "pkg"
+                    | "git"
+                    | "hg"
+                    | "git_subdir"
+                    | "ref"
+                    | "branch"
+                    | "tag"
+                    | "erl_opts"
+                    | "src_dirs"
+                    | "out_dir"
+                    | "extra_src_dirs"
+            ) && (prefix.is_empty()
+                || prefix.ends_with(|c: char| c == ',' || c == '[' || c == '{'))
             {
                 if seen.insert(atom.to_string()) {
                     out.push(atom.to_string());
@@ -1985,7 +2069,9 @@ fn cabal_deps(text: &str) -> Vec<String> {
     while i < lines.len() {
         let t = lines[i].trim();
         i += 1;
-        let Some((field, rest)) = t.split_once(':') else { continue };
+        let Some((field, rest)) = t.split_once(':') else {
+            continue;
+        };
         if field.trim() != "build-depends" {
             continue;
         }
@@ -2005,14 +2091,12 @@ fn cabal_deps(text: &str) -> Vec<String> {
             i += 1;
         }
         for dep in buf.split(',') {
-            let name = dep
-                .split('(')
-                .next()
-                .unwrap_or("")
-                .trim();
+            let name = dep.split('(').next().unwrap_or("").trim();
             let name = name.split_whitespace().next().unwrap_or("");
             if !name.is_empty()
-                && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                && name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
                 && seen.insert(name.to_string())
             {
                 out.push(name.to_string());
@@ -2030,7 +2114,8 @@ fn cmake_deps(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let push = |name: &str, out: &mut Vec<String>, seen: &mut BTreeSet<String>| {
-        let name = name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.');
+        let name =
+            name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.');
         if !name.is_empty() && !name.contains(' ') && seen.insert(name.to_string()) {
             out.push(name.to_string());
         }
@@ -2137,7 +2222,9 @@ fn chart_yaml_deps(text: &str) -> Vec<String> {
 fn zig_zon_deps(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let Some(di) = text.find(".dependencies") else { return out };
+    let Some(di) = text.find(".dependencies") else {
+        return out;
+    };
     let rest = &text[di + ".dependencies".len()..];
     let Some(bi) = rest.find('{') else { return out };
     let bytes = rest.as_bytes();
@@ -2257,7 +2344,10 @@ fn cpanfile_deps(text: &str) -> Vec<String> {
                     let inner = &rest[p + 1..];
                     if let Some(e) = inner.find(q) {
                         let name = inner[..e].trim();
-                        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == ':' || c == '_' || c == '-')
+                        if !name.is_empty()
+                            && name
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == ':' || c == '_' || c == '-')
                             && seen.insert(name.to_string())
                         {
                             out.push(name.to_string());
@@ -2290,11 +2380,16 @@ fn rockspec_deps(text: &str) -> Vec<String> {
                         let dep = inner[..e].trim();
                         // `dep >= 1.0` or `dep = 1.0` -> name only.
                         let name = dep
-                            .split(|c: char| c.is_whitespace() || c == '>' || c == '=' || c == '<' || c == '~')
+                            .split(|c: char| {
+                                c.is_whitespace() || c == '>' || c == '=' || c == '<' || c == '~'
+                            })
                             .next()
                             .unwrap_or("")
                             .trim();
-                        if !name.is_empty() && name != "dependencies" && seen.insert(name.to_string()) {
+                        if !name.is_empty()
+                            && name != "dependencies"
+                            && seen.insert(name.to_string())
+                        {
                             out.push(name.to_string());
                         }
                         rest = &inner[e + 1..];
@@ -2354,7 +2449,9 @@ pub(crate) fn description_deps(text: &str) -> Vec<String> {
     while i < lines.len() {
         let line = lines[i];
         i += 1;
-        let Some((field, rest)) = line.split_once(':') else { continue };
+        let Some((field, rest)) = line.split_once(':') else {
+            continue;
+        };
         if !matches!(field.trim(), "Depends" | "Imports" | "LinkingTo") {
             continue;
         }
@@ -2382,7 +2479,9 @@ pub(crate) fn description_deps(text: &str) -> Vec<String> {
                 .unwrap_or("")
                 .trim();
             if !name.is_empty()
-                && name.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '.' || c == '_')
                 && name != "R"
                 && seen.insert(name.to_string())
             {
@@ -2399,7 +2498,12 @@ pub(crate) fn description_deps(text: &str) -> Vec<String> {
 fn conanfile_py_deps(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for kw in ["requires", "tool_requires", "build_requires", "test_requires"] {
+    for kw in [
+        "requires",
+        "tool_requires",
+        "build_requires",
+        "test_requires",
+    ] {
         let mut rest = text;
         while let Some(i) = rest.find(&format!("{kw} =")) {
             let after = &rest[i + kw.len() + 2..];
@@ -2437,7 +2541,9 @@ fn gitlab_ci_deps(text: &str) -> Vec<String> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for line in text.lines() {
         let t = line.trim();
-        let Some(rest) = t.strip_prefix("image:") else { continue };
+        let Some(rest) = t.strip_prefix("image:") else {
+            continue;
+        };
         let img = rest.trim().trim_matches(|c| c == '"' || c == '\'');
         if !img.is_empty() && !img.starts_with('$') && seen.insert(img.to_string()) {
             out.push(img.to_string());

@@ -71,6 +71,15 @@ pub enum Lang {
     Js,
 }
 
+/// A Python source file's text plus its tree-sitter tree, handed back
+/// by [`scan_project_with_py`] so callers doing their own per-file
+/// analysis (strand-deep) can reuse the parse instead of paying for a
+/// second tree-sitter parse of every file.
+pub struct PySource {
+    pub text: String,
+    pub tree: tree_sitter::Tree,
+}
+
 /// Scan `root` for Rust sources and resolve intra-project dependencies.
 pub fn scan_rust(root: &Path) -> Result<ScanOutput> {
     scan_lang(root, Lang::Rust)
@@ -78,9 +87,17 @@ pub fn scan_rust(root: &Path) -> Result<ScanOutput> {
 
 /// Dispatch to the per-language scanner.
 pub fn scan_lang(root: &Path, lang: Lang) -> Result<ScanOutput> {
+    scan_lang_inner(root, lang, None)
+}
+
+fn scan_lang_inner(
+    root: &Path,
+    lang: Lang,
+    mut py_sink: Option<&mut BTreeMap<String, PySource>>,
+) -> Result<ScanOutput> {
     match lang {
         Lang::Rust => scan_rust_impl(root),
-        Lang::Python => scan_python_impl(root),
+        Lang::Python => scan_python_impl(root, py_sink.as_deref_mut()),
         Lang::Js => scan_js_impl(root),
     }
 }
@@ -89,11 +106,32 @@ pub fn scan_lang(root: &Path, lang: Lang) -> Result<ScanOutput> {
 /// Edges only form within a language (a `.rs` file can't depend on a
 /// `.py` file), but node sets are unioned.
 pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
+    scan_project_inner(root, langs, None)
+}
+
+/// Like [`scan_project`], but also returns every scanned Python file's
+/// text and tree-sitter tree so the caller can analyze them without
+/// re-reading or re-parsing. Only populated when `Lang::Python` is in
+/// `langs`.
+pub fn scan_project_with_py(
+    root: &Path,
+    langs: &[Lang],
+) -> Result<(ScanOutput, BTreeMap<String, PySource>)> {
+    let mut py_sources = BTreeMap::new();
+    let out = scan_project_inner(root, langs, Some(&mut py_sources))?;
+    Ok((out, py_sources))
+}
+
+fn scan_project_inner(
+    root: &Path,
+    langs: &[Lang],
+    mut py_sink: Option<&mut BTreeMap<String, PySource>>,
+) -> Result<ScanOutput> {
     let mut edges = EdgeList::new();
     let mut nodes = Vec::new();
     let mut warnings = Vec::new();
     for &lang in langs {
-        let out = scan_lang(root, lang)?;
+        let out = scan_lang_inner(root, lang, py_sink.as_deref_mut())?;
         edges.extend(out.edges);
         nodes.extend(out.nodes);
         warnings.extend(out.warnings);
@@ -162,8 +200,7 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
     });
     lock_files.sort_by(|a, b| a.0.cmp(&b.0));
     // group -> dep name -> pinned node ids, for manifest bridging.
-    let mut lock_nodes: HashMap<&'static str, HashMap<String, Vec<String>>> =
-        HashMap::new();
+    let mut lock_nodes: HashMap<&'static str, HashMap<String, Vec<String>>> = HashMap::new();
     for (rel, abs) in &lock_files {
         // bun.lockb is binary: parse it from raw bytes instead of
         // the text path used by every other lockfile.
@@ -209,9 +246,7 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
     // holds each component's .module/.pom with real dependency
     // edges. Probe it when a gradle project is present.
     {
-        let gradle_engaged = lock_nodes
-            .get("gradle")
-            .is_some_and(|m| !m.is_empty())
+        let gradle_engaged = lock_nodes.get("gradle").is_some_and(|m| !m.is_empty())
             || manifest_edges
                 .iter()
                 .any(|(s, ..)| manifest_group(s) == Some("gradle"));
@@ -276,7 +311,10 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         }
         if !nuget_seed.is_empty() {
             if let Some(root) = crate::caches::nuget_cache_root() {
-                probes.push(("nuget", crate::caches::nuget_cache_edges(&nuget_seed, &root)));
+                probes.push((
+                    "nuget",
+                    crate::caches::nuget_cache_edges(&nuget_seed, &root),
+                ));
             }
         }
         let jvm_c = coords_of("jvm");
@@ -295,7 +333,10 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         }
         let proj = PathBuf::from(root);
         if !py_seed.is_empty() {
-            probes.push(("python", crate::caches::pip_site_packages_edges(&py_seed, &proj)));
+            probes.push((
+                "python",
+                crate::caches::pip_site_packages_edges(&py_seed, &proj),
+            ));
         }
         // Stack pkgdb: ~/.stack snapshots + project .stack-work.
         let haskell_c = coords_of("haskell");
@@ -323,11 +364,17 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         }
         let swift_c = coords_of("swift");
         if !swift_c.is_empty() {
-            probes.push(("swift", crate::caches::swift_checkout_edges(&swift_c, &proj)));
+            probes.push((
+                "swift",
+                crate::caches::swift_checkout_edges(&swift_c, &proj),
+            ));
         }
         let carthage_c = coords_of("carthage");
         if !carthage_c.is_empty() {
-            probes.push(("carthage", crate::caches::carthage_checkout_edges(&carthage_c, &proj)));
+            probes.push((
+                "carthage",
+                crate::caches::carthage_checkout_edges(&carthage_c, &proj),
+            ));
         }
         for (group, edges_out) in probes {
             if edges_out.is_empty() {
@@ -359,7 +406,12 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
             let Some(i) = dst.rfind('@') else {
                 continue;
             };
-            if i == 0 || !dst[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            if i == 0
+                || !dst[i + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit())
+            {
                 continue;
             }
             let bare = lock_node_name(dst).to_lowercase();
@@ -374,7 +426,11 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
             let mv = ver_key(&dst[i + 1..]);
             if locked.iter().any(|n| {
                 n.rfind('@').is_some_and(|j| {
-                    j > 0 && n[j + 1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+                    j > 0
+                        && n[j + 1..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit())
                         && ver_key(&n[j + 1..]) == mv
                 })
             }) {
@@ -396,7 +452,9 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
             }
         }
         if total > shown {
-            warnings.push(format!("lockfile drift check truncated at {shown} of {total} pins"));
+            warnings.push(format!(
+                "lockfile drift check truncated at {shown} of {total} pins"
+            ));
         }
     }
     // Bridge: manifest `package.json -> my-app` becomes
@@ -539,8 +597,15 @@ fn is_flat_lock(fmt: crate::Format) -> bool {
     use crate::Format::*;
     matches!(
         fmt,
-        SwiftResolved | PubspecLock | StackLock | MixLock | CartfileResolved
-            | DenoLock | GradleVerification | GradleLockfile | RebarLock
+        SwiftResolved
+            | PubspecLock
+            | StackLock
+            | MixLock
+            | CartfileResolved
+            | DenoLock
+            | GradleVerification
+            | GradleLockfile
+            | RebarLock
             | RenvLock
     )
 }
@@ -551,8 +616,9 @@ fn manifest_group(src: &str) -> Option<&'static str> {
     match f.as_str() {
         "package.json" => Some("npm"),
         "cargo.toml" => Some("cargo"),
-        "pyproject.toml" | "pipfile" | "setup.cfg" | "environment.yml"
-        | "environment.yaml" => Some("python"),
+        "pyproject.toml" | "pipfile" | "setup.cfg" | "environment.yml" | "environment.yaml" => {
+            Some("python")
+        }
         "composer.json" => Some("php"),
         "gemfile" => Some("ruby"),
         "pubspec.yaml" => Some("pub"),
@@ -567,8 +633,9 @@ fn manifest_group(src: &str) -> Option<&'static str> {
         "pubspec_overrides.yaml" => Some("pub"),
         "deno.json" | "deno.jsonc" => Some("deno"),
         _ if f.ends_with(".csproj") => Some("nuget"),
-        _ if f.ends_with(".gradle") || f.ends_with(".gradle.kts")
-            || f == "libs.versions.toml" => Some("gradle"),
+        _ if f.ends_with(".gradle") || f.ends_with(".gradle.kts") || f == "libs.versions.toml" => {
+            Some("gradle")
+        }
         _ if f == "setup.py" => Some("python"),
         _ if f.starts_with("requirements") && f.ends_with(".txt") => Some("python"),
         "pdm.lock" => Some("python"),
@@ -605,8 +672,16 @@ fn lock_node_name(node: &str) -> &str {
             // Package names never contain these prefixes, so the
             // `@` here separates name from source, not scope.
             const SRC_PREFIXES: [&str; 11] = [
-                "workspace:", "git+", "git:", "github:", "gitlab:",
-                "http://", "https://", "link:", "file:", "portal:",
+                "workspace:",
+                "git+",
+                "git:",
+                "github:",
+                "gitlab:",
+                "http://",
+                "https://",
+                "link:",
+                "file:",
+                "portal:",
                 "npm:",
             ];
             if SRC_PREFIXES.iter().any(|p| rest.starts_with(p)) {
@@ -637,7 +712,10 @@ fn scan_rust_impl(root: &Path) -> Result<ScanOutput> {
     let extracted: Vec<std::result::Result<(RustRefs, Vec<String>), String>> = files
         .par_iter()
         .map(|(_rel, abs)| {
-            let text = fs::read_to_string(abs)
+            // Lossy decode: non-UTF-8 source files (legacy encodings,
+            // mislabeled binaries) must not abort the whole scan.
+            let text = fs::read(abs)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
             let inner = parse_rs_refs(&text)
                 .map(|r| (r, manual_dep_specs(&text)))
@@ -906,9 +984,7 @@ fn link_attr_name(attr: &syn::Attribute) -> Option<String> {
         return None;
     }
     let nested = attr
-        .parse_args_with(
-            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-        )
+        .parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
         .ok()?;
     for m in nested {
         if let syn::Meta::NameValue(nv) = m {
@@ -944,11 +1020,7 @@ fn cargo_link_libs(mac: &syn::Macro) -> Vec<String> {
         };
         // `dylib=foo` / `static=foo` -> `foo`; bare `foo` stays.
         let name = match rest.split_once('=') {
-            Some((kind, n))
-                if matches!(kind, "static" | "dylib" | "framework") =>
-            {
-                n
-            }
+            Some((kind, n)) if matches!(kind, "static" | "dylib" | "framework") => n,
             _ => rest,
         };
         if !name.is_empty() {
@@ -1065,12 +1137,10 @@ fn walk_ext(
 /// Visit every file under `root` (respecting [`SKIP_DIRS`]) with its
 /// root-relative `/` path and absolute path. Used by the manifest
 /// scanner, which matches on file names rather than extensions.
-pub(crate) fn walk_files(
-    dir: &Path,
-    root: &Path,
-    f: &mut dyn FnMut(String, PathBuf),
-) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+pub(crate) fn walk_files(dir: &Path, root: &Path, f: &mut dyn FnMut(String, PathBuf)) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
@@ -1586,9 +1656,8 @@ fn js_native_file_specs(text: &str, lang: tree_sitter::Language) -> (Vec<String>
             if let Some(func) = node.child_by_field_name("function") {
                 if let Ok(ft) = func.utf8_text(text.as_bytes()) {
                     let args = node.child_by_field_name("arguments");
-                    let arg_str = |idx: usize| -> Option<String> {
-                        js_call_arg_str(args, idx, text)
-                    };
+                    let arg_str =
+                        |idx: usize| -> Option<String> { js_call_arg_str(args, idx, text) };
                     if ft == "bindings" || ft.ends_with(".bindings") {
                         if let Some(n) = arg_str(0) {
                             natives.push(n);
@@ -2022,6 +2091,16 @@ struct PyEnv<'t> {
 }
 
 impl<'t> PyEnv<'t> {
+    fn empty() -> Self {
+        Self {
+            assigns: HashMap::new(),
+            verbind: HashMap::new(),
+            bad: BTreeSet::new(),
+            memo: std::cell::RefCell::new(HashMap::new()),
+            visiting: std::cell::RefCell::new(BTreeSet::new()),
+        }
+    }
+
     fn lookup(&self, name: &str, text: &str) -> Option<BTreeSet<String>> {
         if self.bad.contains(name) {
             return None;
@@ -2841,7 +2920,40 @@ fn py_dict_values(
 /// The fifth element counts dynamic native-library loads
 /// (`ctypes.CDLL(var)`) - reported separately since they aren't
 /// import sites.
-fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
+/// Substrings whose presence means `build_py_env`'s const-prop table
+/// can be consulted: dynamic-import machinery, entry-point/glob
+/// evaluators, native-library loaders, and the convention-setting
+/// names. File-call args (`open`, `Path`, `read_*`) are handled by
+/// deferred re-evaluation instead, so they need no trigger.
+const PY_ENV_TRIGGERS: &[&str] = &[
+    "import_module",
+    "__import__",
+    "importlib",
+    "run_module",
+    "run_path",
+    "spec_from_file_location",
+    "entry_points",
+    "glob",
+    "CDLL",
+    "PyDLL",
+    "WinDLL",
+    "LoadLibrary",
+    "windll",
+    "cdll",
+    "oledll",
+    "pydll",
+    "pytest_plugins",
+    "INSTALLED_APPS",
+    "CELERY_IMPORTS",
+    "STATICFILES_DIRS",
+    "MEDIA_ROOT",
+    "STATIC_ROOT",
+];
+
+fn py_import_refs<'t>(
+    tree: &'t tree_sitter::Tree,
+    text: &str,
+) -> (Vec<PyRef>, bool, usize, usize, usize) {
     let mut out = Vec::new();
     let mut dynamic = 0usize;
     // Subset of `dynamic` whose argument reads env vars or config -
@@ -2849,13 +2961,22 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
     let mut env_cfg = 0usize;
     // Non-literal native lib loads (`ctypes.CDLL(name)`).
     let mut native_dyn = 0usize;
-    let Some(tree) = parse_ts(text, tree_sitter_python::LANGUAGE.into()) else {
-        return (out, true, dynamic, env_cfg, native_dyn);
-    };
     let had_error = tree.root_node().has_error();
     // Const-prop environment for computed dynamic imports - built in
-    // a pre-pass so bindings are order-independent.
-    let env = build_py_env(&tree, text);
+    // a pre-pass so bindings are order-independent. The pre-pass is a
+    // full extra tree walk, so it is gated: files without any feature
+    // that can consume the env skip it entirely (plain string literals
+    // evaluate without it). File/native call args that fail to
+    // evaluate are deferred and re-tried once below if needed.
+    let needs_env = PY_ENV_TRIGGERS.iter().any(|t| text.contains(t));
+    let env = if needs_env {
+        build_py_env(tree, text)
+    } else {
+        PyEnv::empty()
+    };
+    // (arg node, is_native_lib) pairs whose eval failed under the
+    // possibly-empty env.
+    let mut deferred: Vec<(tree_sitter::Node, bool)> = Vec::new();
     // Names bound by import statements - `getattr` on one of these is
     // dynamic dispatch (module __getattr__ can lazily import, so the
     // edge is invisible). Collected in the same walk; getattr calls
@@ -2863,146 +2984,172 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
     // appear textually after the call.
     let mut bound: BTreeSet<String> = BTreeSet::new();
     let mut getattr_objs: Vec<String> = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "import_statement" => {
-                let mut cursor = node.walk();
-                for name in node.children_by_field_name("name", &mut cursor) {
-                    // `import a.b` binds `a`; `import a.b as c` binds `c`.
-                    if name.kind() == "aliased_import" {
-                        if let Some(alias) = name.child_by_field_name("alias") {
-                            if let Ok(t) = alias.utf8_text(text.as_bytes()) {
-                                bound.insert(t.to_string());
-                            }
-                        }
-                        if let Some(d) = name.child_by_field_name("name") {
-                            if let Some(segs) = dotted_segs(d, text) {
-                                out.push(PyRef::Import(segs));
-                            }
-                        }
-                    } else if let Some(segs) = dotted_segs(name, text) {
-                        bound.insert(segs[0].clone());
-                        out.push(PyRef::Import(segs));
-                    }
-                }
-            }
-            "import_from_statement" => {
-                let level_segs = node
-                    .child_by_field_name("module_name")
-                    .and_then(|m| rel_mod_segs(m, text));
-                let mut names = Vec::new();
-                let mut cursor = node.walk();
-                for name in node.children_by_field_name("name", &mut cursor) {
-                    // dotted_name, aliased_import, or wildcard_import.
-                    if name.kind() == "aliased_import" {
-                        if let Some(alias) = name.child_by_field_name("alias") {
-                            if let Ok(t) = alias.utf8_text(text.as_bytes()) {
-                                bound.insert(t.to_string());
-                            }
-                        }
-                    }
-                    let dotted = if name.kind() == "aliased_import" {
-                        name.child_by_field_name("name")
-                    } else if name.kind() == "dotted_name" {
-                        Some(name)
-                    } else {
-                        None
-                    };
-                    if let Some(d) = dotted {
-                        if let Ok(t) = d.utf8_text(text.as_bytes()) {
-                            let t = t.trim();
-                            // Import names are single identifiers;
-                            // anything dotted isn't a real name.
-                            if !t.is_empty()
-                                && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                            {
-                                names.push(t.to_string());
-                                bound.insert(t.to_string());
-                            }
-                        }
-                    }
-                }
-                if let Some((level, segs)) = level_segs {
-                    out.push(PyRef::From { level, segs, names });
-                }
-            }
-            "assignment" => {
-                // Framework convention lists: `pytest_plugins = [...]`,
-                // `INSTALLED_APPS = [...]` - literal dotted strings the
-                // frameworks import on our behalf.
-                if let (Some(l), Some(r)) = (
-                    node.child_by_field_name("left"),
-                    node.child_by_field_name("right"),
-                ) {
-                    if l.kind() == "identifier" {
-                        if let Ok(name) = l.utf8_text(text.as_bytes()) {
-                            if matches!(name, "pytest_plugins" | "INSTALLED_APPS" | "CELERY_IMPORTS") {
-                                if let Some(strings) = py_convention_strings(&env, r, text) {
-                                    if !strings.is_empty() {
-                                        out.push(PyRef::Convention(strings));
-                                    }
-                                }
-                            } else if matches!(
-                                name,
-                                "STATICFILES_DIRS" | "MEDIA_ROOT" | "STATIC_ROOT"
-                            ) {
-                                // Django path-valued settings - data
-                                // coupling, resolved against disk.
-                                if let Some(strings) = py_convention_strings(&env, r, text) {
-                                    for s in strings {
-                                        out.push(PyRef::DataFile(s));
-                                    }
+    // Enumerate only the node kinds the match below inspects - a
+    // tree-sitter query walks the tree in C and yields just these,
+    // skipping per-node Rust overhead for the ~95% of nodes
+    // (identifiers, strings, operators) that are never examined.
+    // Document order differs from the old DFS order but every
+    // consumer is a set, a count, or sorted downstream.
+    static NODE_QUERY: std::sync::OnceLock<tree_sitter::Query> = std::sync::OnceLock::new();
+    let node_query = NODE_QUERY.get_or_init(|| {
+        tree_sitter::Query::new(
+            &tree_sitter_python::LANGUAGE.into(),
+            "(import_statement) @n (import_from_statement) @n (assignment) @n (call) @n (attribute) @n",
+        )
+        .expect("python node query")
+    });
+    let mut qcursor = tree_sitter::QueryCursor::new();
+    let mut matches = qcursor.matches(node_query, tree.root_node(), text.as_bytes());
+    use tree_sitter::StreamingIterator as _;
+    while let Some(m) = matches.next() {
+        for cap in m.captures() {
+            let node = cap.node;
+            match node.kind() {
+                "import_statement" => {
+                    let mut cursor = node.walk();
+                    for name in node.children_by_field_name("name", &mut cursor) {
+                        // `import a.b` binds `a`; `import a.b as c` binds `c`.
+                        if name.kind() == "aliased_import" {
+                            if let Some(alias) = name.child_by_field_name("alias") {
+                                if let Ok(t) = alias.utf8_text(text.as_bytes()) {
+                                    bound.insert(t.to_string());
                                 }
                             }
-                        }
-                    }
-                }
-            }
-            "call" => {
-                // Dynamic imports with literal arguments:
-                // `import_module("a.b")`, `importlib.import_module("a.b")`,
-                // `__import__("a.b")`. Non-literal args are counted as
-                // dynamic sites (invisible edges) for the warning.
-                match py_dyn_call_kind(node, text, &env) {
-                    PyDynCall::Literal(paths) => {
-                        for segs in paths {
+                            if let Some(d) = name.child_by_field_name("name") {
+                                if let Some(segs) = dotted_segs(d, text) {
+                                    out.push(PyRef::Import(segs));
+                                }
+                            }
+                        } else if let Some(segs) = dotted_segs(name, text) {
+                            bound.insert(segs[0].clone());
                             out.push(PyRef::Import(segs));
                         }
                     }
-                    PyDynCall::Dynamic => {
-                        // Same-file call-site propagation: `def f(n):
-                        // import_module(n)` called with literals
-                        // resolves through the parameter.
-                        let resolved = py_first_arg(node).and_then(|arg| {
-                            py_dyn_callsite_paths(tree.root_node(), arg, text, &env)
-                        });
-                        match resolved {
-                            Some((paths, unresolved)) => {
-                                for segs in paths {
-                                    out.push(PyRef::Import(segs));
-                                }
-                                if unresolved {
-                                    dynamic += 1;
+                }
+                "import_from_statement" => {
+                    let level_segs = node
+                        .child_by_field_name("module_name")
+                        .and_then(|m| rel_mod_segs(m, text));
+                    let mut names = Vec::new();
+                    let mut cursor = node.walk();
+                    for name in node.children_by_field_name("name", &mut cursor) {
+                        // dotted_name, aliased_import, or wildcard_import.
+                        if name.kind() == "aliased_import" {
+                            if let Some(alias) = name.child_by_field_name("alias") {
+                                if let Ok(t) = alias.utf8_text(text.as_bytes()) {
+                                    bound.insert(t.to_string());
                                 }
                             }
-                            None => {
-                                dynamic += 1;
-                                if py_first_arg(node).is_some_and(|a| py_source_hint(a, text)) {
-                                    env_cfg += 1;
+                        }
+                        let dotted = if name.kind() == "aliased_import" {
+                            name.child_by_field_name("name")
+                        } else if name.kind() == "dotted_name" {
+                            Some(name)
+                        } else {
+                            None
+                        };
+                        if let Some(d) = dotted {
+                            if let Ok(t) = d.utf8_text(text.as_bytes()) {
+                                let t = t.trim();
+                                // Import names are single identifiers;
+                                // anything dotted isn't a real name.
+                                if !t.is_empty()
+                                    && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                {
+                                    names.push(t.to_string());
+                                    bound.insert(t.to_string());
                                 }
                             }
                         }
                     }
-                    PyDynCall::NotDynamic => {}
+                    if let Some((level, segs)) = level_segs {
+                        out.push(PyRef::From { level, segs, names });
+                    }
                 }
-                // `runpy.run_path("script.py")` - literal/const file
-                // path dep (module path handled above via run_module).
-                if let Some(func) = node.child_by_field_name("function") {
-                    if let Ok(ft) = func.utf8_text(text.as_bytes()) {
+                "assignment" => {
+                    // Framework convention lists: `pytest_plugins = [...]`,
+                    // `INSTALLED_APPS = [...]` - literal dotted strings the
+                    // frameworks import on our behalf.
+                    if let (Some(l), Some(r)) = (
+                        node.child_by_field_name("left"),
+                        node.child_by_field_name("right"),
+                    ) {
+                        if l.kind() == "identifier" {
+                            if let Ok(name) = l.utf8_text(text.as_bytes()) {
+                                if matches!(
+                                    name,
+                                    "pytest_plugins" | "INSTALLED_APPS" | "CELERY_IMPORTS"
+                                ) {
+                                    if let Some(strings) = py_convention_strings(&env, r, text) {
+                                        if !strings.is_empty() {
+                                            out.push(PyRef::Convention(strings));
+                                        }
+                                    }
+                                } else if matches!(
+                                    name,
+                                    "STATICFILES_DIRS" | "MEDIA_ROOT" | "STATIC_ROOT"
+                                ) {
+                                    // Django path-valued settings - data
+                                    // coupling, resolved against disk.
+                                    if let Some(strings) = py_convention_strings(&env, r, text) {
+                                        for s in strings {
+                                            out.push(PyRef::DataFile(s));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "call" => {
+                    // Callee text, extracted once and shared by every
+                    // feature check below (dyn import, run_path,
+                    // spec_from_file_location, native loads, file
+                    // reads, glob, entry_points, getattr).
+                    let call_ft = node
+                        .child_by_field_name("function")
+                        .and_then(|f| f.utf8_text(text.as_bytes()).ok());
+                    // Dynamic imports with literal arguments:
+                    // `import_module("a.b")`, `importlib.import_module("a.b")`,
+                    // `__import__("a.b")`. Non-literal args are counted as
+                    // dynamic sites (invisible edges) for the warning.
+                    match py_dyn_call_kind(node, text, &env) {
+                        PyDynCall::Literal(paths) => {
+                            for segs in paths {
+                                out.push(PyRef::Import(segs));
+                            }
+                        }
+                        PyDynCall::Dynamic => {
+                            // Same-file call-site propagation: `def f(n):
+                            // import_module(n)` called with literals
+                            // resolves through the parameter.
+                            let resolved = py_first_arg(node).and_then(|arg| {
+                                py_dyn_callsite_paths(tree.root_node(), arg, text, &env)
+                            });
+                            match resolved {
+                                Some((paths, unresolved)) => {
+                                    for segs in paths {
+                                        out.push(PyRef::Import(segs));
+                                    }
+                                    if unresolved {
+                                        dynamic += 1;
+                                    }
+                                }
+                                None => {
+                                    dynamic += 1;
+                                    if py_first_arg(node).is_some_and(|a| py_source_hint(a, text)) {
+                                        env_cfg += 1;
+                                    }
+                                }
+                            }
+                        }
+                        PyDynCall::NotDynamic => {}
+                    }
+                    // `runpy.run_path("script.py")` - literal/const file
+                    // path dep (module path handled above via run_module).
+                    if let Some(ft) = call_ft {
                         if ft == "run_path" || ft.ends_with(".run_path") {
-                            match py_first_arg(node)
-                                .and_then(|a| py_eval_strset(&env, a, text, 0))
+                            match py_first_arg(node).and_then(|a| py_eval_strset(&env, a, text, 0))
                             {
                                 Some(vals) => {
                                     for v in vals {
@@ -3023,16 +3170,12 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
                                     let mut c = args.walk();
                                     let kids: Vec<_> = args
                                         .children(&mut c)
-                                        .filter(|k| {
-                                            !matches!(k.kind(), "(" | ")" | ",")
-                                        })
+                                        .filter(|k| !matches!(k.kind(), "(" | ")" | ","))
                                         .collect();
                                     kids.into_iter().nth(1)
                                 })
                                 .flatten();
-                            match path_arg
-                                .and_then(|a| py_eval_strset(&env, a, text, 0))
-                            {
+                            match path_arg.and_then(|a| py_eval_strset(&env, a, text, 0)) {
                                 Some(vals) => {
                                     for v in vals {
                                         out.push(PyRef::PathDep(v));
@@ -3065,7 +3208,15 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
                                         out.push(PyRef::NativeLib(v));
                                     }
                                 }
-                                None if !is_none => native_dyn += 1,
+                                None if !is_none => {
+                                    if needs_env {
+                                        native_dyn += 1;
+                                    } else if let Some(a) = arg {
+                                        deferred.push((a, true));
+                                    } else {
+                                        native_dyn += 1;
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -3105,19 +3256,21 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
                                     || ft.ends_with(".imread")));
                         if is_file_call {
                             if let Some(arg) = py_first_arg(node) {
-                                if let Some(vals) = py_eval_strset(&env, arg, text, 0) {
-                                    for v in vals {
-                                        out.push(PyRef::DataFile(v));
+                                match py_eval_strset(&env, arg, text, 0) {
+                                    Some(vals) => {
+                                        for v in vals {
+                                            out.push(PyRef::DataFile(v));
+                                        }
                                     }
+                                    None if !needs_env => deferred.push((arg, false)),
+                                    None => {}
                                 }
                             }
                         }
                     }
-                }
-                // glob.glob/iglob/Path.glob with a literal or
-                // const-derived pattern - matched against the file set.
-                if let Some(func) = node.child_by_field_name("function") {
-                    if let Ok(ft) = func.utf8_text(text.as_bytes()) {
+                    // glob.glob/iglob/Path.glob with a literal or
+                    // const-derived pattern - matched against the file set.
+                    if let Some(ft) = call_ft {
                         let is_glob = ft == "glob"
                             || ft == "iglob"
                             || ft.ends_with(".glob")
@@ -3152,71 +3305,62 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
                             }
                         }
                     }
-                }
-                // `entry_points(group="x")` and
-                // `entry_points().select(group="x")` - consumer side
-                // of declared entry points; resolved by the caller
-                // once the group->targets map is known. No `group`
-                // kwarg selects all groups (empty vec). `.select`
-                // only counts when it has a group kwarg - a bare
-                // `entry_points().select(name=...)` selects by entry
-                // name, not group, and stays unresolved.
-                if let Some(func) = node.child_by_field_name("function") {
-                    let is_ep_call = func
-                        .utf8_text(text.as_bytes())
-                        .is_ok_and(|t| t == "entry_points" || t.ends_with(".entry_points"));
-                    let is_ep_select = func
-                        .utf8_text(text.as_bytes())
-                        .is_ok_and(|t| t.ends_with(".select"));
-                    if is_ep_call || is_ep_select {
-                        if let Some(args) = node.child_by_field_name("arguments") {
-                            let groups = {
-                                let mut c = args.walk();
-                                let found = args
-                                    .children(&mut c)
-                                    .filter(|ch| ch.kind() == "keyword_argument")
-                                    .find_map(|kw| {
-                                        let name = kw
-                                            .child_by_field_name("name")
-                                            .and_then(|n| n.utf8_text(text.as_bytes()).ok())?;
-                                        if name != "group" {
-                                            return None;
+                    // `entry_points(group="x")` and
+                    // `entry_points().select(group="x")` - consumer side
+                    // of declared entry points; resolved by the caller
+                    // once the group->targets map is known. No `group`
+                    // kwarg selects all groups (empty vec). `.select`
+                    // only counts when it has a group kwarg - a bare
+                    // `entry_points().select(name=...)` selects by entry
+                    // name, not group, and stays unresolved.
+                    if let Some(ft) = call_ft {
+                        let is_ep_call = ft == "entry_points" || ft.ends_with(".entry_points");
+                        let is_ep_select = ft.ends_with(".select");
+                        if is_ep_call || is_ep_select {
+                            if let Some(args) = node.child_by_field_name("arguments") {
+                                let groups = {
+                                    let mut c = args.walk();
+                                    let found = args
+                                        .children(&mut c)
+                                        .filter(|ch| ch.kind() == "keyword_argument")
+                                        .find_map(|kw| {
+                                            let name = kw
+                                                .child_by_field_name("name")
+                                                .and_then(|n| n.utf8_text(text.as_bytes()).ok())?;
+                                            if name != "group" {
+                                                return None;
+                                            }
+                                            let value = kw.child_by_field_name("value")?;
+                                            Some(value)
+                                        })
+                                        .map(|v| {
+                                            py_eval_strset(&env, v, text, 0)
+                                                .map(|s| s.into_iter().collect::<Vec<_>>())
+                                        });
+                                    found
+                                };
+                                match groups {
+                                    // group= literal/const -> those groups.
+                                    Some(Some(gs)) => out.push(PyRef::EpGroup(gs)),
+                                    // group= computed -> dynamic site.
+                                    Some(None) => dynamic += 1,
+                                    // entry_points() with no group -> all
+                                    // groups; bare .select() has no group
+                                    // semantics - ignore it.
+                                    None => {
+                                        if is_ep_call {
+                                            out.push(PyRef::EpGroup(Vec::new()));
                                         }
-                                        let value = kw.child_by_field_name("value")?;
-                                        Some(value)
-                                    })
-                                    .map(|v| {
-                                        py_eval_strset(&env, v, text, 0)
-                                            .map(|s| s.into_iter().collect::<Vec<_>>())
-                                    });
-                                found
-                            };
-                            match groups {
-                                // group= literal/const -> those groups.
-                                Some(Some(gs)) => out.push(PyRef::EpGroup(gs)),
-                                // group= computed -> dynamic site.
-                                Some(None) => dynamic += 1,
-                                // entry_points() with no group -> all
-                                // groups; bare .select() has no group
-                                // semantics - ignore it.
-                                None => {
-                                    if is_ep_call {
-                                        out.push(PyRef::EpGroup(Vec::new()));
                                     }
                                 }
                             }
                         }
                     }
-                }
-                // `getattr(<imported-name>, ...)` - dynamic attribute
-                // dispatch; module __getattr__ may lazily import, so
-                // edges can be invisible. First arg must be a bare
-                // identifier; resolved against `bound` after the walk.
-                if let Some(func) = node.child_by_field_name("function") {
-                    if func
-                        .utf8_text(text.as_bytes())
-                        .is_ok_and(|t| t == "getattr")
-                    {
+                    // `getattr(<imported-name>, ...)` - dynamic attribute
+                    // dispatch; module __getattr__ may lazily import, so
+                    // edges can be invisible. First arg must be a bare
+                    // identifier; resolved against `bound` after the walk.
+                    if call_ft == Some("getattr") {
                         if let Some(args) = node.child_by_field_name("arguments") {
                             let first_ident = {
                                 let mut c = args.walk();
@@ -3234,33 +3378,51 @@ fn py_import_refs(text: &str) -> (Vec<PyRef>, bool, usize, usize, usize) {
                         }
                     }
                 }
-            }
-            "attribute" => {
-                // `ctypes.windll.kernel32` / `ctypes.cdll.msvcrt` /
-                // `ctypes.oledll.X` / `ctypes.pydll.X` - attribute
-                // access itself performs the library load (unlike
-                // `cdll.LoadLibrary`, a method needing a call).
-                if let Ok(t) = node.utf8_text(text.as_bytes()) {
-                    if let Some(rest) = t.strip_prefix("ctypes.") {
-                        let segs: Vec<&str> = rest.split('.').collect();
-                        if segs.len() == 2
-                            && matches!(segs[0], "windll" | "cdll" | "oledll" | "pydll")
-                            && segs[1] != "LoadLibrary"
-                            && !segs[1].is_empty()
-                        {
-                            out.push(PyRef::NativeLib(segs[1].to_string()));
+                "attribute" => {
+                    // `ctypes.windll.kernel32` / `ctypes.cdll.msvcrt` /
+                    // `ctypes.oledll.X` / `ctypes.pydll.X` - attribute
+                    // access itself performs the library load (unlike
+                    // `cdll.LoadLibrary`, a method needing a call).
+                    if let Ok(t) = node.utf8_text(text.as_bytes()) {
+                        if let Some(rest) = t.strip_prefix("ctypes.") {
+                            let segs: Vec<&str> = rest.split('.').collect();
+                            if segs.len() == 2
+                                && matches!(segs[0], "windll" | "cdll" | "oledll" | "pydll")
+                                && segs[1] != "LoadLibrary"
+                                && !segs[1].is_empty()
+                            {
+                                out.push(PyRef::NativeLib(segs[1].to_string()));
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-        let mut c = node.walk();
-        for child in node.children(&mut c) {
-            stack.push(child);
         }
     }
     dynamic += getattr_objs.iter().filter(|o| bound.contains(*o)).count();
+    // Deferred file/native args: the env was skipped up front, so
+    // build it now (once) and re-evaluate only those args. Literal
+    // args never land here, and files with env triggers already ran
+    // the full env during the walk.
+    if !needs_env && !deferred.is_empty() {
+        let env = build_py_env(tree, text);
+        for (arg, is_lib) in deferred {
+            match py_eval_strset(&env, arg, text, 0) {
+                Some(vals) => {
+                    for v in vals {
+                        out.push(if is_lib {
+                            PyRef::NativeLib(v)
+                        } else {
+                            PyRef::DataFile(v)
+                        });
+                    }
+                }
+                None if is_lib => native_dyn += 1,
+                None => {}
+            }
+        }
+    }
     (out, had_error, dynamic, env_cfg, native_dyn)
 }
 
@@ -3644,10 +3806,196 @@ fn py_string_inner(node: tree_sitter::Node, text: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
+/// Per-file resolution for `scan_python_impl`, extracted so the
+/// caller can run it under rayon. Returns (edge triples,
+/// warnings, entry-point lookups); edge order inside a file is
+/// BTreeMap-deterministic and the caller preserves file order.
+fn resolve_py_file(
+    rel_s: String,
+    refs: Vec<PyRef>,
+    had_error: bool,
+    dynamic: usize,
+    env_cfg: usize,
+    native_dyn: usize,
+    manual: Vec<String>,
+    names: &BTreeSet<String>,
+    root: &Path,
+) -> (
+    Vec<(String, String, EdgeKind)>,
+    Vec<String>,
+    Vec<(String, Vec<String>)>,
+) {
+    let mut warns = Vec::new();
+    let mut eps = Vec::new();
+    let mut edge_triples: Vec<(String, String, EdgeKind)> = Vec::new();
+    let rel = &rel_s;
+    if had_error {
+        warns.push(format!("{rel}: parse errors (partial scan)"));
+    }
+    if dynamic > 0 {
+        let hint = if env_cfg > 0 {
+            format!(" ({env_cfg} read env vars/config)")
+        } else {
+            String::new()
+        };
+        warns.push(format!(
+            "{rel}: {dynamic} dynamic import site(s){hint} - edges may be incomplete"
+        ));
+    }
+    if native_dyn > 0 {
+        warns.push(format!(
+            "{rel}: {native_dyn} dynamic native-library load(s) - edges may be incomplete"
+        ));
+    }
+    let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
+    let parent = parent_rel(rel);
+
+    for r in refs {
+        match r {
+            PyRef::Import(segs) => {
+                // `import a.b.c` needs the full path to resolve; try
+                // each ancestor dir as a package root (sys.path
+                // heuristic).
+                for b in ancestor_bases(rel) {
+                    if let Some(dep) = resolve_py_exact(&names, &b, &segs) {
+                        if dep != *rel {
+                            note_dep(&mut deps, dep, EdgeKind::Static);
+                        }
+                        break;
+                    }
+                }
+            }
+            PyRef::From {
+                level,
+                segs,
+                names: imps,
+            } => {
+                add_py_from(&names, rel, parent, level, &segs, &imps, &mut deps);
+            }
+            PyRef::Glob(patterns) => {
+                for pat in patterns {
+                    for dep in py_glob_expand(&names, &[parent, ""], &pat) {
+                        if dep != *rel {
+                            note_dep(&mut deps, dep, EdgeKind::Resolved);
+                        }
+                    }
+                }
+            }
+            PyRef::Convention(strings) => {
+                for s in strings {
+                    let segs: Vec<String> = s.split('.').map(str::to_string).collect();
+                    // Try longest prefix first - `myapp.apps.MyConfig`
+                    // resolves `myapp.apps` (the module), not the
+                    // class attribute.
+                    'outer: for end in (1..=segs.len()).rev() {
+                        for b in ancestor_bases(rel) {
+                            if let Some(dep) = resolve_py_exact(&names, &b, &segs[..end]) {
+                                if dep != *rel {
+                                    note_dep(&mut deps, dep, EdgeKind::Declared);
+                                }
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+            PyRef::PathDep(spec) => {
+                // File path: file-dir relative, then project-root
+                // relative - same rule as `# strand: depends-on`.
+                if let Some(dep) = [parent, ""]
+                    .iter()
+                    .filter_map(|b| normalize_rel(b, &spec))
+                    .find(|c| names.contains(c))
+                {
+                    if dep != *rel {
+                        note_dep(&mut deps, dep, EdgeKind::Static);
+                    }
+                }
+            }
+            PyRef::NativeLib(name) => {
+                // `ctypes.CDLL("/usr/lib/libfoo.so.1")` -> the
+                // basename is the loadable name; the library's
+                // internals stay opaque (honest edge, no
+                // fabrication of function-level links).
+                let base = name.rsplit(['/', '\\']).next().unwrap_or(name.as_str());
+                if !base.is_empty() {
+                    note_dep(&mut deps, format!("native:{base}"), EdgeKind::Resolved);
+                }
+            }
+            PyRef::DataFile(spec) => {
+                // Data coupling: the literal path must exist on
+                // disk or the edge would be invented. Resolved
+                // file-dir relative, then project-root relative.
+                for cand in [parent, ""].iter().filter_map(|b| normalize_rel(b, &spec)) {
+                    if root.join(&cand).is_file() {
+                        if cand != *rel {
+                            note_dep(&mut deps, cand, EdgeKind::Resolved);
+                        }
+                        break;
+                    }
+                }
+            }
+            PyRef::EpGroup(groups) => {
+                eps.push((rel.clone(), groups));
+            }
+        }
+    }
+
+    // `# strand: depends-on path` manual edges - file path relative
+    // to this file's dir, or a dotted module path.
+    for spec in manual {
+        let dep = if spec.contains('/') || spec.ends_with(".py") {
+            // Path form: file-dir relative, then project-root relative.
+            [parent, ""]
+                .iter()
+                .filter_map(|b| normalize_rel(b, &spec))
+                .find(|c| names.contains(c))
+        } else {
+            let segs: Vec<String> = spec.split('.').map(str::to_string).collect();
+            ancestor_bases(rel)
+                .iter()
+                .find_map(|b| resolve_py_exact(&names, b, &segs))
+        };
+        if let Some(dep) = dep {
+            if dep != *rel {
+                note_dep(&mut deps, dep, EdgeKind::Declared);
+            }
+        }
+    }
+
+    for (dep, kind) in deps {
+        edge_triples.push((rel.clone(), dep, kind));
+    }
+    (edge_triples, warns, eps)
+}
+
+/// Per-file extraction result carried from the parallel parse phase
+/// into resolution; `tree`/`text` are only consumed when the caller
+/// asked for [`PySource`]s via `scan_project_with_py`.
+struct PyExtract {
+    rel: String,
+    refs: Vec<PyRef>,
+    had_error: bool,
+    dynamic: usize,
+    env_cfg: usize,
+    native_dyn: usize,
+    manual: Vec<String>,
+    tree: Option<tree_sitter::Tree>,
+    text: String,
+}
+
+fn scan_python_impl(
+    root: &Path,
+    mut py_sink: Option<&mut BTreeMap<String, PySource>>,
+) -> Result<ScanOutput> {
+    let prof = std::env::var_os("STRAND_PROFILE").is_some();
+    let t_all = std::time::Instant::now();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     walk_ext(root, root, PY_EXTS, &mut files)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
+    if prof {
+        eprintln!("py walk: {:?} ({} files)", t_all.elapsed(), files.len());
+    }
     let names: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
     let mut edges: EdgeList = Vec::new();
     let mut warnings = Vec::new();
@@ -3660,165 +4008,71 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
     let extracted = files
         .par_iter()
         .map(|(rel, abs)| {
-            let text = fs::read_to_string(abs)
+            // Lossy decode: non-UTF-8 source files (legacy encodings,
+            // mislabeled binaries) must not abort the whole scan.
+            let text = fs::read(abs)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
-            let (refs, had_error, dynamic, env_cfg, native_dyn) = py_import_refs(&text);
-            Ok((
+            let tree = parse_ts(&text, tree_sitter_python::LANGUAGE.into());
+            let (refs, had_error, dynamic, env_cfg, native_dyn) = match &tree {
+                Some(t) => py_import_refs(t, &text),
+                None => (Vec::new(), true, 0, 0, 0),
+            };
+            Ok(PyExtract {
+                rel: rel.clone(),
+                refs,
+                had_error,
+                dynamic,
+                env_cfg,
+                native_dyn,
+                manual: manual_dep_specs(&text),
+                tree,
+                text,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if prof {
+        eprintln!("py extract: {:?}", t_all.elapsed());
+    }
+
+    // Resolution is per-file independent (read-only shared state),
+    // so it parallelizes; collect preserves file order so edge and
+    // warning order stay deterministic.
+    let resolved = extracted
+        .into_par_iter()
+        .map(|ex| {
+            let PyExtract {
+                rel,
+                refs,
+                had_error,
+                dynamic,
+                env_cfg,
+                native_dyn,
+                manual,
+                tree,
+                text,
+            } = ex;
+            let r = resolve_py_file(
                 rel.clone(),
                 refs,
                 had_error,
                 dynamic,
                 env_cfg,
                 native_dyn,
-                manual_dep_specs(&text),
-            ))
+                manual,
+                &names,
+                root,
+            );
+            (r, tree, text, rel)
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    for (rel_s, refs, had_error, dynamic, env_cfg, native_dyn, manual) in extracted {
-        let rel = &rel_s;
-        if had_error {
-            warnings.push(format!("{rel}: parse errors (partial scan)"));
-        }
-        if dynamic > 0 {
-            let hint = if env_cfg > 0 {
-                format!(" ({env_cfg} read env vars/config)")
-            } else {
-                String::new()
-            };
-            warnings.push(format!(
-                "{rel}: {dynamic} dynamic import site(s){hint} - edges may be incomplete"
-            ));
-        }
-        if native_dyn > 0 {
-            warnings.push(format!(
-                "{rel}: {native_dyn} dynamic native-library load(s) - edges may be incomplete"
-            ));
-        }
-        let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
-        let parent = parent_rel(rel);
-
-        for r in refs {
-            match r {
-                PyRef::Import(segs) => {
-                    // `import a.b.c` needs the full path to resolve; try
-                    // each ancestor dir as a package root (sys.path
-                    // heuristic).
-                    for b in ancestor_bases(rel) {
-                        if let Some(dep) = resolve_py_exact(&names, &b, &segs) {
-                            if dep != *rel {
-                                note_dep(&mut deps, dep, EdgeKind::Static);
-                            }
-                            break;
-                        }
-                    }
-                }
-                PyRef::From {
-                    level,
-                    segs,
-                    names: imps,
-                } => {
-                    add_py_from(&names, rel, parent, level, &segs, &imps, &mut deps);
-                }
-                PyRef::Glob(patterns) => {
-                    for pat in patterns {
-                        for dep in py_glob_expand(&names, &[parent, ""], &pat) {
-                            if dep != *rel {
-                                note_dep(&mut deps, dep, EdgeKind::Resolved);
-                            }
-                        }
-                    }
-                }
-                PyRef::Convention(strings) => {
-                    for s in strings {
-                        let segs: Vec<String> = s.split('.').map(str::to_string).collect();
-                        // Try longest prefix first - `myapp.apps.MyConfig`
-                        // resolves `myapp.apps` (the module), not the
-                        // class attribute.
-                        'outer: for end in (1..=segs.len()).rev() {
-                            for b in ancestor_bases(rel) {
-                                if let Some(dep) = resolve_py_exact(&names, &b, &segs[..end]) {
-                                    if dep != *rel {
-                                        note_dep(&mut deps, dep, EdgeKind::Declared);
-                                    }
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                }
-                PyRef::PathDep(spec) => {
-                    // File path: file-dir relative, then project-root
-                    // relative - same rule as `# strand: depends-on`.
-                    if let Some(dep) = [parent, ""]
-                        .iter()
-                        .filter_map(|b| normalize_rel(b, &spec))
-                        .find(|c| names.contains(c))
-                    {
-                        if dep != *rel {
-                            note_dep(&mut deps, dep, EdgeKind::Static);
-                        }
-                    }
-                }
-                PyRef::NativeLib(name) => {
-                    // `ctypes.CDLL("/usr/lib/libfoo.so.1")` -> the
-                    // basename is the loadable name; the library's
-                    // internals stay opaque (honest edge, no
-                    // fabrication of function-level links).
-                    let base = name
-                        .rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or(name.as_str());
-                    if !base.is_empty() {
-                        note_dep(&mut deps, format!("native:{base}"), EdgeKind::Resolved);
-                    }
-                }
-                PyRef::DataFile(spec) => {
-                    // Data coupling: the literal path must exist on
-                    // disk or the edge would be invented. Resolved
-                    // file-dir relative, then project-root relative.
-                    for cand in [parent, ""]
-                        .iter()
-                        .filter_map(|b| normalize_rel(b, &spec))
-                    {
-                        if root.join(&cand).is_file() {
-                            if cand != *rel {
-                                note_dep(&mut deps, cand, EdgeKind::Resolved);
-                            }
-                            break;
-                        }
-                    }
-                }
-                PyRef::EpGroup(groups) => {
-                    ep_lookups.push((rel.clone(), groups));
-                }
-            }
-        }
-
-        // `# strand: depends-on path` manual edges - file path relative
-        // to this file's dir, or a dotted module path.
-        for spec in manual {
-            let dep = if spec.contains('/') || spec.ends_with(".py") {
-                // Path form: file-dir relative, then project-root relative.
-                [parent, ""]
-                    .iter()
-                    .filter_map(|b| normalize_rel(b, &spec))
-                    .find(|c| names.contains(c))
-            } else {
-                let segs: Vec<String> = spec.split('.').map(str::to_string).collect();
-                ancestor_bases(rel)
-                    .iter()
-                    .find_map(|b| resolve_py_exact(&names, b, &segs))
-            };
-            if let Some(dep) = dep {
-                if dep != *rel {
-                    note_dep(&mut deps, dep, EdgeKind::Declared);
-                }
-            }
-        }
-
-        for (dep, kind) in deps {
-            edges.push((rel.clone(), dep, None, kind));
+        .collect::<Vec<_>>();
+    for (r, tree, text, rel) in resolved {
+        let (triples, warns, eps) = r;
+        warnings.extend(warns);
+        edges.extend(triples.into_iter().map(|(s, d, k)| (s, d, None, k)));
+        ep_lookups.extend(eps);
+        if let (Some(sink), Some(tree)) = (py_sink.as_mut(), tree) {
+            sink.insert(rel, PySource { text, tree });
         }
     }
 
@@ -3997,7 +4251,10 @@ fn scan_python_impl(root: &Path) -> Result<ScanOutput> {
         let providers = crate::caches::entry_point_providers(root);
         let mut prov_by_group: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for (g, n) in &providers {
-            prov_by_group.entry(g.as_str()).or_default().insert(n.as_str());
+            prov_by_group
+                .entry(g.as_str())
+                .or_default()
+                .insert(n.as_str());
         }
         for (rel, groups) in ep_lookups {
             let mut targets: BTreeSet<String> = BTreeSet::new();
@@ -4492,7 +4749,10 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     let extracted = files
         .par_iter()
         .map(|(rel, abs)| {
-            let text = fs::read_to_string(abs)
+            // Lossy decode: non-UTF-8 source files (legacy encodings,
+            // mislabeled binaries) must not abort the whole scan.
+            let text = fs::read(abs)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
             let (specs, globs, had_error, dynamic) =
                 js_import_specs_ts(&text, js_language_for(rel));
@@ -4567,10 +4827,7 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
             }
         }
         for p in &data_files {
-            for cand in [parent, ""]
-                .iter()
-                .filter_map(|b| normalize_rel(b, p))
-            {
+            for cand in [parent, ""].iter().filter_map(|b| normalize_rel(b, p)) {
                 if root.join(&cand).is_file() {
                     if cand != *rel {
                         note_dep(&mut deps, cand, EdgeKind::Resolved);
@@ -5195,11 +5452,7 @@ fn gradle_coord_parts(node: &str) -> Option<(String, String, String)> {
     let bytes = node.as_bytes();
     let mut cut = None;
     for (i, &c) in bytes.iter().enumerate().skip(1) {
-        if c == b'@'
-            && bytes
-                .get(i + 1)
-                .is_some_and(|d| d.is_ascii_digit())
-        {
+        if c == b'@' && bytes.get(i + 1).is_some_and(|d| d.is_ascii_digit()) {
             cut = Some(i);
         }
     }
@@ -5234,7 +5487,9 @@ fn gradle_component_deps(dir: &Path) -> Vec<(String, String, String)> {
     let mut module_text = None;
     let mut pom_text = None;
     for e in entries.flatten() {
-        let Ok(files) = fs::read_dir(e.path()) else { continue };
+        let Ok(files) = fs::read_dir(e.path()) else {
+            continue;
+        };
         for f in files.flatten() {
             let name = f.file_name().to_string_lossy().to_lowercase();
             if name.ends_with(".module") && module_text.is_none() {
@@ -5259,9 +5514,7 @@ fn gradle_component_deps(dir: &Path) -> Vec<(String, String, String)> {
 /// so huge caches stay fast; the visited set keeps it terminating.
 fn gradle_cache_edges(seed: &BTreeSet<String>) -> EdgeList {
     const MAX_PARSE: usize = 4000;
-    let Some(home) = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-    else {
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
         return Vec::new();
     };
     let root = PathBuf::from(home).join(".gradle/caches/modules-2/files-2.1");
@@ -5274,32 +5527,29 @@ fn gradle_cache_edges(seed: &BTreeSet<String>) -> EdgeList {
     // Self-loop declarations for every node we emit.
     let mut declared: BTreeSet<String> = BTreeSet::new();
     let push_node = |edges: &mut EdgeList,
-                         seen: &mut BTreeSet<(String, String)>,
-                         declared: &mut BTreeSet<String>,
-                         src: &str,
-                         dst: String| {
+                     seen: &mut BTreeSet<(String, String)>,
+                     declared: &mut BTreeSet<String>,
+                     src: &str,
+                     dst: String| {
         if dst.is_empty() {
             return;
         }
         declared.insert(dst.clone());
         if seen.insert((src.to_string(), dst.clone())) {
-            edges.push((
-                src.to_string(),
-                dst,
-                None,
-                EdgeKind::Static,
-            ));
+            edges.push((src.to_string(), dst, None, EdgeKind::Static));
         }
     };
 
     // known[(g,a)] = versions seen so far, for versionless deps.
-    let mut known: BTreeMap<(String, String), BTreeSet<String>> =
-        BTreeMap::new();
+    let mut known: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut queue: Vec<(String, String, String)> = Vec::new();
     let mut visited: BTreeSet<(String, String, String)> = BTreeSet::new();
     for n in seed {
         if let Some((g, a, v)) = gradle_coord_parts(n) {
-            known.entry((g.clone(), a.clone())).or_default().insert(v.clone());
+            known
+                .entry((g.clone(), a.clone()))
+                .or_default()
+                .insert(v.clone());
             queue.push((g, a, v));
         }
     }
@@ -5341,12 +5591,7 @@ fn gradle_cache_edges(seed: &BTreeSet<String>) -> EdgeList {
                             let pin = gradle_node(&dg, &da, ver);
                             declared.insert(pin.clone());
                             if seen.insert((bare.clone(), pin.clone())) {
-                                edges.push((
-                                    bare.clone(),
-                                    pin,
-                                    None,
-                                    EdgeKind::Static,
-                                ));
+                                edges.push((bare.clone(), pin, None, EdgeKind::Static));
                             }
                         }
                         vec![bare]

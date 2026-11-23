@@ -66,7 +66,11 @@ fn py_pyi_stub_resolution() {
     w(root, "pkg/__init__.py", "");
     w(root, "pkg/stub.pyi", "def f() -> int: ...\n");
     w(root, "pkg/impl.py", "def f() -> int: return 1\n");
-    w(root, "user.py", "from pkg import stub\nfrom pkg import impl\n");
+    w(
+        root,
+        "user.py",
+        "from pkg import stub\nfrom pkg import impl\n",
+    );
     let out = scan_lang(root, Lang::Python).unwrap();
     assert!(has_edge(&out, "user.py", "pkg/stub.pyi"));
     assert!(has_edge(&out, "user.py", "pkg/impl.py"));
