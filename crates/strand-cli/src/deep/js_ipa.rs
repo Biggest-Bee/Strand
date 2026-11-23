@@ -67,7 +67,7 @@ fn parse_js(text: &str, rel: &str) -> Option<Tree> {
 
 /// All `call_expression` nodes via a tree-sitter query compiled for
 /// the file's own grammar (JS vs TS vs TSX node ids differ).
-fn call_nodes<'a>(f: &'a JsFile) -> Vec<Node<'a>> {
+pub(crate) fn call_nodes<'a>(f: &'a JsFile) -> Vec<Node<'a>> {
     use tree_sitter::StreamingIterator;
     let q = call_query(f);
     let mut cursor = tree_sitter::QueryCursor::new();
@@ -173,7 +173,7 @@ fn collect_facts(
             "variable_declarator" => collect_declarator(node, text, bindings, consts, funcs),
             "function_declaration" => collect_func_decl(node, text, funcs),
             "method_definition" => collect_method(node, text, funcs),
-            "arrow_function" | "function" => {
+            "arrow_function" | "function_expression" => {
                 // Named only via an enclosing declarator/pair - handled
                 // there; skip standalone expressions for v1.
             }
@@ -201,7 +201,7 @@ fn facts_query_rel(rel: &str) -> &'static tree_sitter::Query {
     }
 }
 
-fn spec_string(node: Node, text: &str) -> Option<String> {
+pub(crate) fn spec_string(node: Node, text: &str) -> Option<String> {
     if node.kind() != "string" {
         return None;
     }
@@ -305,7 +305,7 @@ fn collect_import(
     }
 }
 
-fn is_require_call(node: Node, text: &str) -> Option<String> {
+pub(crate) fn is_require_call(node: Node, text: &str) -> Option<String> {
     if node.kind() != "call_expression" {
         return None;
     }
@@ -374,7 +374,7 @@ fn collect_declarator(
         return;
     }
     // `const f = (a, b) => ...` / `const f = function(a,b) {...}`.
-    if matches!(value.kind(), "arrow_function" | "function") {
+    if matches!(value.kind(), "arrow_function" | "function_expression") {
         let params = fn_params(value, text);
         let entry = FuncInfo {
             params,
@@ -443,7 +443,7 @@ fn bind_object_pattern(
 
 /// Params of a function-ish node: identifiers plus the first
 /// identifier inside TS `required_parameter`/`optional_parameter`.
-fn fn_params(node: Node, text: &str) -> Vec<String> {
+pub(crate) fn fn_params(node: Node, text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let Some(pn) = node.child_by_field_name("parameters") else {
         return out;
@@ -755,7 +755,7 @@ fn first_arg(call: Node) -> Option<Node> {
 /// Enclosing function of a node -> (name, info). JS functions get
 /// names from declarations, declarator-bound arrows/functions, and
 /// method definitions; anonymous/nested expressions are skipped.
-fn enclosing_func<'t>(node: Node<'t>, f: &'t JsFile) -> Option<(String, FuncInfo)> {
+pub(crate) fn enclosing_func<'t>(node: Node<'t>, f: &'t JsFile) -> Option<(String, FuncInfo)> {
     let mut anc = node.parent();
     while let Some(n) = anc {
         match n.kind() {
@@ -778,7 +778,7 @@ fn enclosing_func<'t>(node: Node<'t>, f: &'t JsFile) -> Option<(String, FuncInfo
                     })
                     .map(|info| (name, info));
             }
-            "arrow_function" | "function" => {
+            "arrow_function" | "function_expression" => {
                 // Name comes from an enclosing variable_declarator or
                 // pair; walk up to find it.
                 let mut up = n.parent();
@@ -870,7 +870,7 @@ fn dyn_sites(f: &JsFile) -> Vec<DynSite> {
 /// bare/external specs. Mirrors strand-import's JS resolution:
 /// `./`,`../` resolve against the importer's dir; other path-like
 /// specs try project-root relative.
-fn resolve_spec(importer_rel: &str, spec: &str, names: &BTreeSet<String>) -> Option<String> {
+pub(crate) fn resolve_spec(importer_rel: &str, spec: &str, names: &BTreeSet<String>) -> Option<String> {
     use strand_import::scan::{normalize_rel, resolve_js};
     let parent = importer_rel
         .rsplit_once('/')
@@ -888,7 +888,7 @@ fn resolve_spec(importer_rel: &str, spec: &str, names: &BTreeSet<String>) -> Opt
 }
 
 /// (module_rel, func) candidates a call's callee may invoke.
-fn call_targets(
+pub(crate) fn call_targets(
     func_node: Node,
     rbind: &HashMap<String, (String, Option<String>)>,
     f: &JsFile,
@@ -927,7 +927,7 @@ fn call_targets(
 }
 
 /// Module file a member-expression object refers to.
-fn object_module(
+pub(crate) fn object_module(
     obj: Node,
     rbind: &HashMap<String, (String, Option<String>)>,
     f: &JsFile,
@@ -1250,6 +1250,19 @@ mod tests {
         ]);
         assert!(out.edges.is_empty());
         assert_eq!(out.unresolved.len(), 1);
+    }
+
+    #[test]
+    fn function_expression_declarator() {
+        // `const f = function(){}` must register as a callable func
+        // (tree-sitter names it function_expression, not "function").
+        let (out, _) = analyze(&[
+            ("loader.js", "const load = function(name){\n  return require('./plugins/' + name);\n};\nmodule.exports = {load};\n"),
+            ("app.js", "const {load} = require('./loader');\nload('ldap');\n"),
+            ("plugins/ldap.js", ""),
+        ]);
+        assert_eq!(out.edges.len(), 1, "edges: {:?} unres: {:?}", out.edges, out.unresolved);
+        assert_eq!(out.edges[0].1, "plugins/ldap.js");
     }
 
     #[test]

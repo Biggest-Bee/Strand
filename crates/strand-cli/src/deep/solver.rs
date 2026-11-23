@@ -114,7 +114,7 @@ fn func_node<'t>(f: &'t PyFile, r: &FuncRef) -> Option<Node<'t>> {
 
 /// Iterative Tarjan SCC. Returns components in reverse topological
 /// order already? No - returns in Tarjan order; we sort by finish.
-fn tarjan_scc(nodes: &HashSet<NodeId>, adj: &HashMap<NodeId, Vec<NodeId>>) -> Vec<Vec<NodeId>> {
+pub(crate) fn tarjan_scc(nodes: &HashSet<NodeId>, adj: &HashMap<NodeId, Vec<NodeId>>) -> Vec<Vec<NodeId>> {
     // Iterative Tarjan.
     struct Frame {
         node: NodeId,
@@ -193,7 +193,7 @@ fn tarjan_scc(nodes: &HashSet<NodeId>, adj: &HashMap<NodeId, Vec<NodeId>>) -> Ve
 /// topo order already (sinks first) for this formulation - but we
 /// verify by sorting on a computed finish order. Safer: build cond
 /// graph and Kahn it.
-fn order_sccs(
+pub(crate) fn order_sccs(
     sccs: Vec<Vec<NodeId>>,
     adj: &HashMap<NodeId, Vec<NodeId>>,
 ) -> Vec<Vec<NodeId>> {

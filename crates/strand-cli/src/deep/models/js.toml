@@ -1,0 +1,98 @@
+# JavaScript/TypeScript taint/null/leak model - defaults for strand deep.
+# Dotted names resolve through require/import bindings, so
+# `const {exec} = require('child_process')` matches "child_process.exec".
+
+[[sources]]
+kind = "env"
+names = ["process.env"]
+
+[[sources]]
+kind = "argv"
+names = ["process.argv"]
+
+[[sources]]
+kind = "stdin"
+names = ["process.stdin", "readline"]
+
+[[sources]]
+kind = "file"
+names = ["fs.readFileSync", "fs.readFile", "fs.promises.readFile", "fs.createReadStream", "fs.readFileSync.promise"]
+
+[[sources]]
+kind = "net"
+names = ["fetch", "axios.get", "axios.post", "http.get", "https.get", "http.request", "https.request", "request"]
+
+[[sanitizers]]
+names = ["parseInt", "Number", "encodeURIComponent", "encodeURI", "escape"]
+
+[[sinks]]
+name = "eval"
+class = "code_exec"
+arg = 0
+
+[[sinks]]
+name = "Function"
+class = "code_exec"
+arg = 0
+
+[[sinks]]
+name = "setTimeout"
+class = "code_exec"
+arg = 0
+
+[[sinks]]
+name = "setInterval"
+class = "code_exec"
+arg = 0
+
+[[sinks]]
+name = "vm.runInThisContext"
+class = "code_exec"
+arg = 0
+
+[[sinks]]
+name = "vm.runInNewContext"
+class = "code_exec"
+arg = 0
+
+[[sinks]]
+name = "vm.runInContext"
+class = "code_exec"
+arg = 0
+
+[[sinks]]
+name = "child_process.exec"
+class = "shell"
+arg = 0
+
+[[sinks]]
+name = "child_process.execSync"
+class = "shell"
+arg = 0
+
+[[sinks]]
+name = "child_process.spawn"
+class = "shell"
+arg = 0
+
+[[sinks]]
+name = "child_process.spawnSync"
+class = "shell"
+arg = 0
+
+[[sinks]]
+name = "child_process.execFile"
+class = "shell"
+arg = 0
+
+[[sinks]]
+name = "child_process.execFileSync"
+class = "shell"
+arg = 0
+
+[[sinks]]
+name = "v8.deserialize"
+class = "deser"
+arg = 0
+
+propagators = ["JSON.stringify", "Buffer.from"]

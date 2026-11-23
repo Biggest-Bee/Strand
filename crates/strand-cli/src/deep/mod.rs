@@ -4,7 +4,9 @@
 
 pub mod callgraph;
 pub mod facts;
+pub mod facts_js;
 pub mod ipa;
 pub mod js_ipa;
 pub mod models;
 pub mod solver;
+pub mod solver_js;

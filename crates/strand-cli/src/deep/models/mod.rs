@@ -146,3 +146,9 @@ pub fn python_default() -> Result<Model, String> {
     toml::from_str(include_str!("python.toml"))
         .map_err(|e| format!("embedded python.toml: {e}"))
 }
+
+/// Parse the embedded JS/TS default model.
+pub fn js_default() -> Result<Model, String> {
+    toml::from_str(include_str!("js.toml"))
+        .map_err(|e| format!("embedded js.toml: {e}"))
+}

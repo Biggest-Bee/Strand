@@ -86,13 +86,13 @@ impl Summary {
 /// Per-variable state.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VarState {
-    taint: Option<String>,
-    is_none: bool,
-    resource: Option<String>,
+    pub(crate) taint: Option<String>,
+    pub(crate) is_none: bool,
+    pub(crate) resource: Option<String>,
 }
 
 impl VarState {
-    fn join(&mut self, other: &VarState) {
+    pub(crate) fn join(&mut self, other: &VarState) {
         if self.taint.is_none() {
             self.taint = other.taint.clone();
         }

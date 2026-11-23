@@ -906,6 +906,34 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
         }
     }
 
+    // JS/TS files: parsed once here, shared by `--analyze` (JS
+    // solver) and JS IPA below. JS trees aren't shared by the scan
+    // (only Python trees are), so JS files parse on demand;
+    // projects without JS pay nothing.
+    let js_names: BTreeSet<String> = scan
+        .nodes
+        .iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".json")
+                || strand_import::scan::JS_EXTS
+                    .iter()
+                    .any(|e| l.ends_with(&format!(".{e}")))
+        })
+        .cloned()
+        .collect();
+    // .json stays in js_names (IPA resolution target) but is not
+    // parsed as JS - it is data, not a module.
+    let js_files: Vec<(String, PathBuf)> = js_names
+        .iter()
+        .filter(|n| !n.to_lowercase().ends_with(".json"))
+        .map(|n| (n.clone(), root.join(n)))
+        .collect();
+    let js_parsed: Vec<deep::js_ipa::JsFile> = deep::js_ipa::analyze_files(&js_files)
+        .into_iter()
+        .filter_map(|(_, f)| f)
+        .collect();
+
     if a.analyze {
         let model = match &a.models {
             Some(dir) => {
@@ -960,34 +988,58 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
         // Summaries are dead weight until process exit; skipping the
         // drop saves teardown time on large repos (deep_exit reclaims).
         std::mem::forget(sol);
+
+        // JS/TS solver: same Summary engine over JsFiles with the
+        // js.toml model. Skipped entirely for Python-only projects.
+        if !js_parsed.is_empty() {
+            let js_model = match &a.models {
+                Some(dir) => {
+                    let models = models::load_dir(dir)
+                        .map_err(strand_core::Error::Usage)?;
+                    models
+                        .get("js")
+                        .or_else(|| models.get("javascript"))
+                        .cloned()
+                        .or_else(|| models::js_default().ok())
+                        .ok_or_else(|| {
+                            strand_core::Error::Usage("no js model".to_string())
+                        })?
+                }
+                None => models::js_default()
+                    .map_err(strand_core::Error::Usage)?,
+            };
+            let t_js = std::time::Instant::now();
+            let jsol = deep::solver_js::solve_js(&js_parsed, &js_names, &js_model);
+            eprintln!(
+                "js solve: {} functions, {} SCCs ({} cyclic), {} iters, {} findings ({:.1?})",
+                jsol.stats.functions,
+                jsol.stats.sccs,
+                jsol.stats.cyclic_sccs,
+                jsol.stats.fixpoint_iters,
+                jsol.stats.findings,
+                t_js.elapsed()
+            );
+            for f in &jsol.findings {
+                println!(
+                    "[{:?}] {}:{} {} - {} (via {}) [{:.0}%]",
+                    f.class,
+                    f.file,
+                    f.line,
+                    f.sink,
+                    f.source,
+                    f.via.join(" -> "),
+                    f.confidence * 100.0
+                );
+            }
+            std::mem::forget(jsol);
+        }
     }
 
     let t_ipa = std::time::Instant::now();
     let mut res = ipa::analyze_parsed(&parsed, &file_set);
 
-    // JS/TS dynamic import()/require() IPA. JS trees aren't shared
-    // by the scan (only Python trees are), so JS files parse here;
-    // projects without JS pay nothing.
-    let js_names: BTreeSet<String> = scan
-        .nodes
-        .iter()
-        .filter(|n| {
-            let l = n.to_lowercase();
-            l.ends_with(".json")
-                || strand_import::scan::JS_EXTS
-                    .iter()
-                    .any(|e| l.ends_with(&format!(".{e}")))
-        })
-        .cloned()
-        .collect();
-    let js_files: Vec<(String, PathBuf)> = js_names
-        .iter()
-        .map(|n| (n.clone(), root.join(n)))
-        .collect();
-    let js_parsed: Vec<deep::js_ipa::JsFile> = deep::js_ipa::analyze_files(&js_files)
-        .into_iter()
-        .filter_map(|(_, f)| f)
-        .collect();
+    // JS/TS dynamic import()/require() IPA reuses js_parsed (built
+    // above for --analyze); projects without JS pay nothing.
     if !js_parsed.is_empty() {
         let t_js = std::time::Instant::now();
         let js_res = deep::js_ipa::analyze_js_parsed(&js_parsed, &js_names);
