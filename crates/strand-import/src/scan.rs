@@ -154,14 +154,26 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
     let mut lock_nodes: HashMap<&'static str, HashMap<String, Vec<String>>> =
         HashMap::new();
     for (rel, abs) in &lock_files {
+        // bun.lockb is binary: parse it from raw bytes instead of
+        // the text path used by every other lockfile.
         if abs
             .file_name()
             .map(|n| n.to_string_lossy().ends_with(".lockb"))
             .unwrap_or(false)
         {
-            warnings.push(format!(
-                "{rel}: binary lockfile (bun.lockb); regenerate with `bun install` to produce bun.lock"
-            ));
+            match fs::read(abs).map(|b| crate::locks::bun_lockb(&b)) {
+                Ok(Ok(es)) => ingest_lock_edges(
+                    rel,
+                    es,
+                    Some("npm"),
+                    false,
+                    &mut nodes,
+                    &mut edges,
+                    &mut lock_nodes,
+                ),
+                Ok(Err(e)) => warnings.push(format!("{rel}: bun.lockb parse: {e}")),
+                Err(e) => warnings.push(format!("{rel}: bun.lockb read: {e}")),
+            }
             continue;
         }
         let Ok(text) = fs::read_to_string(abs) else {
@@ -169,34 +181,15 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         };
         let fmt = crate::detect_format(abs, &text);
         match crate::parse(&text, fmt) {
-            Ok(mut es) => {
-                // Flat lockfiles (no inter-package edges) emit
-                // `(lockfile) -> pkg` edges; point them at this
-                // lockfile's rel path.
-                if is_flat_lock(fmt) {
-                    for e in &mut es {
-                        if e.0 == crate::locks::FLAT_SRC {
-                            e.0 = rel.clone();
-                        }
-                    }
-                }
-                let group = lock_group(fmt);
-                for (s, d, _, _) in &es {
-                    nodes.push(s.clone());
-                    nodes.push(d.clone());
-                    if let Some(g) = group {
-                        for n in [s, d] {
-                            lock_nodes
-                                .entry(g)
-                                .or_default()
-                                .entry(lock_node_name(n).to_lowercase())
-                                .or_default()
-                                .push(n.clone());
-                        }
-                    }
-                }
-                edges.extend(es);
-            }
+            Ok(es) => ingest_lock_edges(
+                rel,
+                es,
+                lock_group(fmt),
+                is_flat_lock(fmt),
+                &mut nodes,
+                &mut edges,
+                &mut lock_nodes,
+            ),
             Err(e) => warnings.push(format!("{rel}: lockfile parse: {e}")),
         }
     }
@@ -254,6 +247,43 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         nodes,
         warnings,
     })
+}
+
+/// Merge parsed lockfile edges into the scan: rewrite flat
+/// `(lockfile)` srcs to the lockfile's rel path, register nodes,
+/// and index `name@version` ids for manifest bridging.
+#[allow(clippy::too_many_arguments)]
+fn ingest_lock_edges(
+    rel: &str,
+    mut es: EdgeList,
+    group: Option<&'static str>,
+    flat: bool,
+    nodes: &mut Vec<String>,
+    edges: &mut EdgeList,
+    lock_nodes: &mut HashMap<&'static str, HashMap<String, Vec<String>>>,
+) {
+    if flat {
+        for e in &mut es {
+            if e.0 == crate::locks::FLAT_SRC {
+                e.0 = rel.to_string();
+            }
+        }
+    }
+    for (s, d, _, _) in &es {
+        nodes.push(s.clone());
+        nodes.push(d.clone());
+        if let Some(g) = group {
+            for n in [s, d] {
+                lock_nodes
+                    .entry(g)
+                    .or_default()
+                    .entry(lock_node_name(n).to_lowercase())
+                    .or_default()
+                    .push(n.clone());
+            }
+        }
+    }
+    edges.extend(es);
 }
 
 /// Ecosystem group a lockfile format feeds manifest bridging.
@@ -327,8 +357,25 @@ fn manifest_group(src: &str) -> Option<&'static str> {
 /// `@scope/name@1.2.3` -> `@scope/name`).
 fn lock_node_name(node: &str) -> &str {
     if let Some(i) = node.rfind('@') {
-        if i > 0 && node[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            return &node[..i];
+        if i > 0 {
+            let rest = &node[i + 1..];
+            let first = rest.chars().next().unwrap_or('\0');
+            // Semver pin: `name@1.2.3`.
+            if first.is_ascii_digit() {
+                return &node[..i];
+            }
+            // Non-semver source specs: `name@workspace:path`,
+            // `name@github:o/r#sha`, `name@git+https://...`.
+            // Package names never contain these prefixes, so the
+            // `@` here separates name from source, not scope.
+            const SRC_PREFIXES: [&str; 11] = [
+                "workspace:", "git+", "git:", "github:", "gitlab:",
+                "http://", "https://", "link:", "file:", "portal:",
+                "npm:",
+            ];
+            if SRC_PREFIXES.iter().any(|p| rest.starts_with(p)) {
+                return &node[..i];
+            }
         }
     }
     // Space-separated `name version (source)` forms: name is first.

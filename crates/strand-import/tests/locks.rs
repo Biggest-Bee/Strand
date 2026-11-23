@@ -677,3 +677,106 @@ fn flake_lock_inputs() {
     assert!(e.contains(&("nixpkgs".into(), "NixOS/nixpkgs".into())));
     assert!(e.contains(&("flake-utils".into(), "numtide/flake-utils".into())));
 }
+
+#[test]
+fn bun_lockb_binary() {
+    // Minimal format-v2 fixture: root package + lodash, root deps
+    // on lodash through one dependency record resolved to index 1.
+    let header = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
+    let list_len = 2usize;
+    let begin_at = header.len() + 4 + 32 + 8 * 6;
+    let col_bytes = list_len * (8 + 8 + 64 + 8 + 8 + 88 + 20 + 48);
+    let end_at = begin_at + col_bytes;
+    let base = end_at + 6 * 16;
+    let total = base + 4 + 26;
+
+    let mut b = Vec::with_capacity(total);
+    b.extend_from_slice(header);
+    b.extend_from_slice(&2u32.to_le_bytes()); // format v2
+    b.extend_from_slice(&[0u8; 32]); // meta hash
+    b.extend_from_slice(&(total as u64).to_le_bytes());
+    b.extend_from_slice(&(list_len as u64).to_le_bytes());
+    b.extend_from_slice(&8u64.to_le_bytes()); // input alignment
+    b.extend_from_slice(&8u64.to_le_bytes()); // field count
+    b.extend_from_slice(&(begin_at as u64).to_le_bytes());
+    b.extend_from_slice(&(end_at as u64).to_le_bytes());
+    assert_eq!(b.len(), begin_at);
+
+    let inl = |s: &str| {
+        let mut a = [0u8; 8];
+        a[..s.len()].copy_from_slice(s.as_bytes());
+        a
+    };
+    // name column: inline string refs
+    b.extend_from_slice(&inl("my-app"));
+    b.extend_from_slice(&inl("lodash"));
+    // name_hash column
+    b.extend_from_slice(&[0u8; 16]);
+    // resolution column: root = zeros, lodash = npm 4.17.21
+    b.extend_from_slice(&[0u8; 64]);
+    let mut res = [0u8; 64];
+    res[0] = 2; // npm tag
+    res[16..20].copy_from_slice(&4u32.to_le_bytes());
+    res[20..24].copy_from_slice(&17u32.to_le_bytes());
+    res[24..28].copy_from_slice(&21u32.to_le_bytes());
+    b.extend_from_slice(&res);
+    // dependencies column: pkg0 (start=0, count=1), pkg1 (0, 0)
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(&[0u8; 8]);
+    // resolutions column: 2 x 8 zeros (unused by parser)
+    b.extend_from_slice(&[0u8; 16]);
+    // meta 2x88, bin 2x20, scripts 2x48
+    b.extend_from_slice(&[0u8; 2 * 88]);
+    b.extend_from_slice(&[0u8; 2 * 20]);
+    b.extend_from_slice(&[0u8; 2 * 48]);
+    assert_eq!(b.len(), end_at);
+
+    // six buffer descriptors: trees, hoisted, resolutions,
+    // dependencies, extern_strings, string_bytes
+    let desc = |s: usize, e: usize, b: &mut Vec<u8>| {
+        b.extend_from_slice(&(s as u64).to_le_bytes());
+        b.extend_from_slice(&(e as u64).to_le_bytes());
+    };
+    desc(base, base, &mut b);
+    desc(base, base, &mut b);
+    desc(base, base + 4, &mut b); // resolutions u32[]
+    desc(base + 4, base + 30, &mut b); // dependency records
+    desc(base + 30, base + 30, &mut b); // extern_strings
+    desc(base + 30, base + 30, &mut b); // string_bytes
+    assert_eq!(b.len(), base);
+
+    // resolutions: record 0 -> package index 1
+    b.extend_from_slice(&1u32.to_le_bytes());
+    // one 26-byte dep record (content unused; resolutions[] rules)
+    let mut rec = [0u8; 26];
+    rec[..6].copy_from_slice(b"lodash");
+    rec[18..25].copy_from_slice(b"4.17.21");
+    b.extend_from_slice(&rec);
+    assert_eq!(b.len(), total);
+
+    let e = strand_import::locks::bun_lockb(&b).unwrap();
+    let has = |s: &str, d: &str| e.iter().any(|(a, b_, ..)| a == s && b_ == d);
+    assert!(has("my-app", "my-app"));
+    assert!(has("lodash@4.17.21", "lodash@4.17.21"));
+    assert!(has("package.json", "lodash@4.17.21"));
+}
+
+#[test]
+fn deno_lock_url_nodes() {
+    let text = r#"{
+      "version": "5",
+      "remote": {
+        "https://deno.land/std@0.224.0/http/server.ts": "abc",
+        "https://esm.sh/react@18.2.0/es2022/react.mjs": "def",
+        "https://jsr.io/@luca/flag/1.0.0/mod.ts": "ghi"
+      },
+      "npm": { "lodash@4.17.21": { "integrity": "x" } }
+    }"#;
+    let e = edges(text, Format::DenoLock);
+    let dsts: Vec<&str> = e.iter().map(|(_, d)| d.as_str()).collect();
+    assert!(dsts.contains(&"std@0.224.0"));
+    assert!(dsts.contains(&"react@18.2.0"));
+    assert!(dsts.contains(&"@luca/flag@1.0.0"));
+    assert!(dsts.contains(&"lodash@4.17.21"));
+}

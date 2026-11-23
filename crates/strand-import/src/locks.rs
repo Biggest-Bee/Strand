@@ -1691,6 +1691,38 @@ pub fn cartfile_resolved(text: &str) -> Result<EdgeList> {
 /// Parse `deno.lock` (JSON). `remote`/`npm`/`jsr`/`workspace`
 /// sections key resolved specifiers to integrity entries; emit each
 /// key as a node off [`FLAT_SRC`].
+/// Normalize a deno.lock specifier to `name@version` when it is a
+/// remote URL: `host/std@0.224.0/...` (deno.land), `esm.sh/pkg@1.2.3`,
+/// `jsr.io/@scope/pkg/1.0.0/...` (version as its own segment).
+/// Returns None for non-URL keys (npm/jsr/workspace entries are
+/// already emitted verbatim).
+fn deno_url_node(key: &str) -> Option<String> {
+    let rest = key
+        .strip_prefix("https://")
+        .or_else(|| key.strip_prefix("http://"))?;
+    let mut segs = rest.split('/');
+    segs.next()?; // host
+    let segs: Vec<&str> = segs.collect();
+    // Try joining 1-2 leading segments as the package specifier:
+    // `name@ver`, `@scope/name@ver`, `name/ver`, `@scope/name/ver`.
+    for w in 1..=2usize.min(segs.len()) {
+        let joined = segs[..w].join("/");
+        if let Some((n, v)) = joined.rsplit_once('@') {
+            if !n.is_empty()
+                && v.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                return Some(nv(n, v));
+            }
+        }
+        if w < segs.len()
+            && segs[w].chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return Some(nv(&joined, segs[w]));
+        }
+    }
+    None
+}
+
 pub fn deno_lock(text: &str) -> Result<EdgeList> {
     let v: serde_json::Value =
         serde_json::from_str(text).map_err(|e| err(format!("deno.lock: {e}")))?;
@@ -1706,6 +1738,18 @@ pub fn deno_lock(text: &str) -> Result<EdgeList> {
                         None,
                         strand_core::EdgeKind::Static,
                     ));
+                }
+                // Remote URLs also yield a normalized `name@version`
+                // node so they bridge with manifest deps.
+                if let Some(n) = deno_url_node(key) {
+                    if seen.insert(n.clone()) {
+                        edges.push((
+                            FLAT_SRC.to_string(),
+                            n,
+                            None,
+                            strand_core::EdgeKind::Static,
+                        ));
+                    }
                 }
             }
         }
@@ -1865,3 +1909,254 @@ pub fn flake_lock(text: &str) -> Result<EdgeList> {
     Ok(edges)
 }
   
+
+// ---------- bun.lockb (binary, format v2) ----------
+
+fn rd_u32(b: &[u8], p: &mut usize) -> Result<u32> {
+    let s = b
+        .get(*p..*p + 4)
+        .ok_or_else(|| err("bun.lockb: truncated u32"))?;
+    *p += 4;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn rd_u64(b: &[u8], p: &mut usize) -> Result<u64> {
+    let s = b
+        .get(*p..*p + 8)
+        .ok_or_else(|| err("bun.lockb: truncated u64"))?;
+    *p += 8;
+    Ok(u64::from_le_bytes(s.try_into().unwrap()))
+}
+
+/// Decode an 8-byte string reference: inline NUL-terminated ASCII
+/// when the high bit of byte 7 is clear, otherwise (offset, len)
+/// into the `string_bytes` buffer with the high bit set on len.
+fn lockb_str(r: &[u8], string_bytes: &[u8]) -> Result<String> {
+    if r.len() < 8 {
+        return Err(err("bun.lockb: short string ref"));
+    }
+    if r[7] & 0x80 == 0 {
+        let end = r.iter().position(|&c| c == 0).unwrap_or(r.len());
+        Ok(String::from_utf8_lossy(&r[..end]).into_owned())
+    } else {
+        let off = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+        let len = (u32::from_le_bytes([r[4], r[5], r[6], r[7]]) & 0x7fff_ffff) as usize;
+        let s = string_bytes
+            .get(off..off.saturating_add(len))
+            .ok_or_else(|| err("bun.lockb: string ref out of range"))?;
+        Ok(String::from_utf8_lossy(s).into_owned())
+    }
+}
+
+/// Decode a 64-byte resolution record into a version/source string.
+/// npm resolutions carry major/minor/patch u32s plus pre/build
+/// string refs; string kinds (folder, tarball, workspace, symlink,
+/// single-file) carry one string ref; git kinds carry
+/// owner/repo/commitish/resolved string refs.
+fn lockb_resolution(res: &[u8], string_bytes: &[u8]) -> Result<String> {
+    if res.len() < 64 {
+        return Err(err("bun.lockb: short resolution"));
+    }
+    match res[0] {
+        // npm: url string @8 (skipped), version u32s @16/20/24,
+        // pad @28, pre str @32, build str @48.
+        2 => {
+            let u32at = |o: usize| -> Result<u32> {
+                let s = res
+                    .get(o..o + 4)
+                    .ok_or_else(|| err("bun.lockb: short resolution"))?;
+                Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+            };
+            let (major, minor, patch) = (u32at(16)?, u32at(20)?, u32at(24)?);
+            let pre = lockb_str(&res[32..40], string_bytes)?;
+            let build = lockb_str(&res[48..56], string_bytes)?;
+            let mut v = format!("{major}.{minor}.{patch}");
+            if !pre.is_empty() {
+                v.push('-');
+                v.push_str(&pre);
+            }
+            if !build.is_empty() {
+                v.push('+');
+                v.push_str(&build);
+            }
+            Ok(v)
+        }
+        // folder=4, local_tarball=8, github=16, gitlab=24, git=32,
+        // symlink=64, workspace=72, remote_tarball=80,
+        // single_file_module=100.
+        4 | 8 | 64 | 72 | 80 | 100 => {
+            let s = lockb_str(&res[8..16], string_bytes)?;
+            Ok(match res[0] {
+                72 => format!("workspace:{s}"),
+                64 => format!("link:{s}"),
+                100 => format!("module:{s}"),
+                _ => s,
+            })
+        }
+        16 | 24 | 32 => {
+            let owner = lockb_str(&res[8..16], string_bytes)?;
+            let repo = lockb_str(&res[16..24], string_bytes)?;
+            let commitish = lockb_str(&res[24..32], string_bytes)?;
+            let resolved = lockb_str(&res[32..40], string_bytes)?;
+            let mut out = match res[0] {
+                16 => "github:".to_string(),
+                24 => "gitlab:".to_string(),
+                _ => "git+".to_string(),
+            };
+            if !owner.is_empty() {
+                out.push_str(&owner);
+                out.push('/');
+            }
+            out.push_str(&repo);
+            let sha = if !resolved.is_empty() { &resolved } else { &commitish };
+            if !sha.is_empty() {
+                out.push('#');
+                out.push_str(sha);
+            }
+            Ok(out)
+        }
+        // root=1, uninitialized=0: no version info.
+        _ => Ok(String::new()),
+    }
+}
+
+/// Parse `bun.lockb` (Bun's binary lockfile, format v2). The file
+/// is a columnar package table plus string table; each package's
+/// dependency records resolve through a global `resolutions` u32
+/// array to package indices, so real transitive edges are emitted.
+/// Root (index 0) deps hang off `package.json`, matching the text
+/// `bun.lock` workspace convention.
+pub fn bun_lockb(bytes: &[u8]) -> Result<EdgeList> {
+    const HEADER: &[u8] = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
+    if !bytes.starts_with(HEADER) {
+        return Err(err("bun.lockb: missing header magic"));
+    }
+    let mut pos = HEADER.len();
+    let format = rd_u32(bytes, &mut pos)?;
+    if format != 2 {
+        return Err(err(format!(
+            "bun.lockb: unsupported format version {format}"
+        )));
+    }
+    pos += 32; // meta hash
+    let _end = rd_u64(bytes, &mut pos)?;
+    let list_len = rd_u64(bytes, &mut pos)? as usize;
+    let align = rd_u64(bytes, &mut pos)?;
+    let field_count = rd_u64(bytes, &mut pos)?;
+    let begin_at = rd_u64(bytes, &mut pos)? as usize;
+    let end_at = rd_u64(bytes, &mut pos)? as usize;
+    if align != 8 || field_count != 8 {
+        return Err(err("bun.lockb: unexpected table shape"));
+    }
+    if list_len == 0
+        || list_len > 1_000_000
+        || begin_at >= end_at
+        || end_at > bytes.len()
+    {
+        return Err(err("bun.lockb: invalid package table range"));
+    }
+
+    // Column layout: 8 fields of fixed per-item sizes in order
+    // name(8), name_hash(8), resolution(64), dependencies(8),
+    // resolutions(8), meta(88), bin(20), scripts(48).
+    const SIZES: [usize; 8] = [8, 8, 64, 8, 8, 88, 20, 48];
+    let mut col: [usize; 8] = [0; 8];
+    let mut off = begin_at;
+    for (f, &sz) in SIZES.iter().enumerate() {
+        col[f] = off;
+        off += sz * list_len;
+    }
+    if off > end_at {
+        return Err(err("bun.lockb: package table overlaps buffers"));
+    }
+    let item = |f: usize, i: usize, n: usize| -> Result<&[u8]> {
+        bytes
+            .get(col[f] + i * SIZES[f]..col[f] + i * SIZES[f] + n)
+            .ok_or_else(|| err("bun.lockb: package table out of range"))
+    };
+
+    // Six buffers follow the table, each described by absolute
+    // (start, end) u64 offsets: trees, hoisted_dependencies,
+    // resolutions(u32[]), dependencies(26B records), extern_strings,
+    // string_bytes.
+    let mut bpos = end_at;
+    let mut bufs: Vec<&[u8]> = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let s = rd_u64(bytes, &mut bpos)? as usize;
+        let e = rd_u64(bytes, &mut bpos)? as usize;
+        bufs.push(
+            bytes
+                .get(s..e)
+                .ok_or_else(|| err("bun.lockb: buffer out of range"))?,
+        );
+    }
+    let res_buf = bufs[2];
+    // bufs[3] is the dependency record table; record k's target is
+    // resolutions[k], so the records themselves are not needed.
+    let string_bytes = bufs[5];
+
+    let resolutions: Vec<u32> = res_buf
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // Node id per package index.
+    let mut nodes: Vec<String> = Vec::with_capacity(list_len);
+    for i in 0..list_len {
+        let name = lockb_str(item(0, i, 8)?, string_bytes)?;
+        let ver = lockb_resolution(item(2, i, 64)?, string_bytes)?;
+        nodes.push(nv(&name, &ver));
+    }
+
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+
+    // Self-loop declarations so leaf packages still appear.
+    for n in &nodes {
+        if !n.is_empty() && seen.insert((n.clone(), n.clone())) {
+            edges.push((n.clone(), n.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+
+    // Dependency records: package i's `dependencies` field is
+    // (start record, count); record k resolves to package index
+    // resolutions[k]. Record layout: name str(8) + name_hash(8) +
+    // behavior(1) + tag(1) + literal str(8) = 26 bytes.
+    for i in 0..list_len {
+        if nodes[i].is_empty() {
+            continue;
+        }
+        let src = if i == 0 {
+            "package.json".to_string()
+        } else {
+            nodes[i].clone()
+        };
+        let f = item(3, i, 8)?;
+        let start = u32::from_le_bytes([f[0], f[1], f[2], f[3]]) as usize;
+        let count = u32::from_le_bytes([f[4], f[5], f[6], f[7]]) as usize;
+        for j in 0..count {
+            let k = start + j;
+            let Some(&dst_idx) = resolutions.get(k) else { break };
+            let dst_idx = dst_idx as usize;
+            if dst_idx == 0 || dst_idx >= list_len || dst_idx == i {
+                continue;
+            }
+            let dst = &nodes[dst_idx];
+            if dst.is_empty() {
+                continue;
+            }
+            if seen.insert((src.clone(), dst.clone())) {
+                edges.push((
+                    src.clone(),
+                    dst.clone(),
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("bun.lockb: no packages found"));
+    }
+    Ok(edges)
+}
