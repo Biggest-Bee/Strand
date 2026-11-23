@@ -16,6 +16,11 @@ use strand_core::EdgeKind;
 use crate::EdgeList;
 use crate::locks::{nv, split_nv};
 
+/// User home directory (`USERPROFILE`/`HOME`).
+pub fn home_dir_public() -> Option<PathBuf> {
+    home_dir()
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -70,6 +75,7 @@ struct Probe {
     /// bare dep name -> locked node ids, for versionless deps.
     known: BTreeMap<String, BTreeSet<String>>,
     visited: BTreeSet<String>,
+    bare_of: fn(&str) -> String,
 }
 
 impl Probe {
@@ -84,6 +90,7 @@ impl Probe {
             declared: seed.iter().cloned().collect(),
             known,
             visited: BTreeSet::new(),
+            bare_of,
         }
     }
 
@@ -130,10 +137,11 @@ impl Probe {
     }
 
     /// Register a discovered pinned node so later versionless deps
-    /// resolve to it and BFS can visit it.
+    /// resolve to it and BFS can visit it. The known-map key uses the
+    /// same normalization as the seeds (`bare_of`).
     fn learn(&mut self, node: &str) {
-        let (n, _) = split_nv(node);
-        self.known.entry(n.to_string()).or_default().insert(node.to_string());
+        let key = (self.bare_of)(node);
+        self.known.entry(key).or_default().insert(node.to_string());
         self.declared.insert(node.to_string());
     }
 
@@ -686,6 +694,536 @@ pub fn carthage_checkout_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList
                 }
             };
             for dst in dsts {
+                probe.edge(&coord, dst.clone());
+                if split_name_ver(&dst).is_some() && !probe.visited.contains(&dst) {
+                    queue.push(dst);
+                }
+            }
+        }
+    }
+    probe.finish()
+}
+
+// ---------- stack (Haskell pkgdb) ----------
+
+/// One installed-package `.conf` record: `(name, version)` plus its
+/// `depends:` entries.
+struct PkgConf {
+    name: String,
+    ver: String,
+    deps: Vec<String>,
+    path: PathBuf,
+}
+
+/// Parse a Cabal installed-package `.conf`: `name:`, `version:`,
+/// `depends:` (comma-separated installed package ids).
+fn parse_pkg_conf(text: &str) -> PkgConf {
+    let mut name = String::new();
+    let mut ver = String::new();
+    let mut deps: Vec<String> = Vec::new();
+    let mut in_depends = false;
+    for line in text.lines() {
+        // Continuation lines of `depends:` are indented and carry no
+        // `field:` prefix; a new top-level `field:` ends the list.
+        let is_cont = line.starts_with(' ') || line.starts_with('\t');
+        let t = line.trim();
+        if !is_cont {
+            in_depends = false;
+        }
+        if in_depends && is_cont {
+            deps.extend(
+                t.split(',')
+                    .map(|d| d.trim().to_string())
+                    .filter(|d| !d.is_empty()),
+            );
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("name:") {
+            name = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("version:") {
+            ver = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("depends:") {
+            in_depends = true;
+            deps.extend(
+                v.split(',')
+                    .map(|d| d.trim().to_string())
+                    .filter(|d| !d.is_empty()),
+            );
+        }
+    }
+    PkgConf {
+        name,
+        ver,
+        deps,
+        path: PathBuf::new(),
+    }
+}
+
+/// Collect `.conf` files under `dir` (non-recursive).
+fn conf_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "conf") {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Bounded walk collecting directories named `pkgdb` (Stack/Cabal
+/// package databases sit at variable depths under snapshots and
+/// .stack-work install trees).
+fn find_pkgdbs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 5 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.file_name().is_some_and(|n| n == "pkgdb") {
+            out.push(p);
+            continue; // don't descend into pkgdb itself
+        }
+        find_pkgdbs(&p, depth + 1, out);
+    }
+}
+
+/// BFS `name@version` pins through Stack/Cabal package databases:
+/// snapshot pkgdbs at `~/.stack/snapshots/*/pkgdb` and project-local
+/// `.stack-work/install/*/*/pkgdb` hold `.conf` files whose
+/// `depends:` fields are real edges. Dep entries are installed
+/// package ids `name-version` possibly with a `-unithash` suffix;
+/// resolved by prefix match against the conf index.
+pub fn stack_pkgdb_edges(seed: &BTreeSet<String>, stack_home: &Path, project_root: &Path) -> EdgeList {
+    const MAX_PARSE: usize = 4000;
+    // Candidate pkgdb dirs. Snapshot layout is
+    // snapshots/<platform>/<ghc>/<hash>/pkgdb (variable depth), so
+    // walk it bounded like the install tree.
+    let mut pkgdbs: Vec<PathBuf> = Vec::new();
+    find_pkgdbs(&stack_home.join("snapshots"), 0, &mut pkgdbs);
+    find_pkgdbs(&stack_home.join("global-project/.stack-work/install"), 0, &mut pkgdbs);
+    // <project>/.stack-work/install/**/pkgdb - the install tree has
+    // variable depth (platform/ghc/hash), so walk it bounded.
+    find_pkgdbs(&project_root.join(".stack-work/install"), 0, &mut pkgdbs);
+
+    // Index every .conf by (name, version).
+    let mut confs: Vec<PkgConf> = Vec::new();
+    for dir in &pkgdbs {
+        let mut files = Vec::new();
+        conf_files(dir, &mut files);
+        for f in files {
+            if confs.len() >= MAX_PARSE {
+                break;
+            }
+            let Ok(text) = fs::read_to_string(&f) else { continue };
+            let mut c = parse_pkg_conf(&text);
+            if c.name.is_empty() {
+                continue;
+            }
+            c.path = f;
+            confs.push(c);
+        }
+    }
+    if confs.is_empty() {
+        return Vec::new();
+    }
+    // name-version -> conf index for dep-id resolution.
+    let id_of = |c: &PkgConf| -> String {
+        if c.ver.is_empty() {
+            c.name.clone()
+        } else {
+            format!("{}-{}", c.name, c.ver)
+        }
+    };
+    // dep entry `name-ver` or `name-ver-hash` -> matching confs.
+    let resolve_dep = |entry: &str| -> Vec<String> {
+        let mut hits: Vec<String> = Vec::new();
+        for c in &confs {
+            let id = id_of(c);
+            if entry == id || entry.starts_with(&format!("{id}-")) {
+                hits.push(nv(&c.name, &c.ver));
+            }
+        }
+        hits.sort();
+        hits.dedup();
+        hits
+    };
+
+    let mut probe = Probe::new(seed, |n| split_nv(n).0.to_lowercase());
+    let mut queue: Vec<String> = Vec::new();
+    for n in seed {
+        if split_name_ver(n).is_some() {
+            queue.push(n.clone());
+        }
+    }
+    let mut parsed = 0usize;
+    while let Some(node) = queue.pop() {
+        let Some((name, ver)) = split_name_ver(&node) else { continue };
+        let coord = node.clone();
+        if !probe.visited.insert(coord.clone()) {
+            continue;
+        }
+        if parsed >= MAX_PARSE {
+            break;
+        }
+        parsed += 1;
+        // Find the conf matching this pin.
+        let Some(c) = confs
+            .iter()
+            .find(|c| c.name == name && c.ver == ver)
+        else {
+            continue;
+        };
+        for dep in &c.deps {
+            for dst in resolve_dep(dep) {
+                probe.edge(&coord, dst.clone());
+                if split_name_ver(&dst).is_some() && !probe.visited.contains(&dst) {
+                    queue.push(dst);
+                }
+            }
+        }
+    }
+    probe.finish()
+}
+
+// ---------- erlang (_build .app files) ----------
+
+/// Extract the `{applications, [...]}` atom list from an `.app`
+/// file (Erlang term, usually one line).
+fn app_applications(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(i) = text.find("{applications,") else { return out };
+    let rest = &text[i + "{applications,".len()..];
+    let Some(bi) = rest.find('[') else { return out };
+    let after = &rest[bi + 1..];
+    let Some(ei) = after.find(']') else { return out };
+    for atom in after[..ei].split(',') {
+        let a = atom
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .trim();
+        if !a.is_empty()
+            && a.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !matches!(a, "kernel" | "stdlib" | "compiler" | "syntax_tools" | "tools")
+        {
+            out.push(a.to_string());
+        }
+    }
+    out
+}
+
+/// BFS `name@version` pins through `_build/*/lib/<app>/ebin/*.app`:
+/// each app file's `applications` list is a real dep edge. Project-
+/// local; dep names resolve to lock pins by bare name.
+pub fn erlang_app_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
+    const MAX_PARSE: usize = 2000;
+    // Collect app files: _build/<profile>/lib/<app>/ebin/<app>.app
+    // (also _checkouts). Non-recursive walk of _build/*/lib/*/ebin.
+    let mut apps: Vec<(String, PathBuf)> = Vec::new(); // (app name, .app path)
+    for profile_dir in ["_build/default/lib", "_build/test/lib", "_build/prod/lib"] {
+        let lib = root.join(profile_dir);
+        if let Ok(lib_entries) = fs::read_dir(&lib) {
+            for app_dir in lib_entries.flatten() {
+                let ebin = app_dir.path().join("ebin");
+                if let Ok(files) = fs::read_dir(&ebin) {
+                    for f in files.flatten() {
+                        let p = f.path();
+                        if p.extension().is_some_and(|x| x == "app") {
+                            let name = p
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            apps.push((name, p));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if apps.is_empty() {
+        return Vec::new();
+    }
+    // Parse each .app once: name -> applications.
+    let mut app_deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, path) in &apps {
+        if app_deps.len() >= MAX_PARSE {
+            break;
+        }
+        if let Ok(text) = fs::read_to_string(path) {
+            app_deps.insert(name.clone(), app_applications(&text));
+        }
+    }
+
+    let mut probe = Probe::new(seed, |n| split_nv(n).0.to_lowercase());
+    let mut queue: Vec<String> = Vec::new();
+    for n in seed {
+        if split_name_ver(n).is_some() {
+            queue.push(n.clone());
+        }
+    }
+    let mut parsed = 0usize;
+    while let Some(node) = queue.pop() {
+        let Some((app, _ver)) = split_name_ver(&node) else { continue };
+        let coord = node.clone();
+        if !probe.visited.insert(coord.clone()) {
+            continue;
+        }
+        if parsed >= MAX_PARSE {
+            break;
+        }
+        parsed += 1;
+        let Some(deps) = app_deps.get(&app.to_lowercase()).cloned() else {
+            continue;
+        };
+        for dep in deps {
+            for dst in probe.resolve(&dep.to_lowercase()) {
+                probe.edge(&coord, dst.clone());
+                if split_name_ver(&dst).is_some() && !probe.visited.contains(&dst) {
+                    queue.push(dst);
+                }
+            }
+        }
+    }
+    probe.finish()
+}
+
+// ---------- pip site-packages (venv dist-info) ----------
+
+/// PEP 503 normalize a distribution name.
+fn pep503(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c == '_' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Extract the package name from a `Requires-Dist:` value:
+/// `name (>=1.0); marker`, `name>=1.0`, `name; marker`,
+/// `name @ https://...` (direct ref -> None).
+fn requires_dist_name(req: &str) -> Option<String> {
+    let req = req.trim();
+    if req.contains(" @ ") {
+        return None;
+    }
+    let mut end = 0;
+    for (i, c) in req.char_indices() {
+        if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']') {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let name = req[..end].split('[').next().unwrap_or("").trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(pep503(name))
+    }
+}
+
+/// One installed dist-info record.
+struct DistInfo {
+    node: String,          // normname@version
+    deps: Vec<String>,     // normalized dep names
+}
+
+/// Parse a dist-info METADATA file.
+fn parse_dist_info(text: &str) -> Option<DistInfo> {
+    let mut name = String::new();
+    let mut ver = String::new();
+    let mut deps = Vec::new();
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("Name:") {
+            name = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Version:") {
+            ver = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Requires-Dist:") {
+            if let Some(d) = requires_dist_name(v) {
+                deps.push(d);
+            }
+        }
+    }
+    if name.is_empty() {
+        return None;
+    }
+    Some(DistInfo {
+        node: nv(&pep503(&name), &ver),
+        deps,
+    })
+}
+
+/// BFS python `name@version` pins through venv site-packages
+/// dist-info METADATA `Requires-Dist` fields. Checks `<root>/.venv`,
+/// `venv`, `env`, `.env` for `lib/python*/site-packages` and
+/// `Lib/site-packages` (Windows). Emits edges for every installed
+/// dist (the venv graph is real metadata), bounded.
+pub fn pip_site_packages_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
+    const MAX_PARSE: usize = 3000;
+    // Find site-packages dirs under candidate venvs.
+    let mut sp_dirs: Vec<PathBuf> = Vec::new();
+    for venv in [".venv", "venv", "env", ".env"] {
+        let v = root.join(venv);
+        // lib/python*/site-packages
+        let lib = v.join("lib");
+        if let Ok(py_dirs) = fs::read_dir(&lib) {
+            for py in py_dirs.flatten() {
+                let sp = py.path().join("site-packages");
+                if sp.is_dir() {
+                    sp_dirs.push(sp);
+                }
+            }
+        }
+        // Lib/site-packages (Windows layout).
+        let win = v.join("Lib/site-packages");
+        if win.is_dir() {
+            sp_dirs.push(win);
+        }
+    }
+    if sp_dirs.is_empty() {
+        return Vec::new();
+    }
+    // Index all dist-infos: normname -> node ids.
+    let mut infos: Vec<DistInfo> = Vec::new();
+    let mut known: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for dir in &sp_dirs {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for e in entries.flatten() {
+            if infos.len() >= MAX_PARSE {
+                break;
+            }
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let fname = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            if !fname.ends_with(".dist-info") {
+                continue;
+            }
+            let meta = p.join("METADATA");
+            let Ok(text) = fs::read_to_string(&meta) else { continue };
+            let Some(info) = parse_dist_info(&text) else { continue };
+            known
+                .entry(pep503(split_nv(&info.node).0))
+                .or_default()
+                .insert(info.node.clone());
+            infos.push(info);
+        }
+    }
+    if infos.is_empty() {
+        return Vec::new();
+    }
+    // Seed pins also join the known index so versionless Requires-
+    // Dist entries resolve to locked versions even when the dist
+    // isn't installed locally.
+    for n in seed {
+        let (nm, _) = split_nv(n);
+        known.entry(pep503(nm)).or_default().insert(n.clone());
+    }
+
+    let mut probe = Probe::new(seed, |n| pep503(split_nv(n).0));
+    // Merge discovered dist nodes into known.
+    for (k, vs) in &known {
+        probe.known.entry(k.clone()).or_default().extend(vs.iter().cloned());
+    }
+    let mut queue: Vec<String> = Vec::new();
+    for n in seed {
+        if split_name_ver(n).is_some() {
+            queue.push(n.clone());
+        }
+    }
+    // Also process every discovered dist-info node so transitive
+    // Requires-Dist chains are covered even beyond the seeds.
+    for info in &infos {
+        if split_name_ver(&info.node).is_some() {
+            queue.push(info.node.clone());
+        }
+    }
+    let mut parsed = 0usize;
+    while let Some(node) = queue.pop() {
+        if !probe.visited.insert(node.clone()) {
+            continue;
+        }
+        if parsed >= MAX_PARSE {
+            break;
+        }
+        parsed += 1;
+        let Some(info) = infos.iter().find(|i| i.node == node) else {
+            continue;
+        };
+        for dep in &info.deps {
+            for dst in probe.resolve(dep) {
+                probe.edge(&node, dst.clone());
+                if split_name_ver(&dst).is_some() && !probe.visited.contains(&dst) {
+                    queue.push(dst);
+                }
+            }
+        }
+    }
+    probe.finish()
+}
+
+// ---------- renv (R library DESCRIPTION files) ----------
+
+/// BFS `name@version` pins through a renv project library:
+/// `renv/library/<r-ver>/<pkg>/DESCRIPTION` files carry real
+/// Depends/Imports edges via [`crate::manifests::description_deps`].
+/// Project-local.
+pub fn renv_library_edges(seed: &BTreeSet<String>, root: &Path) -> EdgeList {
+    const MAX_PARSE: usize = 2000;
+    let lib = root.join("renv/library");
+    if !lib.is_dir() {
+        return Vec::new();
+    }
+    // renv/library/<R-version>/<pkg>/DESCRIPTION
+    let mut descs: Vec<(String, PathBuf)> = Vec::new(); // (pkg name, path)
+    if let Ok(rvers) = fs::read_dir(&lib) {
+        for rv in rvers.flatten() {
+            if let Ok(pkgs) = fs::read_dir(rv.path()) {
+                for p in pkgs.flatten() {
+                    let d = p.path().join("DESCRIPTION");
+                    if d.is_file() {
+                        let name = p.file_name().to_string_lossy().to_string();
+                        descs.push((name, d));
+                    }
+                }
+            }
+        }
+    }
+    if descs.is_empty() {
+        return Vec::new();
+    }
+    let mut probe = Probe::new(seed, |n| split_nv(n).0.to_lowercase());
+    let mut queue: Vec<String> = Vec::new();
+    for n in seed {
+        if split_name_ver(n).is_some() {
+            queue.push(n.clone());
+        }
+    }
+    let mut parsed = 0usize;
+    while let Some(node) = queue.pop() {
+        let Some((pkg, _ver)) = split_name_ver(&node) else { continue };
+        let coord = node.clone();
+        if !probe.visited.insert(coord.clone()) {
+            continue;
+        }
+        if parsed >= MAX_PARSE {
+            break;
+        }
+        parsed += 1;
+        let Some((_, desc)) = descs
+            .iter()
+            .find(|(n, _)| n.to_lowercase() == pkg.to_lowercase())
+        else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(desc) else { continue };
+        for dep in crate::manifests::description_deps(&text) {
+            for dst in probe.resolve(&dep.to_lowercase()) {
                 probe.edge(&coord, dst.clone());
                 if split_name_ver(&dst).is_some() && !probe.visited.contains(&dst) {
                     queue.push(dst);

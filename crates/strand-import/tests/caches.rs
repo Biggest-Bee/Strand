@@ -270,3 +270,115 @@ fn empty_cache_returns_empty() {
             .iter()
             .all(|(a, b, ..)| a == b));
 }
+
+#[test]
+fn pip_site_packages_dist_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let sp = dir
+        .path()
+        .join(".venv/lib/python3.11/site-packages");
+    let di = sp.join("requests-2.31.0.dist-info");
+    fs::create_dir_all(&di).unwrap();
+    fs::write(
+        di.join("METADATA"),
+        "Metadata-Version: 2.1\nName: requests\nVersion: 2.31.0\n\
+         Requires-Dist: charset_normalizer (<4,>=2)\n\
+         Requires-Dist: idna (<4,>=2.5)\n\
+         Requires-Dist: urllib3 (<3,>=1.21.1)\n\
+         Requires-Dist: certifi (>=2017.4.17)\n",
+    )
+    .unwrap();
+    let s = seeds(&[
+        "requests@2.31.0",
+        "urllib3@2.0.7",
+        "idna@3.6",
+        "certifi@2024.2.2",
+        "charset-normalizer@3.3.2",
+    ]);
+    let edges = strand_import::caches::pip_site_packages_edges(&s, dir.path());
+    assert!(has_edge(&edges, "requests@2.31.0", "urllib3@2.0.7"), "{edges:?}");
+    assert!(has_edge(&edges, "requests@2.31.0", "idna@3.6"), "{edges:?}");
+    assert!(has_edge(&edges, "requests@2.31.0", "certifi@2024.2.2"), "{edges:?}");
+    // charset_normalizer normalizes to charset-normalizer.
+    assert!(has_edge(&edges, "requests@2.31.0", "charset-normalizer@3.3.2"), "{edges:?}");
+}
+
+#[test]
+fn erlang_app_applications() {
+    let dir = tempfile::tempdir().unwrap();
+    let ebin = dir.path().join("_build/default/lib/cowboy/ebin");
+    fs::create_dir_all(&ebin).unwrap();
+    fs::write(
+        ebin.join("cowboy.app"),
+        "{application, cowboy,\n [{description, \"Small, fast, modern HTTP server.\"},\n  {vsn, \"2.10.0\"},\n  {registered, [cowboy_clock, cowboy_sup, cowboy_stream_h]},\n  {applications, [kernel, stdlib, cowlib, ranch]},\n  {modules, []}]}.\n",
+    )
+    .unwrap();
+    let s = seeds(&["cowboy@2.10.0", "cowlib@2.12.1", "ranch@2.1.0"]);
+    let edges = strand_import::caches::erlang_app_edges(&s, dir.path());
+    assert!(has_edge(&edges, "cowboy@2.10.0", "cowlib@2.12.1"), "{edges:?}");
+    assert!(has_edge(&edges, "cowboy@2.10.0", "ranch@2.1.0"), "{edges:?}");
+    // kernel/stdlib are OTP apps, filtered out.
+    assert!(!edges.iter().any(|(_, d, ..)| d == "kernel" || d == "stdlib"), "{edges:?}");
+}
+
+#[test]
+fn renv_library_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let desc = dir.path().join("renv/library/4.3.0/ggplot2");
+    fs::create_dir_all(&desc).unwrap();
+    fs::write(
+        desc.join("DESCRIPTION"),
+        "Package: ggplot2\nVersion: 3.5.0\nDepends: R (>= 3.3), scales (>= 1.2.0), gtable\nImports: grDevices, graphics, methods, stats, utils, lifecycle, rlang, glue\n",
+    )
+    .unwrap();
+    let s = seeds(&[
+        "ggplot2@3.5.0",
+        "scales@1.3.0",
+        "gtable@0.3.4",
+        "rlang@1.1.0",
+    ]);
+    let edges = strand_import::caches::renv_library_edges(&s, dir.path());
+    assert!(has_edge(&edges, "ggplot2@3.5.0", "scales@1.3.0"), "{edges:?}");
+    assert!(has_edge(&edges, "ggplot2@3.5.0", "gtable@0.3.4"), "{edges:?}");
+    assert!(has_edge(&edges, "ggplot2@3.5.0", "rlang@1.1.0"), "{edges:?}");
+}
+
+#[test]
+fn stack_pkgdb_conf_depends() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let pkgdb = home.path().join("snapshots/x86_64-linux/ghc-9.6.3/pkgdb");
+    fs::create_dir_all(&pkgdb).unwrap();
+    fs::write(
+        pkgdb.join("aeson-2.1.0.0-0123abcd.conf"),
+        "name: aeson\nversion: 2.1.0.0\ndepends: base-4.17.2.0-aaaabbbb,\n  text-2.0.2-ccccdddd,\n  vector-0.13.1.0-eeeeffff\n",
+    )
+    .unwrap();
+    fs::write(
+        pkgdb.join("base-4.17.2.0-aaaabbbb.conf"),
+        "name: base\nversion: 4.17.2.0\ndepends:\n",
+    )
+    .unwrap();
+    fs::write(
+        pkgdb.join("text-2.0.2-ccccdddd.conf"),
+        "name: text\nversion: 2.0.2\ndepends: base-4.17.2.0-aaaabbbb\n",
+    )
+    .unwrap();
+    fs::write(
+        pkgdb.join("vector-0.13.1.0-eeeeffff.conf"),
+        "name: vector\nversion: 0.13.1.0\ndepends:\n",
+    )
+    .unwrap();
+    let s = seeds(&[
+        "aeson@2.1.0.0",
+        "base@4.17.2.0",
+        "text@2.0.2",
+        "vector@0.13.1.0",
+    ]);
+    let edges = strand_import::caches::stack_pkgdb_edges(&s, home.path(), proj.path());
+    assert!(has_edge(&edges, "aeson@2.1.0.0", "base@4.17.2.0"), "{edges:?}");
+    assert!(has_edge(&edges, "aeson@2.1.0.0", "text@2.0.2"), "{edges:?}");
+    assert!(has_edge(&edges, "aeson@2.1.0.0", "vector@0.13.1.0"), "{edges:?}");
+    // Transitive: text -> base.
+    assert!(has_edge(&edges, "text@2.0.2", "base@4.17.2.0"), "{edges:?}");
+}

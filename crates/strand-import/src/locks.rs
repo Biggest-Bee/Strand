@@ -2437,3 +2437,345 @@ pub fn pom_deps(text: &str) -> Vec<(String, String, String)> {
     }
     out
 }
+
+// ---------- pdm.lock ----------
+
+/// PEP 503-style name normalization for index lookups.
+fn norm_dep_name(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c == '_' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Extract the package name from a PEP 508-ish requirement string:
+/// `name[extra] (>=1.0); marker` -> `name`. Direct references
+/// (`name @ url`) return None.
+fn pep508_name(req: &str) -> Option<String> {
+    let req = req.split(';').next().unwrap_or(req).trim();
+    // `name @ https://...` direct reference - skip.
+    if let Some(at) = req.find('@') {
+        let before = req[..at].trim_end();
+        if before
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']'))
+            && req[at + 1..].trim_start().starts_with("http")
+        {
+            return None;
+        }
+    }
+    let mut end = 0;
+    for (i, c) in req.char_indices() {
+        if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']') {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let name = req[..end]
+        .split('[')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(norm_dep_name(name))
+    }
+}
+
+/// `pdm.lock` (TOML): `[[package]]` entries with `name`, `version`,
+/// and `dependencies = ["req; marker", ...]` - real edges.
+pub fn pdm_lock(text: &str) -> Result<EdgeList> {
+    let doc: toml::Table =
+        toml::from_str(text).map_err(|e| err(format!("pdm.lock: {e}")))?;
+    let mut index = VerIndex::default();
+    let mut pkgs: Vec<(String, String, Vec<String>)> = Vec::new();
+    if let Some(arr) = doc.get("package").and_then(|p| p.as_array()) {
+        for p in arr {
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let node = nv(&norm_dep_name(name), ver);
+            index.add(&node);
+            let deps = p
+                .get("dependencies")
+                .and_then(|d| d.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            pkgs.push((node, name.to_string(), deps));
+        }
+    }
+    if pkgs.is_empty() {
+        return Err(err("pdm.lock: no packages found"));
+    }
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for (node, raw_name, deps) in &pkgs {
+        for d in deps {
+            let Some(dep) = pep508_name(d) else { continue };
+            if dep == norm_dep_name(raw_name) {
+                continue; // extras self-reference
+            }
+            for dst in index.resolve(&dep, &mut edges, &mut seen) {
+                if seen.insert((node.clone(), dst.clone())) {
+                    edges.push((node.clone(), dst, None, strand_core::EdgeKind::Static));
+                }
+            }
+        }
+        if seen.insert((node.clone(), node.clone())) {
+            edges.push((node.clone(), node.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+    Ok(edges)
+}
+
+// ---------- conda-lock.yml ----------
+
+/// `conda-lock.yml`: top-level `package:` sequence; each entry has
+/// `name`, `version`, `manager` and a `dependencies:` map of
+/// `name: constraint`. Constraint values are ranges, not pins, so
+/// dep names resolve through the lock's own name index.
+pub fn conda_lock(text: &str) -> Result<EdgeList> {
+    let doc: serde_yml::Value =
+        serde_yml::from_str(text).map_err(|e| err(format!("conda-lock.yml: {e}")))?;
+    let mut index = VerIndex::default();
+    let mut pkgs: Vec<(String, Vec<String>)> = Vec::new();
+    let push_pkg = |index: &mut VerIndex,
+                        pkgs: &mut Vec<(String, Vec<String>)>,
+                        p: &serde_yml::Value| {
+        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let ver = p.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() {
+            return;
+        }
+        let node = nv(name, ver);
+        index.add(&node);
+        let deps: Vec<String> = p
+            .get("dependencies")
+            .map(|d| match d {
+                serde_yml::Value::Mapping(m) => m
+                    .keys()
+                    .filter_map(|k| k.as_str().map(String::from))
+                    .collect(),
+                serde_yml::Value::Sequence(s) => s
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        pkgs.push((node, deps));
+    };
+    // `package:` may be a sequence (v1 unified) or a map keyed by
+    // name (older per-platform style).
+    match doc.get("package") {
+        Some(serde_yml::Value::Sequence(seq)) => {
+            for p in seq {
+                push_pkg(&mut index, &mut pkgs, p);
+            }
+        }
+        Some(serde_yml::Value::Mapping(map)) => {
+            for (name, entries) in map {
+                let Some(n) = name.as_str() else { continue };
+                if n.is_empty() {
+                    continue;
+                }
+                if let Some(seq) = entries.as_sequence() {
+                    for e in seq {
+                        let ver = e.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                        let node = nv(n, ver);
+                        index.add(&node);
+                        let deps: Vec<String> = e
+                            .get("dependencies")
+                            .map(|d| match d {
+                                serde_yml::Value::Mapping(m) => m
+                                    .keys()
+                                    .filter_map(|k| k.as_str().map(String::from))
+                                    .collect(),
+                                _ => Vec::new(),
+                            })
+                            .unwrap_or_default();
+                        pkgs.push((node, deps));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    if pkgs.is_empty() {
+        return Err(err("conda-lock.yml: no packages found"));
+    }
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for (node, deps) in &pkgs {
+        for d in deps {
+            let dep = norm_dep_name(d);
+            for dst in index.resolve(&dep, &mut edges, &mut seen) {
+                if seen.insert((node.clone(), dst.clone())) {
+                    edges.push((node.clone(), dst, None, strand_core::EdgeKind::Static));
+                }
+            }
+        }
+        if seen.insert((node.clone(), node.clone())) {
+            edges.push((node.clone(), node.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+    Ok(edges)
+}
+
+// ---------- Julia Manifest.toml ----------
+
+/// `Manifest.toml` (Julia): `[deps]` is a table of `Name -> {uuid,
+/// version, deps = ["DepName", ...]}`. `deps` entries are bare
+/// package names resolved through the manifest's own index.
+pub fn julia_manifest(text: &str) -> Result<EdgeList> {
+    let doc: toml::Table =
+        toml::from_str(text).map_err(|e| err(format!("Manifest.toml: {e}")))?;
+    let Some(deps_tbl) = doc.get("deps").and_then(|d| d.as_table()) else {
+        return Err(err("Manifest.toml: no [deps] table"));
+    };
+    let mut index = VerIndex::default();
+    let mut pkgs: Vec<(String, Vec<String>)> = Vec::new();
+    for (name, entry) in deps_tbl {
+        // `[[deps.X]]` yields an array-of-tables; `[deps.X]`
+        // yields a plain table. Normalize to the entry table.
+        let entry_tbl = entry
+            .as_table()
+            .or_else(|| entry.as_array().and_then(|a| a.first()).and_then(|v| v.as_table()));
+        let Some(entry_tbl) = entry_tbl else { continue };
+        let ver = entry_tbl.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        let node = nv(name, ver);
+        index.add(&node);
+        let deps: Vec<String> = entry_tbl
+            .get("deps")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        pkgs.push((node, deps));
+    }
+    if pkgs.is_empty() {
+        return Err(err("Manifest.toml: no packages found"));
+    }
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for (node, deps) in &pkgs {
+        for d in deps {
+            for dst in index.resolve(d, &mut edges, &mut seen) {
+                if seen.insert((node.clone(), dst.clone())) {
+                    edges.push((node.clone(), dst, None, strand_core::EdgeKind::Static));
+                }
+            }
+        }
+        if seen.insert((node.clone(), node.clone())) {
+            edges.push((node.clone(), node.clone(), None, strand_core::EdgeKind::Static));
+        }
+    }
+    Ok(edges)
+}
+
+// ---------- rebar.lock ----------
+
+/// `rebar.lock` (Erlang/rebar3): `{"1.2.0", [{Name,{pkg,Name,Vsn},
+/// Level}, ...]}.` - the modern format records pins but no dep
+/// edges (the `_build` `.app` probe in caches.rs recovers them).
+/// Emits `name@version` nodes; git/hg entries get `name@git:<sha>`
+/// or bare `name`.
+pub fn rebar_lock(text: &str) -> Result<EdgeList> {
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("{pkg,") {
+        let after = &rest[i + 5..];
+        let Some(close) = after.find('}') else { break };
+        let inner = &after[..close];
+        let mut parts = inner.split(',');
+        let unq = |p: &str| -> String {
+            p.trim()
+                .trim_start_matches("<<")
+                .trim_end_matches(">>")
+                .trim_matches('"')
+                .to_string()
+        };
+        let name = parts.next().map(unq).filter(|n| !n.is_empty());
+        let ver = parts.next().map(unq).filter(|v| !v.is_empty());
+        if let Some(n) = name {
+            let node = match ver {
+                Some(v) => nv(&n, &v),
+                None => n.clone(),
+            };
+            if seen.insert(node.clone()) {
+                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+            }
+        }
+        rest = &rest[i + close + 1..];
+    }
+    // Git/hg-sourced entries: {Name,{git,"url",{ref,"sha"}},Lvl}
+    // and {Name,{git_subdir,...}} - emit name@git:<sha> nodes.
+    let mut rest = text;
+    while let Some(i) = rest.find("{git") {
+        let before = &rest[..i];
+        let name = before.rfind("<<\"").and_then(|s| {
+            let inner = &before[s + 3..];
+            inner.find("\">>").map(|e| inner[..e].to_string())
+        });
+        let after = &rest[i..];
+        let sha = after.find("{ref,").and_then(|r| {
+            let seg = &after[r + 5..];
+            seg.find('"').and_then(|q1| {
+                seg[q1 + 1..]
+                    .find('"')
+                    .map(|q2| seg[q1 + 1..q1 + 1 + q2].to_string())
+            })
+        });
+        if let Some(n) = name {
+            let node = match sha {
+                Some(s) if !s.is_empty() => format!("{n}@git:{s}"),
+                _ => n.clone(),
+            };
+            if seen.insert(node.clone()) {
+                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+            }
+        }
+        rest = &rest[i + 4..];
+    }
+    if edges.is_empty() {
+        return Err(err("rebar.lock: no packages found"));
+    }
+    Ok(edges)
+}
+
+// ---------- renv.lock (R) ----------
+
+/// `renv.lock` (JSON): `Packages` maps name -> {Version, Source}.
+/// Flat inventory of pinned R packages.
+pub fn renv_lock(text: &str) -> Result<EdgeList> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| err(format!("renv.lock: {e}")))?;
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    if let Some(pkgs) = v.get("Packages").and_then(|p| p.as_object()) {
+        for (name, meta) in pkgs {
+            let ver = meta.get("Version").and_then(|x| x.as_str()).unwrap_or("");
+            let node = nv(name, ver);
+            if seen.insert(node.clone()) {
+                edges.push((FLAT_SRC.to_string(), node, None, strand_core::EdgeKind::Static));
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("renv.lock: no packages found"));
+    }
+    Ok(edges)
+}

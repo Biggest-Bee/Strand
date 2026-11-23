@@ -882,3 +882,138 @@ fn gradle_module_and_pom_deps() {
     assert!(deps.contains(&("com.google.code.gson".into(), "gson".into(), "".into())));
     assert_eq!(deps.len(), 2); // test-scoped junit skipped
 }
+
+#[test]
+fn pdm_lock_dependency_edges() {
+    let text = r#"
+[metadata]
+lock_version = "4.5.1"
+
+[[package]]
+name = "anyio"
+version = "4.13.0"
+dependencies = [
+ "idna>=2.8",
+ "typing-extensions>=4.5; python_version < \"3.13\"",
+]
+
+[[package]]
+name = "idna"
+version = "3.10"
+
+[[package]]
+name = "typing-extensions"
+version = "4.14.0"
+
+[[package]]
+name = "requests"
+version = "2.32.0"
+dependencies = [
+ "anyio",
+ "certifi @ https://example.com/certifi.whl",
+]
+"#;
+    let edges = strand_import::parse(text, strand_import::Format::PdmLock).unwrap();
+    let has = |s: &str, d: &str| edges.iter().any(|(a, b, ..)| a == s && b == d);
+    assert!(has("anyio@4.13.0", "idna@3.10"), "{edges:?}");
+    assert!(has("anyio@4.13.0", "typing-extensions@4.14.0"));
+    // Direct reference `certifi @ url` is skipped; bare `anyio`
+    // resolves to the unique pin.
+    assert!(has("requests@2.32.0", "anyio@4.13.0"));
+    assert!(!edges.iter().any(|(_, d, ..)| d.contains("certifi")), "{edges:?}");
+}
+
+#[test]
+fn conda_lock_dependency_edges() {
+    let text = r#"
+version: 1
+metadata:
+  platforms: [linux-64]
+package:
+  - name: python
+    version: "3.11.0"
+    manager: conda
+    dependencies:
+      bzip2: ">=1.0.8,<2.0a0"
+      openssl: ">=3.0.0"
+  - name: bzip2
+    version: "1.0.8"
+    manager: conda
+  - name: openssl
+    version: "3.0.0"
+    manager: conda
+    dependencies:
+      ca-certificates: "*"
+  - name: ca-certificates
+    version: "2023.01.10"
+    manager: conda
+"#;
+    let edges = strand_import::parse(text, strand_import::Format::CondaLock).unwrap();
+    let has = |s: &str, d: &str| edges.iter().any(|(a, b, ..)| a == s && b == d);
+    assert!(has("python@3.11.0", "bzip2@1.0.8"), "{edges:?}");
+    assert!(has("python@3.11.0", "openssl@3.0.0"));
+    assert!(has("openssl@3.0.0", "ca-certificates@2023.01.10"));
+}
+
+#[test]
+fn julia_manifest_transitive() {
+    let text = r#"
+julia_version = "1.9.0"
+manifest_format = "2.0"
+
+[[deps.DataFrames]]
+uuid = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+version = "1.3.4"
+deps = ["Compat", "DataAPI", "Tables"]
+
+[[deps.Compat]]
+uuid = "34da2185-b29b-5c13-b0c7-acf172513d20"
+version = "4.11.0"
+
+[[deps.DataAPI]]
+uuid = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
+version = "1.11.0"
+
+[[deps.Tables]]
+uuid = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+version = "1.7.0"
+deps = ["DataAPI"]
+"#;
+    let edges = strand_import::parse(text, strand_import::Format::JuliaManifest).unwrap();
+    let has = |s: &str, d: &str| edges.iter().any(|(a, b, ..)| a == s && b == d);
+    assert!(has("DataFrames@1.3.4", "Compat@4.11.0"), "{edges:?}");
+    assert!(has("DataFrames@1.3.4", "Tables@1.7.0"));
+    assert!(has("Tables@1.7.0", "DataAPI@1.11.0"));
+}
+
+#[test]
+fn rebar_lock_pkg_and_git_entries() {
+    let text = r#"{"1.2.0",
+[{<<"cowboy">>,{pkg,<<"cowboy">>,<<"2.13.0">>},2},
+ {<<"ranch">>,{pkg,<<"ranch">>,<<"2.2.0">>},3},
+ {<<"app_config">>,
+ {git,"https://github.com/leapsight/app_config.git",
+ {ref,"6c4aee8fc3d08b59e22183a530cb4ce29d4b348b"}},
+ 0}]}.
+"#;
+    let edges = strand_import::parse(text, strand_import::Format::RebarLock).unwrap();
+    let nodes: Vec<&str> = edges.iter().map(|(_, d, ..)| d.as_str()).collect();
+    assert!(nodes.contains(&"cowboy@2.13.0"), "{edges:?}");
+    assert!(nodes.contains(&"ranch@2.2.0"));
+    assert!(nodes.contains(&"app_config@git:6c4aee8fc3d08b59e22183a530cb4ce29d4b348b"), "{edges:?}");
+}
+
+#[test]
+fn renv_lock_packages() {
+    let text = r#"{
+  "R": {"Version": "4.3.0"},
+  "Packages": {
+    "ggplot2": {"Version": "3.4.4", "Source": "Repository"},
+    "dplyr": {"Version": "1.1.4", "Source": "Repository"}
+  }
+}"#;
+    let edges = strand_import::parse(text, strand_import::Format::RenvLock).unwrap();
+    let nodes: Vec<&str> = edges.iter().map(|(_, d, ..)| d.as_str()).collect();
+    assert!(nodes.contains(&"ggplot2@3.4.4"), "{edges:?}");
+    assert!(nodes.contains(&"dplyr@1.1.4"));
+}

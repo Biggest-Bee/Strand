@@ -273,7 +273,7 @@ fn csproj_and_props_deps() {
     )
     .unwrap();
     let out = strand_import::manifests::scan_manifests(dir.path()).unwrap();
-    assert!(out.edges.iter().any(|e| e.1 == "Newtonsoft.Json"));
+    assert!(out.edges.iter().any(|e| e.1 == "Newtonsoft.Json@13.0.3"));
 }
 
 #[test]
@@ -528,4 +528,177 @@ fn setup_cfg_extras_require() {
     assert!(deps.contains(&"sphinx-rtd-theme"));
     assert!(!deps.contains(&"test"));
     assert!(!deps.contains(&"docs"));
+}
+
+#[test]
+fn misc_new_manifests() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Julia Project.toml.
+    std::fs::write(
+        root.join("Project.toml"),
+        "[deps]\nDataFrames = \"a93c6f00-e57d-5684-b7b6-d8193f3e46c0\"\nJSON = \"682c06a0-de6a-54ab-a142-c8b1cf79cde6\"\n",
+    )
+    .unwrap();
+    // Clojure deps.edn.
+    std::fs::write(
+        root.join("deps.edn"),
+        "{:deps [[org.clojure/clojure \"1.11.1\"] [cheshire \"5.11.0\" :exclusions [tigris]] {:mvn/version \"0.5.0\"}]}",
+    )
+    .unwrap();
+    // build.sbt.
+    std::fs::write(
+        root.join("build.sbt"),
+        "libraryDependencies += \"org.typelevel\" %% \"cats-core\" %% \"2.9.0\"\nlibraryDependencies += \"com.typesafe\" % \"config\" % \"1.4.2\" % Test\n",
+    )
+    .unwrap();
+    // rebar.config.
+    std::fs::write(
+        root.join("rebar.config"),
+        "{deps, [cowboy, {rebar, \"1.0.0\"}, {hackney, {git, \"https://github.com/benoitc/hackney\"}}]}.\n{erl_opts, [debug_info]}.\n",
+    )
+    .unwrap();
+    // .cabal.
+    std::fs::write(
+        root.join("foo.cabal"),
+        "name: foo\nversion: 0.1.0.0\nbuild-depends: base >=4.14,\n               text,\n               aeson (>=2.0),\n               containers,\n",
+    )
+    .unwrap();
+    // CMakeLists.txt.
+    std::fs::write(
+        root.join("CMakeLists.txt"),
+        "cmake_minimum_required(VERSION 3.20)\nproject(x C)\nfind_package(OpenSSL REQUIRED)\nfind_package(Boost 1.74)\npkg_check_modules(ZLIB REQUIRED zlib)\n",
+    )
+    .unwrap();
+    // meson.build.
+    std::fs::write(
+        root.join("meson.build"),
+        "project('x', 'c')\ndependency('openssl')\ndependency(\"libpng\", version: '>=1.6', required: false)\n",
+    )
+    .unwrap();
+    // Chart.yaml.
+    std::fs::write(
+        root.join("Chart.yaml"),
+        "apiVersion: v2\nname: mychart\nversion: 0.1.0\ndependencies:\n  - name: postgresql\n    version: \"12.1.0\"\n    repository: https://charts.bitnami.com/bitnami\n",
+    )
+    .unwrap();
+    // build.zig.zon.
+    std::fs::write(
+        root.join("build.zig.zon"),
+        "{\n  .name = \"x\",\n  .dependencies = {\n    .zls = .{ .url = \"https://x\", .hash = \"abc\" },\n    .known-folders = .{ .path = \"vendor/kf\" }\n  }\n}\n",
+    )
+    .unwrap();
+    // Gleam.toml.
+    std::fs::write(
+        root.join("gleam.toml"),
+        "name = \"x\"\n[dependencies]\ngleam_stdlib = \">= 0.40.0\"\nwisp = \"~> 1.0\"\n",
+    )
+    .unwrap();
+    // pixi.toml.
+    std::fs::write(
+        root.join("pixi.toml"),
+        "[dependencies]\npython = \"3.11.*\"\n[ pypi-dependencies ]\nrequests = \"*\"\n",
+    )
+    .unwrap();
+    // shard.yml.
+    std::fs::write(
+        root.join("shard.yml"),
+        "name: x\ndependencies:\n  kemal:\n    version: \"~> 1.0\"\n  radix:\n    git: https://github.com/x/radix\n",
+    )
+    .unwrap();
+    // cpanfile.
+    std::fs::write(
+        root.join("cpanfile"),
+        "requires 'Plack';\nrequires 'DBI', '>= 1.6';\non 'test' => sub { requires 'Test::More' };\n",
+    )
+    .unwrap();
+    // rockspec.
+    std::fs::write(
+        root.join("x-1.0-1.rockspec"),
+        "package = \"x\"\ndependencies = { \"luafilesystem >= 1.6.3\", \"say >= 1.3-1\" }\n",
+    )
+    .unwrap();
+    // dub.json.
+    std::fs::write(
+        root.join("dub.json"),
+        "{\"name\":\"x\",\"dependencies\":{\"vibe-d\":\"~>0.5.0\",\"gated\":{\"version\":\"1.0.0\"}}}",
+    )
+    .unwrap();
+    // DESCRIPTION.
+    std::fs::write(
+        root.join("DESCRIPTION"),
+        "Package: mypkg\nVersion: 1.0.0\nDepends: R (>= 4.0.0),\n    ggplot2 (>= 3.4.0)\nImports: dplyr,\n    tidyr\n",
+    )
+    .unwrap();
+    // conanfile.py.
+    std::fs::write(
+        root.join("conanfile.py"),
+        "from conan import ConanFile\nclass X(ConanFile):\n    requires = \"fmt/10.1.0\"\n    tool_requires = (\"cmake/3.27.0\",)\n",
+    )
+    .unwrap();
+    // .gitlab-ci.yml.
+    std::fs::write(
+        root.join(".gitlab-ci.yml"),
+        "image: golang:1.22\ntest:\n  image: \"alpine:3.19\"\n",
+    )
+    .unwrap();
+    // .fsproj with version pin.
+    std::fs::write(
+        root.join("lib.fsproj"),
+        "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><PackageReference Include=\"FSharp.Core\" Version=\"8.0.200\" /></ItemGroup></Project>",
+    )
+    .unwrap();
+    // compose depends_on.
+    std::fs::write(
+        root.join("compose.yml"),
+        "services:\n  web:\n    image: nginx:1.25\n    depends_on:\n      - db\n      - cache\n  db:\n    image: postgres:16\n",
+    )
+    .unwrap();
+
+    let out = scan_manifests(root).unwrap();
+    let deps: Vec<&str> = out.edges.iter().map(|e| e.1.as_str()).collect();
+    let has = |d: &str| deps.contains(&d);
+
+    assert!(has("DataFrames"), "{deps:?}");
+    assert!(has("JSON"));
+    assert!(has("org.clojure:clojure@1.11.1"), "{deps:?}");
+    assert!(has("org.typelevel:cats-core@2.9.0"), "{deps:?}");
+    assert!(has("com.typesafe:config@1.4.2"), "{deps:?}");
+    assert!(has("cowboy"), "{deps:?}");
+    assert!(has("rebar@1.0.0"), "{deps:?}");
+    assert!(has("base"), "{deps:?}");
+    assert!(has("text"));
+    assert!(has("aeson"));
+    assert!(has("OpenSSL"), "{deps:?}");
+    assert!(has("zlib"));
+    assert!(has("openssl"), "{deps:?}");
+    assert!(has("libpng"));
+    assert!(has("postgresql@12.1.0"), "{deps:?}");
+    assert!(has("zls"), "{deps:?}");
+    assert!(has("known-folders"));
+    assert!(has("gleam_stdlib"), "{deps:?}");
+    assert!(has("wisp"));
+    assert!(has("python"));
+    assert!(has("requests"));
+    assert!(has("kemal"), "{deps:?}");
+    assert!(has("radix"));
+    assert!(has("Plack"), "{deps:?}");
+    assert!(has("DBI"));
+    assert!(has("Test::More"));
+    assert!(has("luafilesystem"), "{deps:?}");
+    assert!(has("say"));
+    assert!(has("vibe-d"), "{deps:?}");
+    assert!(has("gated"));
+    assert!(has("ggplot2"), "{deps:?}");
+    assert!(has("dplyr"));
+    assert!(has("tidyr"));
+    assert!(has("fmt/10.1.0"), "{deps:?}");
+    assert!(has("cmake/3.27.0"));
+    assert!(has("golang:1.22"), "{deps:?}");
+    assert!(has("alpine:3.19"));
+    assert!(has("FSharp.Core@8.0.200"), "{deps:?}");
+    assert!(has("service:db"), "{deps:?}");
+    assert!(has("service:cache"));
+    // R itself should not appear as a dep.
+    assert!(!has("R"));
 }

@@ -74,6 +74,16 @@ pub enum Format {
     WebpackStats,
     /// `esbuild --metafile` JSON output (per-input imports).
     EsbuildMeta,
+    /// `pdm.lock` (TOML, real dep edges).
+    PdmLock,
+    /// `conda-lock.yml` (unified conda lock, real dep edges).
+    CondaLock,
+    /// Julia `Manifest.toml` (real dep edges).
+    JuliaManifest,
+    /// `rebar.lock` (Erlang/rebar3, flat pins).
+    RebarLock,
+    /// `renv.lock` (R, flat pins).
+    RenvLock,
 }
 
 /// One parsed edge: `src -> dst` ("src depends on dst"), optional
@@ -113,6 +123,11 @@ pub fn parse(text: &str, format: Format) -> Result<EdgeList> {
         Format::FlakeLock => locks::flake_lock(text),
         Format::WebpackStats => bundler::webpack_stats(text),
         Format::EsbuildMeta => bundler::esbuild_meta(text),
+        Format::PdmLock => locks::pdm_lock(text),
+        Format::CondaLock => locks::conda_lock(text),
+        Format::JuliaManifest => locks::julia_manifest(text),
+        Format::RebarLock => locks::rebar_lock(text),
+        Format::RenvLock => locks::renv_lock(text),
     }
 }
 
@@ -146,7 +161,17 @@ pub fn detect_format(path: &std::path::Path, text: &str) -> Format {
             "verification-metadata.xml" => return Format::GradleVerification,
             "gradle.lockfile" => return Format::GradleLockfile,
             "flake.lock" => return Format::FlakeLock,
+            "pdm.lock" => return Format::PdmLock,
+            "conda-lock.yml" | "conda-lock.yaml" => return Format::CondaLock,
+            "manifest.toml" => return Format::JuliaManifest,
+            "rebar.lock" => return Format::RebarLock,
+            "renv.lock" => return Format::RenvLock,
+            "go.work.sum" => return Format::GoSum,
             _ => {}
+        }
+        // `Package@swift-5.9.resolved` versioned variants.
+        if name.starts_with("package@swift-") && name.ends_with(".resolved") {
+            return Format::SwiftResolved;
         }
     }
     // Content sniffing for renamed files.

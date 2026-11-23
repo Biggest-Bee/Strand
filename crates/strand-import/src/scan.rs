@@ -138,13 +138,22 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         "flake.lock",
         "gradle.lockfile",
         "verification-metadata.xml",
+        "pdm.lock",
+        "conda-lock.yml",
+        "conda-lock.yaml",
+        "manifest.toml",
+        "rebar.lock",
+        "renv.lock",
+        "go.work.sum",
     ];
     let mut lock_files: Vec<(String, PathBuf)> = Vec::new();
     walk_files(root, root, &mut |rel, abs| {
         if abs
             .file_name()
             .map(|n| {
-                LOCK_NAMES.contains(&n.to_string_lossy().to_lowercase().as_str())
+                let n = n.to_string_lossy().to_lowercase();
+                LOCK_NAMES.contains(&n.as_str())
+                    || (n.starts_with("package@swift-") && n.ends_with(".resolved"))
             })
             .unwrap_or(false)
         {
@@ -276,11 +285,41 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
                 probes.push(("jvm", crate::caches::maven_cache_edges(&jvm_c, &root)));
             }
         }
-        // Project-local checkouts (deps/, .build, SourcePackages).
+        // Python pins come from pdm.lock (lock_nodes) plus exact
+        // `==` pins in requirements/setup.py manifest edges.
+        let mut py_seed = coords_of("python");
+        for (s, d, ..) in &manifest_edges {
+            if manifest_group(s) == Some("python") && d.contains('@') {
+                py_seed.insert(d.clone());
+            }
+        }
         let proj = PathBuf::from(root);
+        if !py_seed.is_empty() {
+            probes.push(("python", crate::caches::pip_site_packages_edges(&py_seed, &proj)));
+        }
+        // Stack pkgdb: ~/.stack snapshots + project .stack-work.
+        let haskell_c = coords_of("haskell");
+        if !haskell_c.is_empty() {
+            let stack_home = crate::caches::home_dir_public()
+                .map(|h| h.join(".stack"))
+                .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+            probes.push((
+                "haskell",
+                crate::caches::stack_pkgdb_edges(&haskell_c, &stack_home, &proj),
+            ));
+        }
+        // Project-local checkouts/installs.
         let mix_c = coords_of("elixir");
         if !mix_c.is_empty() {
             probes.push(("elixir", crate::caches::mix_deps_edges(&mix_c, &proj)));
+        }
+        let erlang_c = coords_of("erlang");
+        if !erlang_c.is_empty() {
+            probes.push(("erlang", crate::caches::erlang_app_edges(&erlang_c, &proj)));
+        }
+        let r_c = coords_of("r");
+        if !r_c.is_empty() {
+            probes.push(("r", crate::caches::renv_library_edges(&r_c, &proj)));
         }
         let swift_c = coords_of("swift");
         if !swift_c.is_empty() {
@@ -419,6 +458,11 @@ fn lock_group(fmt: crate::Format) -> Option<&'static str> {
         ConanLock => Some("conan"),
         GradleVerification | GradleLockfile => Some("gradle"),
         GoMod | GoSum => Some("go"),
+        PdmLock => Some("python"),
+        CondaLock => Some("conda"),
+        JuliaManifest => Some("julia"),
+        RebarLock => Some("erlang"),
+        RenvLock => Some("r"),
         _ => None,
     }
 }
@@ -430,7 +474,8 @@ fn is_flat_lock(fmt: crate::Format) -> bool {
     matches!(
         fmt,
         SwiftResolved | PubspecLock | StackLock | MixLock | CartfileResolved
-            | DenoLock | GradleVerification | GradleLockfile
+            | DenoLock | GradleVerification | GradleLockfile | RebarLock
+            | RenvLock
     )
 }
 
@@ -460,6 +505,19 @@ fn manifest_group(src: &str) -> Option<&'static str> {
             || f == "libs.versions.toml" => Some("gradle"),
         _ if f == "setup.py" => Some("python"),
         _ if f.starts_with("requirements") && f.ends_with(".txt") => Some("python"),
+        "pdm.lock" => Some("python"),
+        "project.toml" => Some("julia"),
+        "deps.edn" | "bb.edn" | "project.clj" => Some("jvm"),
+        _ if f.ends_with(".sbt") => Some("jvm"),
+        "rebar.config" => Some("erlang"),
+        _ if f.ends_with(".cabal") || f == "stack.yaml" => Some("haskell"),
+        "manifest.toml" => Some("julia"),
+        "renv.lock" => Some("r"),
+        "description" => Some("r"),
+        "conanfile.py" => Some("conan"),
+        _ if f.ends_with(".fsproj") || f.ends_with(".vbproj") || f.ends_with(".props") => {
+            Some("nuget")
+        }
         _ => None,
     }
 }

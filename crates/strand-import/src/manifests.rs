@@ -29,6 +29,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::locks::nv;
 use crate::scan::{ScanOutput, walk_files};
 use crate::EdgeList;
 use strand_core::EdgeKind;
@@ -89,12 +90,36 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
                 | "module.bazel"
                 | "directory.packages.props"
         ) || name.ends_with(".csproj")
+            || name.ends_with(".fsproj")
+            || name.ends_with(".vbproj")
+            || name.ends_with(".props")
             || name.ends_with(".gradle")
             || name.ends_with(".gradle.kts")
             || name.ends_with(".dockerfile")
             || name.ends_with(".nix")
             || name.ends_with(".tf")
             || name.ends_with(".bzl")
+            || name == "deps.edn"
+            || name == "bb.edn"
+            || name == "project.clj"
+            || name.ends_with(".sbt")
+            || name == "rebar.config"
+            || name.ends_with(".cabal")
+            || name == "cmakelists.txt"
+            || name.ends_with(".cmake")
+            || name == "meson.build"
+            || name == "chart.yaml"
+            || name == "build.zig.zon"
+            || name == "gleam.toml"
+            || name == "pixi.toml"
+            || name == "shard.yml"
+            || name == "cpanfile"
+            || name.ends_with(".rockspec")
+            || name == "dub.json"
+            || name == "description"
+            || name == "conanfile.py"
+            || name == ".gitlab-ci.yml"
+            || name == "project.toml"
             || (name.starts_with("requirements") && name.ends_with(".txt"))
             || (parent == "requirements" && name.ends_with(".txt"))
             || (norm_rel.starts_with(".github/workflows/") || norm_rel.contains("/.github/workflows/")
@@ -187,8 +212,51 @@ pub fn scan_manifests(root: &Path) -> Result<ScanOutput, crate::Error> {
             bazel_deps(&text)
         } else if name == "package.swift" {
             package_swift_deps(&text)
-        } else if name.ends_with(".csproj") || name == "directory.packages.props" {
+        } else if name.ends_with(".csproj")
+            || name.ends_with(".fsproj")
+            || name.ends_with(".vbproj")
+            || name.ends_with(".props")
+            || name == "directory.packages.props"
+        {
             nuget_manifest_deps(&text)
+        } else if name == "project.toml" {
+            project_toml_deps(&text)
+        } else if name == "deps.edn" || name == "bb.edn" {
+            edn_lib_deps(&text)
+        } else if name == "project.clj" {
+            edn_lib_deps(&text)
+        } else if name.ends_with(".sbt") {
+            sbt_deps(&text)
+        } else if name == "rebar.config" {
+            rebar_config_deps(&text)
+        } else if name.ends_with(".cabal") {
+            cabal_deps(&text)
+        } else if name == "cmakelists.txt" || name.ends_with(".cmake") {
+            cmake_deps(&text)
+        } else if name == "meson.build" {
+            meson_deps(&text)
+        } else if name == "chart.yaml" {
+            chart_yaml_deps(&text)
+        } else if name == "build.zig.zon" {
+            zig_zon_deps(&text)
+        } else if name == "gleam.toml" {
+            gleam_deps(&text)
+        } else if name == "pixi.toml" {
+            pixi_deps(&text)
+        } else if name == "shard.yml" {
+            shard_deps(&text)
+        } else if name == "cpanfile" {
+            cpanfile_deps(&text)
+        } else if name.ends_with(".rockspec") {
+            rockspec_deps(&text)
+        } else if name == "dub.json" {
+            dub_deps(&text)
+        } else if name == "description" {
+            description_deps(&text)
+        } else if name == "conanfile.py" {
+            conanfile_py_deps(&text)
+        } else if name == ".gitlab-ci.yml" {
+            gitlab_ci_deps(&text)
         } else if name.ends_with(".gradle") || name.ends_with(".gradle.kts") {
             gradle_deps(&text)
         } else if rel_norm.starts_with(".github/workflows/") || rel_norm.contains("/.github/workflows/") {
@@ -802,17 +870,31 @@ fn nuget_manifest_deps(text: &str) -> Vec<String> {
             }
             let Some(gt) = after.find('>') else { break };
             let attrs = &after[..gt];
-            for q in ['"', '\''] {
-                let needle = format!("Include={q}");
-                if let Some(p) = attrs.find(&needle) {
-                    let val = &attrs[p + needle.len()..];
-                    if let Some(end) = val.find(q) {
-                        let id = val[..end].trim();
-                        if !id.is_empty() {
-                            out.push(id.to_string());
+            let get_attr = |attrs: &str, name: &str| -> Option<String> {
+                for q in ['"', '\''] {
+                    let needle = format!("{name}={q}");
+                    if let Some(p) = attrs.find(&needle) {
+                        let val = &attrs[p + needle.len()..];
+                        if let Some(end) = val.find(q) {
+                            return Some(val[..end].trim().to_string());
                         }
                     }
-                    break;
+                }
+                None
+            };
+            if let Some(id) = get_attr(attrs, "Include") {
+                if !id.is_empty() {
+                    // Exact `Version="x.y.z"` pins become `id@version`
+                    // nodes so they bridge to packages.lock.json and
+                    // seed the NuGet cache probe; ranges stay bare.
+                    match get_attr(attrs, "Version") {
+                        Some(v)
+                            if v.chars().next().is_some_and(|c| c.is_ascii_digit()) =>
+                        {
+                            out.push(format!("{id}@{v}"));
+                        }
+                        _ => out.push(id),
+                    }
                 }
             }
             rest = &after[gt + 1..];
@@ -1036,12 +1118,34 @@ fn compose_deps(text: &str) -> Vec<String> {
     };
     let mut out = Vec::new();
     if let Some(services) = doc.get("services").and_then(|v| v.as_mapping()) {
-        for (_svc, cfg) in services {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for (svc, cfg) in services {
             if let Some(img) = cfg.get("image").and_then(|v| v.as_str()) {
                 let img = img.trim();
-                if !img.is_empty() {
+                if !img.is_empty() && seen.insert(img.to_string()) {
                     out.push(img.to_string());
                 }
+            }
+            // `depends_on` service->service edges: `service:<name>`
+            // nodes keep them distinct from image/package refs.
+            if let Some(dep) = cfg.get("depends_on") {
+                let names: Vec<&str> = match dep {
+                    serde_yml::Value::Sequence(s) => {
+                        s.iter().filter_map(|v| v.as_str()).collect()
+                    }
+                    serde_yml::Value::Mapping(m) => {
+                        m.keys().filter_map(|k| k.as_str()).collect()
+                    }
+                    serde_yml::Value::String(s) => vec![s.as_str()],
+                    _ => Vec::new(),
+                };
+                for n in names {
+                    let node = format!("service:{n}");
+                    if seen.insert(node.clone()) {
+                        out.push(node);
+                    }
+                }
+                let _ = svc;
             }
         }
     }
@@ -1537,6 +1641,788 @@ fn bazel_deps(text: &str) -> Vec<String> {
                 }
             }
             rest = &after[end + 1..];
+        }
+    }
+    out
+}
+
+// ---------- Julia Project.toml ----------
+
+/// `Project.toml` (Julia): `[deps]` maps `Name = "uuid"`.
+/// Emits bare package names that bridge to `Manifest.toml` pins.
+fn project_toml_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = toml::from_str::<toml::Table>(text) else {
+        return Vec::new();
+    };
+    doc.get("deps")
+        .and_then(|d| d.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+// ---------- Clojure (deps.edn / bb.edn / project.clj) ----------
+
+/// Convert a Clojure lib name `org/artifact` to a Maven-style
+/// `org:artifact@version` node id for the jvm group.
+fn clj_coord(lib: &str, ver: Option<&str>) -> Option<String> {
+    let (g, a) = lib.split_once('/')?;
+    if g.is_empty() || a.is_empty() {
+        return None;
+    }
+    Some(match ver {
+        Some(v) if !v.is_empty() => format!("{g}:{a}@{v}"),
+        _ => format!("{g}:{a}"),
+    })
+}
+
+/// Read an EDN symbol starting at `bytes[i]` (lib names like
+/// `org.clojure/clojure` are unquoted symbols, not strings).
+fn edn_symbol(text: &str, i: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    if i >= bytes.len() {
+        return None;
+    }
+    let c = bytes[i];
+    // Symbol constituent chars ( EDN: alnum + `*+!-_?/<>=.` etc).
+    if !(c.is_ascii_alphanumeric() || matches!(c, b'.' | b'*' | b'+' | b'!' | b'-' | b'_' | b'?' | b'/' | b'<' | b'>' | b'=' | b':' | b'$' | b'&' | b'%' )) {
+        return None;
+    }
+    let mut j = i;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if c.is_ascii_alphanumeric()
+            || matches!(c, b'.' | b'*' | b'+' | b'!' | b'-' | b'_' | b'?' | b'/' | b'<' | b'>' | b'=' | b':' | b'$' | b'&' | b'%')
+        {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    Some((text[i..j].to_string(), j))
+}
+
+/// Extract `[lib "version"]`, `[lib {:mvn/version "v"}]`, and
+/// `[lib/version "v"]` vectors from EDN text (deps.edn, bb.edn,
+/// project.clj). Lib names may be quoted strings or bare symbols.
+fn edn_lib_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Lib name: quoted string or bare symbol containing '/'.
+        let (lib, after) = if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+            let q = bytes[j];
+            match text[j + 1..].find(q as char) {
+                Some(e) => (text[j + 1..j + 1 + e].to_string(), j + 1 + e + 1),
+                None => {
+                    i += 1;
+                    continue;
+                }
+            }
+        } else {
+            match edn_symbol(text, j) {
+                Some((s, e)) => (s, e),
+                None => {
+                    i += 1;
+                    continue;
+                }
+            }
+        };
+        if lib.is_empty() || !lib.contains('/') {
+            i = after;
+            continue;
+        }
+        // Bound the version search to this dep vector's closing
+        // `]` (depth-counted from the opening `[` at i) so a later
+        // dep's `:mvn/version` can't leak in.
+        let mut vend = text.len();
+        {
+            let bb = text.as_bytes();
+            let mut depth = 0i32;
+            for (k, &b) in bb[i..].iter().enumerate() {
+                match b {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            vend = i + k;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Version: next quoted string, or :mvn/version "v" nearby.
+        let rest = &text[after..vend.min(text.len())];
+        let take = rest.len().min(300);
+        let seg = &rest[..take];
+        let ver = if let Some(mp) = seg.find(":mvn/version") {
+            seg[mp..]
+                .find('"')
+                .and_then(|a| {
+                    seg[mp + a + 1..]
+                        .find('"')
+                        .map(|b| &seg[mp + a + 1..mp + a + 1 + b])
+                })
+        } else {
+            seg.find('"')
+                .and_then(|a| {
+                    seg[a + 1..]
+                        .find('"')
+                        .map(|b| &seg[a + 1..a + 1 + b])
+                })
+        };
+        if let Some(node) = clj_coord(&lib, ver) {
+            if seen.insert(node.clone()) {
+                out.push(node);
+            }
+        }
+        i = after;
+    }
+    out
+}
+
+/// Extract quoted strings from a line in order.
+fn quoted_strings(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(q) = rest.find('"') {
+        let inner = &rest[q + 1..];
+        if let Some(e) = inner.find('"') {
+            out.push(inner[..e].to_string());
+            rest = &inner[e + 1..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// `build.sbt` / `*.sbt`: `"g" %% "a" %% "v"` and `%` dep syntax,
+/// optional `% Test`-style config suffix. Line-based: each dep
+/// declaration's group/artifact/version are the first three quoted
+/// strings on the line.
+fn sbt_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("//") || t.starts_with('#') {
+            continue;
+        }
+        let qs = quoted_strings(t);
+        if qs.len() < 3 {
+            continue;
+        }
+        let (g, a, v) = (&qs[0], &qs[1], &qs[2]);
+        // Group/artifact look like maven coords; version looks like
+        // a version (starts with digit).
+        if !g.contains('.') && !a.is_empty() {
+            continue;
+        }
+        if !v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Some(node) = clj_coord(&format!("{g}/{a}"), Some(v)) {
+            if seen.insert(node.clone()) {
+                out.push(node);
+            }
+        }
+    }
+    out
+}
+
+// ---------- rebar.config ----------
+
+/// `rebar.config` (Erlang): `{deps, [cowboy, {rebar,"1.0.0"},
+/// {rebar,{git,...}}, {rebar,{pkg,pkgname}}]}`. Emits `name` or
+/// `name@version` nodes bridging to `rebar.lock`.
+fn rebar_config_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // Restrict to the deps list region if present: `{deps, [ ... ]}`
+    // - find the `[` after `{deps,` and its matching `]` (depth
+    // counted; quoted strings may contain brackets but are rare in
+    // dep lists, acceptable approximation).
+    let region = if let Some(di) = text.find("{deps,") {
+        let after = &text[di..];
+        if let Some(bi) = after.find('[') {
+            let bytes = after.as_bytes();
+            let mut depth = 0i32;
+            let mut end = after.len();
+            for (j, &b) in bytes[bi..].iter().enumerate() {
+                match b {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = bi + j;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &after[bi + 1..end.min(after.len())]
+        } else {
+            after
+        }
+    } else {
+        text
+    };
+    let bytes = region.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // {name, ...} tuple form.
+            let inner_start = i + 1;
+            if let Some(close) = region[inner_start..].find('}') {
+                let inner = &region[inner_start..inner_start + close];
+                // First element: atom or quoted name.
+                let name = inner
+                    .split(',')
+                    .next()
+                    .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>').to_string())
+                    .filter(|n| {
+                        !n.is_empty()
+                            && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+                            && !matches!(n.as_str(), "git" | "hg" | "pkg" | "git_subdir" | "deps")
+                    });
+                if let Some(n) = name {
+                    // Version: {name,"1.0.0"} second element quoted.
+                    let mut parts = inner.splitn(2, ',');
+                    parts.next();
+                    let second = parts.next().unwrap_or("").trim();
+                    let node = if second.starts_with('"') || second.starts_with('\'') {
+                        let q = second.chars().next().unwrap();
+                        second[1..]
+                            .find(q)
+                            .map(|e| nv(&n, &second[1..1 + e]))
+                            .unwrap_or_else(|| n.clone())
+                    } else if second.starts_with("{pkg,") {
+                        // {name,{pkg,pkgname}} - emit pkgname.
+                        second[5..]
+                            .split([',', '}'])
+                            .next()
+                            .map(|p| p.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                            .filter(|p| !p.is_empty())
+                            .map(|p| nv(&p, ""))
+                            .unwrap_or_else(|| n.clone())
+                    } else {
+                        n.clone()
+                    };
+                    if seen.insert(node.clone()) {
+                        out.push(node);
+                    }
+                }
+                i = inner_start + close + 1;
+                continue;
+            }
+        } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            // Bare atom dep like `cowboy,` inside the deps list.
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let atom = &region[start..i];
+            // Only inside deps list: after `{deps,` we are in region.
+            let prefix = region[..start].trim_end();
+            if !matches!(atom, "deps" | "pkg" | "git" | "hg" | "git_subdir" | "ref" | "branch" | "tag" | "erl_opts" | "src_dirs" | "out_dir" | "extra_src_dirs")
+                && (prefix.is_empty()
+                    || prefix.ends_with(|c: char| c == ',' || c == '[' || c == '{'))
+            {
+                if seen.insert(atom.to_string()) {
+                    out.push(atom.to_string());
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+// ---------- .cabal ----------
+
+/// `.cabal`: `build-depends:` fields (comma-separated, optional
+/// version constraints in parens) across all component sections.
+/// Values may continue on following indented lines.
+fn cabal_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        i += 1;
+        let Some((field, rest)) = t.split_once(':') else { continue };
+        if field.trim() != "build-depends" {
+            continue;
+        }
+        let mut buf = rest.to_string();
+        while i < lines.len() {
+            let cont = lines[i];
+            if !(cont.starts_with(' ') || cont.starts_with('\t')) {
+                break;
+            }
+            let ct = cont.trim();
+            // A new `field:` line ends the continuation.
+            if ct.contains(':') && !ct.starts_with(',') {
+                break;
+            }
+            buf.push(' ');
+            buf.push_str(ct);
+            i += 1;
+        }
+        for dep in buf.split(',') {
+            let name = dep
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .trim();
+            let name = name.split_whitespace().next().unwrap_or("");
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                && seen.insert(name.to_string())
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+// ---------- CMake / Meson ----------
+
+/// `CMakeLists.txt` / `*.cmake`: `find_package(X [ver])`,
+/// `find_dependency(X)`, `pkg_check_modules(P x y)` names.
+fn cmake_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let push = |name: &str, out: &mut Vec<String>, seen: &mut BTreeSet<String>| {
+        let name = name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.');
+        if !name.is_empty() && !name.contains(' ') && seen.insert(name.to_string()) {
+            out.push(name.to_string());
+        }
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        for kw in ["find_package(", "find_dependency("] {
+            if let Some(i) = t.find(kw) {
+                let rest = &t[i + kw.len()..];
+                if let Some(sp) = rest.find(|c: char| c.is_whitespace() || c == ')') {
+                    push(&rest[..sp], &mut out, &mut seen);
+                }
+            }
+        }
+        if let Some(i) = t.find("pkg_check_modules(") {
+            let rest = &t[i + "pkg_check_modules(".len()..];
+            // First arg is the prefix var; deps follow. Skip
+            // REQUIRED/QUIET module keywords.
+            if let Some(close) = rest.find(')') {
+                let args = &rest[..close];
+                // Whitespace/comma-separated tokens: first is the
+                // prefix var (skip), then module names mixed with
+                // REQUIRED/QUIET/NO_MODULE keywords.
+                let mut first = true;
+                for w in args.split([',', ' ', '\t', '\n'].as_ref()) {
+                    let w = w.trim();
+                    if w.is_empty() {
+                        continue;
+                    }
+                    if first {
+                        first = false;
+                        continue;
+                    }
+                    if !matches!(w, "REQUIRED" | "QUIET" | "NO_MODULE") {
+                        push(w, &mut out, &mut seen);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `meson.build`: `dependency('name' [, version: ...])` calls.
+fn meson_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("dependency(") {
+        let after = &rest[i + "dependency(".len()..];
+        let after = after.trim_start();
+        if let Some(q) = after.find(['\'', '"']) {
+            let quote = after.as_bytes()[q];
+            let inner = &after[q + 1..];
+            if let Some(e) = inner.find(quote as char) {
+                let name = inner[..e].trim();
+                if !name.is_empty() && seen.insert(name.to_string()) {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        rest = &rest[i + 1..];
+    }
+    out
+}
+
+// ---------- Helm Chart.yaml ----------
+
+/// `Chart.yaml`: `dependencies:` entries with `name`/`version`.
+fn chart_yaml_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    if let Some(seq) = doc.get("dependencies").and_then(|d| d.as_sequence()) {
+        for d in seq {
+            let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let ver = d.get("version").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let node = if ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                format!("{name}@{ver}")
+            } else {
+                name.to_string()
+            };
+            if seen.insert(node.clone()) {
+                out.push(node);
+            }
+        }
+    }
+    out
+}
+
+// ---------- Zig build.zig.zon ----------
+
+/// `build.zig.zon`: `.dependencies` object keys are package names.
+/// The format is JSON5-ish (`.name = ...`, unquoted `.key`s,
+/// trailing commas), so serde can't parse it - scan manually.
+fn zig_zon_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let Some(di) = text.find(".dependencies") else { return out };
+    let rest = &text[di + ".dependencies".len()..];
+    let Some(bi) = rest.find('{') else { return out };
+    let bytes = rest.as_bytes();
+    let mut depth = 0i32;
+    let mut end = rest.len();
+    for (j, &b) in bytes[bi..].iter().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = bi + j + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &rest[bi + 1..end - 1];
+    // Depth-1 `.key =` entries.
+    let mut depth = 0i32;
+    let mut i = 0;
+    let bb = body.as_bytes();
+    while i < bb.len() {
+        match bb[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b'.' if depth == 0 => {
+                // `.name =` at top level of dependencies.
+                let start = i + 1;
+                let mut j = start;
+                while j < bb.len()
+                    && (bb[j].is_ascii_alphanumeric() || matches!(bb[j], b'_' | b'-'))
+                {
+                    j += 1;
+                }
+                if j > start {
+                    let name = &body[start..j];
+                    // Must be followed by `=` (dep entry) not `.` path.
+                    let mut k = j;
+                    while k < bb.len() && bb[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < bb.len() && bb[k] == b'=' {
+                        if seen.insert(name.to_string()) {
+                            out.push(name.to_string());
+                        }
+                    }
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+// ---------- Gleam / pixi / shard (TOML/YAML ecosystems) ----------
+
+/// `Gleam.toml`: `[dependencies]` name = "constraint".
+fn gleam_deps(text: &str) -> Vec<String> {
+    toml_deps_section(text, "dependencies")
+}
+
+/// `pixi.toml`: `[dependencies]` (conda) and `[pypi-dependencies]`
+/// (PyPI) name = "spec" entries.
+fn pixi_deps(text: &str) -> Vec<String> {
+    let mut out = toml_deps_section(text, "dependencies");
+    out.extend(toml_deps_section(text, "pypi-dependencies"));
+    out
+}
+
+/// Shared `[section]` name-key extractor for simple TOML manifests.
+fn toml_deps_section(text: &str, section: &str) -> Vec<String> {
+    let Ok(doc) = toml::from_str::<toml::Table>(text) else {
+        return Vec::new();
+    };
+    doc.get(section)
+        .and_then(|d| d.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// `shard.yml` (Crystal): `dependencies:` map keys.
+fn shard_deps(text: &str) -> Vec<String> {
+    let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(text) else {
+        return Vec::new();
+    };
+    doc.get("dependencies")
+        .and_then(|d| d.as_mapping())
+        .map(|m| {
+            m.keys()
+                .filter_map(|k| k.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------- Perl / Lua / D / R / Conan-python ----------
+
+/// `cpanfile`: `requires 'Module::Name' [, 'version']` lines,
+/// including inside `on ... => sub { ... }` blocks.
+fn cpanfile_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if !(t.starts_with("requires") || t.contains("requires ")) {
+            continue;
+        }
+        if let Some(i) = t.find("requires") {
+            let rest = &t[i + 8..];
+            for q in ['\'', '"'] {
+                if let Some(p) = rest.find(q) {
+                    let inner = &rest[p + 1..];
+                    if let Some(e) = inner.find(q) {
+                        let name = inner[..e].trim();
+                        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == ':' || c == '_' || c == '-')
+                            && seen.insert(name.to_string())
+                        {
+                            out.push(name.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `*.rockspec` (LuaRocks): `dependencies = { "dep >= 1.0", ... }`.
+fn rockspec_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut in_deps = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("dependencies") {
+            in_deps = true;
+        }
+        if in_deps {
+            for q in ['"', '\''] {
+                let mut rest = t;
+                while let Some(p) = rest.find(q) {
+                    let inner = &rest[p + 1..];
+                    if let Some(e) = inner.find(q) {
+                        let dep = inner[..e].trim();
+                        // `dep >= 1.0` or `dep = 1.0` -> name only.
+                        let name = dep
+                            .split(|c: char| c.is_whitespace() || c == '>' || c == '=' || c == '<' || c == '~')
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !name.is_empty() && name != "dependencies" && seen.insert(name.to_string()) {
+                            out.push(name.to_string());
+                        }
+                        rest = &inner[e + 1..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if t.contains('}') {
+                in_deps = false;
+            }
+        }
+    }
+    out
+}
+
+/// `dub.json` (D): `dependencies` object or array.
+fn dub_deps(text: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    match v.get("dependencies") {
+        Some(serde_json::Value::Object(m)) => {
+            for k in m.keys() {
+                if seen.insert(k.clone()) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        Some(serde_json::Value::Array(a)) => {
+            for item in a {
+                if let Some(s) = item.as_str() {
+                    // `"name ~>1.0"` or `"name"`.
+                    let name = s.split_whitespace().next().unwrap_or("");
+                    if !name.is_empty() && seen.insert(name.to_string()) {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// `DESCRIPTION` (R package): `Depends:`, `Imports:`,
+/// `LinkingTo:` comma-separated package names with optional
+/// `(>= version)` constraints. Values may continue on following
+/// indented lines.
+pub(crate) fn description_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        let Some((field, rest)) = line.split_once(':') else { continue };
+        if !matches!(field.trim(), "Depends" | "Imports" | "LinkingTo") {
+            continue;
+        }
+        // Collect continuation lines (indented, no `Field:` prefix).
+        let mut buf = rest.to_string();
+        while i < lines.len() {
+            let cont = lines[i];
+            if !(cont.starts_with(' ') || cont.starts_with('\t')) {
+                break;
+            }
+            if cont.contains(':') && !cont.trim_start().starts_with(',') {
+                break;
+            }
+            buf.push(' ');
+            buf.push_str(cont.trim());
+            i += 1;
+        }
+        for dep in buf.split(',') {
+            let name = dep
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+                && name != "R"
+                && seen.insert(name.to_string())
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `conanfile.py`: `requires = "ref"`, `requires = ("a", "b")`,
+/// plus `tool_requires`/`build_requires`/`test_requires`. Emits
+/// verbatim `pkg/version@user/channel` refs matching conan.lock.
+fn conanfile_py_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for kw in ["requires", "tool_requires", "build_requires", "test_requires"] {
+        let mut rest = text;
+        while let Some(i) = rest.find(&format!("{kw} =")) {
+            let after = &rest[i + kw.len() + 2..];
+            let after = after.trim_start();
+            // Collect quoted strings until newline or closing paren.
+            let end = after.find('\n').unwrap_or(after.len());
+            let seg = &after[..end];
+            let seg_end = seg.find(')').unwrap_or(seg.len());
+            let seg = &seg[..seg_end];
+            let mut s = seg;
+            while let Some(q) = s.find('"') {
+                let inner = &s[q + 1..];
+                if let Some(e) = inner.find('"') {
+                    let dep = inner[..e].trim();
+                    if !dep.is_empty() && seen.insert(dep.to_string()) {
+                        out.push(dep.to_string());
+                    }
+                    s = &inner[e + 1..];
+                } else {
+                    break;
+                }
+            }
+            rest = &rest[i + kw.len() + 2..];
+        }
+    }
+    out
+}
+
+// ---------- GitLab CI ----------
+
+/// `.gitlab-ci.yml`: `image:` values (container refs, same node
+/// style as Dockerfile FROM).
+fn gitlab_ci_deps(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("image:") else { continue };
+        let img = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+        if !img.is_empty() && !img.starts_with('$') && seen.insert(img.to_string()) {
+            out.push(img.to_string());
         }
     }
     out
