@@ -5,8 +5,14 @@
 pub mod callgraph;
 pub mod facts;
 pub mod facts_js;
+pub mod facts_go;
+pub mod facts_rs;
+pub mod go_deep;
 pub mod ipa;
 pub mod js_ipa;
 pub mod models;
+pub mod rust_deep;
 pub mod solver;
+pub mod solver_go;
 pub mod solver_js;
+pub mod solver_rs;

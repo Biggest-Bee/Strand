@@ -1,0 +1,122 @@
+# Rust source/sink/sanitizer model for strand deep --analyze.
+# Dotted names use "::" path separators; the matcher also accepts
+# "." separators and suffix matching, so bare names like "execute"
+# hit "conn::execute" method calls.
+
+[[sources]]
+kind = "env"
+names = [
+  "std::env::var",
+  "std::env::var_os",
+  "std::env::vars",
+  "std::env::vars_os",
+]
+
+[[sources]]
+kind = "argv"
+names = [
+  "std::env::args",
+  "std::env::args_os",
+]
+
+[[sources]]
+kind = "stdin"
+names = [
+  "std::io::stdin",
+]
+
+[[sources]]
+kind = "file"
+names = [
+  "std::fs::read",
+  "std::fs::read_to_string",
+  "std::fs::read_dir",
+]
+
+[[sources]]
+kind = "net"
+names = [
+  "reqwest::get",
+  "reqwest::Client::get",
+  "ureq::get",
+]
+
+# Command construction: tainted program name or argument.
+[[sinks]]
+name = "std::process::Command::new"
+class = "shell"
+arg = 0
+
+[[sinks]]
+name = "std::process::Command::arg"
+class = "shell"
+arg = 0
+
+[[sinks]]
+name = "std::process::Command::args"
+class = "shell"
+arg = 0
+
+# SQL execution through common drivers (rusqlite/sqlx/diesel all
+# funnel through execute/query-shaped methods).
+[[sinks]]
+name = "execute"
+class = "sql"
+arg = 0
+
+[[sinks]]
+name = "execute_batch"
+class = "sql"
+arg = 0
+
+[[sinks]]
+name = "query"
+class = "sql"
+arg = 0
+
+[[sinks]]
+name = "query_row"
+class = "sql"
+arg = 0
+
+[[sinks]]
+name = "query_map"
+class = "sql"
+arg = 0
+
+# Option/Result unwrap-on-absent is handled natively by the Rust
+# walker (PANIC_METHODS -> NullDeref); no model rules needed there.
+
+[[sanitizers]]
+names = [
+  "parse",
+  "from_str",
+  "from_utf8",
+]
+
+# Propagators: derived-value methods that keep taint.
+propagators = [
+  "to_string",
+  "to_owned",
+  "clone",
+  "trim",
+  "trim_start",
+  "trim_end",
+  "trim_matches",
+  "to_lowercase",
+  "to_uppercase",
+  "replace",
+  "repeat",
+  "chars",
+  "bytes",
+  "lines",
+  "split",
+  "splitn",
+  "rsplit",
+  "split_whitespace",
+  "join",
+  "concat",
+  "push_str",
+  "insert_str",
+  "leak",
+]

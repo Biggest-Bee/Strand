@@ -869,12 +869,31 @@ fn assign_pattern(
                     .push((name.to_string(), kind, line_of(assign_node)));
             }
             env.insert(name.to_string(), st);
+            // Per-index/per-key element states for `x = [a, b]` and
+            // `x = {k: v}` so `x[0]`/`x.k` resolve precisely (mirror
+            // of Python's tuple/list per-index tracking). Stale
+            // element entries are dropped when the container is
+            // reassigned a non-literal.
+            if let Some(rhs) = rhs_node(assign_node) {
+                clear_element_states(env, name);
+                record_element_states(name, rhs, ctx, env);
+            } else {
+                clear_element_states(env, name);
+            }
         }
-        "object_pattern"
-        | "array_pattern"
-        | "rest_pattern"
-        | "assignment_pattern"
-        | "parenthesized_expression" => {
+        "object_pattern" | "array_pattern" | "rest_pattern"
+        | "assignment_pattern" | "parenthesized_expression" => {
+            // Destructuring with a matching literal RHS distributes
+            // per element: `const [a, b] = [tainted, clean]`.
+            if target.kind() == "array_pattern" {
+                if let Some(rhs) = rhs_node(assign_node) {
+                    if rhs.kind() == "array"
+                        && try_array_destructure(target, rhs, ctx, env)
+                    {
+                        return;
+                    }
+                }
+            }
             if let Some(keys) = pattern_keys(target, ctx) {
                 for k in keys {
                     let mut st = state.clone();
@@ -905,6 +924,150 @@ fn assign_pattern(
         }
         _ => {}
     }
+}
+
+/// RHS expression node of an assignment-ish node (declarator value
+/// or assignment right).
+fn rhs_node(node: Node) -> Option<Node> {
+    match node.kind() {
+        "variable_declarator" => node.child_by_field_name("value"),
+        "assignment_expression" | "augmented_assignment_expression" => {
+            node.child_by_field_name("right")
+        }
+        _ => None,
+    }
+}
+
+/// True if evaluating this expr cannot produce findings or mutate
+/// analysis state (no calls, assignments, awaits, updates).
+fn expr_is_side_effect_free(node: Node) -> bool {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if matches!(
+            n.kind(),
+            "call_expression" | "new_expression" | "assignment_expression"
+                | "augmented_assignment_expression" | "await_expression"
+                | "yield_expression" | "update_expression"
+        ) {
+            return false;
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            if ch.is_named() {
+                stack.push(ch);
+            }
+        }
+    }
+    true
+}
+
+/// Drop tracked `name[i]` / `name.key` entries (container rebound).
+fn clear_element_states(env: &mut HashMap<String, VarState>, name: &str) {
+    let pi = format!("{name}[");
+    let pk = format!("{name}.");
+    env.retain(|k, _| !k.starts_with(&pi) && !k.starts_with(&pk));
+}
+
+/// Record `name[i]` / `name.key` env entries for array/object literal
+/// RHS with side-effect-free elements (re-eval is finding-free).
+fn record_element_states(
+    name: &str,
+    rhs: Node,
+    ctx: &mut CtxJs,
+    env: &mut HashMap<String, VarState>,
+) {
+    match rhs.kind() {
+        "array" => {
+            let elems: Vec<Node> = rhs
+                .children(&mut rhs.walk())
+                .filter(|k| k.is_named() && k.kind() != "spread_element")
+                .collect();
+            if elems.is_empty()
+                || !elems.iter().all(|e| expr_is_side_effect_free(*e))
+            {
+                return;
+            }
+            for (i, e) in elems.iter().enumerate() {
+                let v = eval_expr(*e, ctx, env);
+                let mut est = v.state.clone();
+                if est.taint.is_none() {
+                    est.taint = v.source_label.clone();
+                }
+                env.insert(format!("{name}[{i}]"), est);
+            }
+        }
+        "object" => {
+            let mut c = rhs.walk();
+            for ch in rhs.children(&mut c) {
+                if ch.kind() != "pair" || !expr_is_side_effect_free(ch) {
+                    continue;
+                }
+                let Some(key_node) = ch.child_by_field_name("key") else {
+                    continue;
+                };
+                let key = match key_node.kind() {
+                    "property_identifier" | "identifier" => key_node
+                        .utf8_text(ctx.f.text.as_bytes())
+                        .ok()
+                        .map(str::to_string),
+                    "string" | "number" => js_ipa::spec_string(
+                        key_node,
+                        ctx.f.text.as_str(),
+                    )
+                    .or_else(|| {
+                        key_node
+                            .utf8_text(ctx.f.text.as_bytes())
+                            .ok()
+                            .map(str::to_string)
+                    }),
+                    _ => None,
+                };
+                let (Some(key), Some(val)) =
+                    (key, ch.child_by_field_name("value"))
+                else {
+                    continue;
+                };
+                if !expr_is_side_effect_free(val) {
+                    continue;
+                }
+                let v = eval_expr(val, ctx, env);
+                let mut est = v.state.clone();
+                if est.taint.is_none() {
+                    est.taint = v.source_label.clone();
+                }
+                env.insert(format!("{name}.{key}"), est);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `const [a, b] = [x, y]` with matching arity and side-effect-free
+/// elements: distribute per-element states. Returns true when handled.
+fn try_array_destructure(
+    pat: Node,
+    rhs: Node,
+    ctx: &mut CtxJs,
+    env: &mut HashMap<String, VarState>,
+) -> bool {
+    let elems: Vec<Node> = pat
+        .children(&mut pat.walk())
+        .filter(|k| k.is_named())
+        .collect();
+    let relems: Vec<Node> = rhs
+        .children(&mut rhs.walk())
+        .filter(|k| k.is_named() && k.kind() != "spread_element")
+        .collect();
+    if elems.len() != relems.len()
+        || !relems.iter().all(|e| expr_is_side_effect_free(*e))
+    {
+        return false;
+    }
+    for (t, r) in elems.iter().zip(relems.iter()) {
+        let v = eval_expr(*r, ctx, env);
+        assign_pattern(*t, v.state.clone(), v.source_label.clone(), ctx, env, rhs);
+    }
+    true
 }
 
 /// If this assignment's RHS is a resource-acquiring call, return kind.
@@ -1097,21 +1260,32 @@ fn eval_expr(node: Node, ctx: &mut CtxJs, env: &mut HashMap<String, VarState>) -
                     st.is_none = false;
                 }
             }
+            // env key lookup: an exact tracked entry (`x[0]`, `o.k`)
+            // is authoritative for that element - sibling taint in
+            // the container's joined state must not leak into it.
+            // Dynamic subscripts with no exact entry fall back to
+            // the container state.
             if let Some(key) = expr_key(node, ctx, env) {
-                let prev = env
-                    .get(&key)
-                    .or_else(|| key.split_once('[').and_then(|(b, _)| env.get(b)));
-                if let Some(prev) = prev {
-                    if prev.taint.is_some() || prev.is_none || prev.resource.is_some() {
-                        let mut merged = st.clone();
-                        if prev.taint.is_some() {
-                            merged.taint = prev.taint.clone();
+                if env.contains_key(&key) {
+                    // Exact tracked element/key state is authoritative.
+                    st = env.get(&key).cloned().unwrap_or_default();
+                } else {
+                    let base = key
+                        .split_once('[')
+                        .map(|(b, _)| b)
+                        .and_then(|b| env.get(b));
+                    if let Some(prev) = base {
+                        if prev.taint.is_some() || prev.is_none || prev.resource.is_some() {
+                            let mut merged = st.clone();
+                            if prev.taint.is_some() {
+                                merged.taint = prev.taint.clone();
+                            }
+                            merged.is_none |= prev.is_none;
+                            if prev.resource.is_some() {
+                                merged.resource = prev.resource.clone();
+                            }
+                            st = merged;
                         }
-                        merged.is_none |= prev.is_none;
-                        if prev.resource.is_some() {
-                            merged.resource = prev.resource.clone();
-                        }
-                        st = merged;
                     }
                 }
             }
@@ -1933,6 +2107,51 @@ main();
             "parseInt sanitizer should stop argv taint: {:?}",
             out.findings
         );
+    }
+
+    #[test]
+    fn per_index_array_tracking() {
+        // x[0] tainted, x[1] clean - only index 0 should reach eval.
+        let out = run(&[(
+            "t.js",
+            "function main() {\n  const pair = [process.env.X, 'ok'];\n  eval(pair[0]);\n  eval(pair[1]);\n}\n",
+        )]);
+        let hits: Vec<_> = out
+            .findings
+            .iter()
+            .filter(|f| f.class == SinkKind::CodeExec)
+            .collect();
+        assert_eq!(hits.len(), 1, "only pair[0] should flag: {:?}", out.findings);
+        assert_eq!(hits[0].line, 3);
+    }
+
+    #[test]
+    fn array_destructuring_per_element() {
+        let out = run(&[(
+            "t.js",
+            "function main() {\n  const [bad, good] = [process.env.X, 'ok'];\n  eval(bad);\n  eval(good);\n}\n",
+        )]);
+        let hits: Vec<_> = out
+            .findings
+            .iter()
+            .filter(|f| f.class == SinkKind::CodeExec)
+            .collect();
+        assert_eq!(hits.len(), 1, "only bad should flag: {:?}", out.findings);
+        assert_eq!(hits[0].line, 3);
+    }
+
+    #[test]
+    fn object_literal_key_tracking() {
+        let out = run(&[(
+            "t.js",
+            "const cp = require('child_process');\nfunction main() {\n  const o = { cmd: process.env.X, ok: 'ls' };\n  cp.exec(o.cmd);\n  cp.exec(o.ok);\n}\n",
+        )]);
+        let hits: Vec<_> = out
+            .findings
+            .iter()
+            .filter(|f| f.class == SinkKind::Shell)
+            .collect();
+        assert_eq!(hits.len(), 1, "only o.cmd should flag: {:?}", out.findings);
     }
 
     #[test]

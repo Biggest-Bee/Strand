@@ -934,6 +934,40 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
         .filter_map(|(_, f)| f)
         .collect();
 
+    // Go files: parsed once here for the Go solver under --analyze.
+    // Module prefixes (go.mod) discovered once for import resolution.
+    let go_files: Vec<(String, PathBuf)> = scan
+        .nodes
+        .iter()
+        .filter(|n| n.to_lowercase().ends_with(".go"))
+        .map(|n| (n.clone(), root.join(n)))
+        .collect();
+    let (go_parsed, go_mods) = if go_files.is_empty() {
+        (Vec::new(), None)
+    } else {
+        let mods = deep::go_deep::discover_modules(&root);
+        let parsed = deep::go_deep::analyze_files(&go_files)
+            .into_iter()
+            .filter_map(|(_, f)| f)
+            .collect();
+        (parsed, Some(mods))
+    };
+
+    // Rust files: parsed once here for the Rust solver under
+    // --analyze. Module identity is the file path; cross-file
+    // resolution uses a module-suffix index.
+    let rs_files: Vec<(String, PathBuf)> = scan
+        .nodes
+        .iter()
+        .filter(|n| n.to_lowercase().ends_with(".rs"))
+        .map(|n| (n.clone(), root.join(n)))
+        .collect();
+    let rs_parsed: Vec<deep::rust_deep::RsFile> =
+        deep::rust_deep::analyze_files(&rs_files)
+            .into_iter()
+            .filter_map(|(_, f)| f)
+            .collect();
+
     if a.analyze {
         let model = match &a.models {
             Some(dir) => {
@@ -1032,6 +1066,98 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
                 );
             }
             std::mem::forget(jsol);
+        }
+
+        // Go solver: same Summary engine over GoFiles with the
+        // go.toml model. Skipped entirely for non-Go projects.
+        if !go_parsed.is_empty() {
+            if let Some(mods) = &go_mods {
+                let go_model = match &a.models {
+                    Some(dir) => {
+                        let models = models::load_dir(dir)
+                            .map_err(strand_core::Error::Usage)?;
+                        models
+                            .get("go")
+                            .cloned()
+                            .or_else(|| models::go_default().ok())
+                            .ok_or_else(|| {
+                                strand_core::Error::Usage("no go model".to_string())
+                            })?
+                    }
+                    None => models::go_default()
+                        .map_err(strand_core::Error::Usage)?,
+                };
+                let t_go = std::time::Instant::now();
+                let gosol =
+                    deep::solver_go::solve_go(&go_parsed, mods, &go_model);
+                eprintln!(
+                    "go solve: {} functions, {} SCCs ({} cyclic), {} iters, {} findings ({:.1?})",
+                    gosol.stats.functions,
+                    gosol.stats.sccs,
+                    gosol.stats.cyclic_sccs,
+                    gosol.stats.fixpoint_iters,
+                    gosol.stats.findings,
+                    t_go.elapsed()
+                );
+                for f in &gosol.findings {
+                    println!(
+                        "[{:?}] {}:{} {} - {} (via {}) [{:.0}%]",
+                        f.class,
+                        f.file,
+                        f.line,
+                        f.sink,
+                        f.source,
+                        f.via.join(" -> "),
+                        f.confidence * 100.0
+                    );
+                }
+                std::mem::forget(gosol);
+            }
+        }
+
+        // Rust solver: same Summary engine over RsFiles with the
+        // rust.toml model. Skipped entirely for non-Rust projects.
+        if !rs_parsed.is_empty() {
+            let rs_model = match &a.models {
+                Some(dir) => {
+                    let models = models::load_dir(dir)
+                        .map_err(strand_core::Error::Usage)?;
+                    models
+                        .get("rust")
+                        .or_else(|| models.get("rs"))
+                        .cloned()
+                        .or_else(|| models::rust_default().ok())
+                        .ok_or_else(|| {
+                            strand_core::Error::Usage("no rust model".to_string())
+                        })?
+                }
+                None => models::rust_default()
+                    .map_err(strand_core::Error::Usage)?,
+            };
+            let t_rs = std::time::Instant::now();
+            let rssol = deep::solver_rs::solve_rs(&rs_parsed, &rs_model);
+            eprintln!(
+                "rust solve: {} functions, {} SCCs ({} cyclic), {} iters, {} findings ({:.1?})",
+                rssol.stats.functions,
+                rssol.stats.sccs,
+                rssol.stats.cyclic_sccs,
+                rssol.stats.fixpoint_iters,
+                rssol.stats.findings,
+                t_rs.elapsed()
+            );
+            for f in &rssol.findings {
+                println!(
+                    "[{:?}] {}:{} {} - {} (via {}) [{:.0}%]",
+                    f.class,
+                    f.file,
+                    f.line,
+                    f.sink,
+                    f.source,
+                    f.via.join(" -> "),
+                    f.confidence * 100.0
+                );
+            }
+            std::mem::forget(rssol);
         }
     }
 

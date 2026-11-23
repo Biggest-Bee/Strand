@@ -1,0 +1,66 @@
+# Go taint/nil/leak model - defaults for strand deep.
+# Dotted names use canonical package names: the import's local name
+# resolves to the package's real name (`e "os/exec"` still matches
+# "exec.Command"; `gopkg.in/yaml.v3` canonicalizes to "yaml").
+
+[[sources]]
+kind = "env"
+names = ["os.Getenv", "os.LookupEnv"]
+
+[[sources]]
+kind = "argv"
+names = ["os.Args"]
+
+[[sources]]
+kind = "stdin"
+names = ["os.Stdin"]
+
+[[sources]]
+kind = "file"
+names = ["os.ReadFile", "ioutil.ReadFile"]
+
+[[sources]]
+kind = "net"
+names = ["http.Get", "http.Post", "http.PostForm", "http.Head", "http.ReadResponse"]
+
+[[sanitizers]]
+names = ["Atoi", "ParseInt", "ParseFloat", "ParseBool", "ParseUint", "EscapeString", "HTMLEscapeString", "QueryEscape", "PathEscape"]
+
+[[sinks]]
+name = "exec.Command"
+class = "shell"
+
+[[sinks]]
+name = "os.StartProcess"
+class = "shell"
+
+[[sinks]]
+name = "Query"
+class = "sql"
+
+[[sinks]]
+name = "QueryContext"
+class = "sql"
+
+[[sinks]]
+name = "Exec"
+class = "sql"
+
+[[sinks]]
+name = "ExecContext"
+class = "sql"
+
+[[sinks]]
+name = "QueryRow"
+class = "sql"
+
+[[sinks]]
+name = "QueryRowContext"
+class = "sql"
+
+[[sinks]]
+name = "yaml.Unmarshal"
+class = "deser"
+arg = 0
+
+propagators = ["fmt.Sprintf", "fmt.Sprint", "strings.Join", "strings.Replace", "strings.ReplaceAll", "strings.Repeat", "strings.ToUpper", "strings.ToLower", "strings.TrimSpace", "strconv.Itoa", "strconv.FormatInt", "strconv.FormatUint"]

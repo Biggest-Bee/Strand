@@ -95,11 +95,18 @@ impl Model {
             .collect()
     }
 
-    /// Sink rules matching a dotted call name.
+    /// Sink rules matching a dotted call name. Matches on "." or
+    /// "::" separators so Rust paths (`conn::execute`) hit bare
+    /// rules (`execute`) the same way JS (`conn.execute`) does.
     pub fn sinks_for<'a>(&'a self, dotted: &str) -> Vec<&'a SinkRule> {
         self.sinks
             .iter()
-            .filter(|r| dotted == r.name || dotted.ends_with(&format!(".{}", r.name)) || r.name == "*")
+            .filter(|r| {
+                dotted == r.name
+                    || dotted.ends_with(&format!(".{}", r.name))
+                    || dotted.ends_with(&format!("::{}", r.name))
+                    || r.name == "*"
+            })
             .collect()
     }
 
@@ -109,7 +116,12 @@ impl Model {
     /// `sys.argv[1]`).
     pub fn source_kind(&self, dotted: &str) -> Option<SourceKind> {
         for rule in &self.sources {
-            if rule.names.iter().any(|n| dotted == *n || dotted.starts_with(&format!("{n}.")) || n == "*") {
+            if rule.names.iter().any(|n| {
+                dotted == *n
+                    || dotted.starts_with(&format!("{n}."))
+                    || dotted.starts_with(&format!("{n}::"))
+                    || n == "*"
+            }) {
                 return Some(rule.kind.clone());
             }
         }
@@ -151,4 +163,16 @@ pub fn python_default() -> Result<Model, String> {
 pub fn js_default() -> Result<Model, String> {
     toml::from_str(include_str!("js.toml"))
         .map_err(|e| format!("embedded js.toml: {e}"))
+}
+
+/// Parse the embedded Go default model.
+pub fn go_default() -> Result<Model, String> {
+    toml::from_str(include_str!("go.toml"))
+        .map_err(|e| format!("embedded go.toml: {e}"))
+}
+
+/// Parse the embedded Rust default model.
+pub fn rust_default() -> Result<Model, String> {
+    toml::from_str(include_str!("rust.toml"))
+        .map_err(|e| format!("embedded rust.toml: {e}"))
 }
