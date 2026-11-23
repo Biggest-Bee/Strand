@@ -69,6 +69,7 @@ pub enum Lang {
     Rust,
     Python,
     Js,
+    Go,
 }
 
 /// A Python source file's text plus its tree-sitter tree, handed back
@@ -99,6 +100,7 @@ fn scan_lang_inner(
         Lang::Rust => scan_rust_impl(root),
         Lang::Python => scan_python_impl(root, py_sink.as_deref_mut()),
         Lang::Js => scan_js_impl(root),
+        Lang::Go => scan_go_impl(root),
     }
 }
 
@@ -3967,6 +3969,506 @@ fn resolve_py_file(
         edge_triples.push((rel.clone(), dep, kind));
     }
     (edge_triples, warns, eps)
+}
+
+// ---------- Go ----------
+
+/// Minimal `go.mod` view for source scanning: module path plus
+/// `require` path->version pairs. `replace`/`exclude` are ignored -
+/// the require path still names the module an import resolves
+/// through, which is what edge targets need.
+struct GoModInfo {
+    module: String,
+    requires: Vec<(String, String)>,
+}
+
+/// Parse `module X` and `require` lines/blocks out of a go.mod.
+fn parse_go_mod_info(text: &str) -> Option<GoModInfo> {
+    let mut module: Option<String> = None;
+    let mut requires: Vec<(String, String)> = Vec::new();
+    let mut in_block = false;
+    for raw in text.lines() {
+        let line = strip_go_line_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if in_block {
+            if line == ")" {
+                in_block = false;
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            if let (Some(p), Some(v)) = (it.next(), it.next()) {
+                requires.push((p.to_string(), v.to_string()));
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("module") {
+            let rest = rest.trim_start();
+            if !rest.is_empty() && !rest.starts_with('(') {
+                module = rest.split_whitespace().next().map(str::to_string);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("require") {
+            let rest = rest.trim_start();
+            if rest.is_empty() || rest.starts_with('(') {
+                in_block = true;
+            } else {
+                let mut it = rest.split_whitespace();
+                if let (Some(p), Some(v)) = (it.next(), it.next()) {
+                    requires.push((p.to_string(), v.to_string()));
+                }
+            }
+            continue;
+        }
+    }
+    module.map(|m| GoModInfo { module: m, requires })
+}
+
+/// Strip a trailing `//` comment without touching `//` inside string
+/// literals (import paths never contain `//`, and directive values
+/// that do are not parsed here).
+fn strip_go_line_comment(line: &str) -> &str {
+    let b = line.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'`' | b'\'' => in_str = !in_str,
+            b'/' if !in_str && i + 1 < b.len() && b[i + 1] == b'/' => {
+                return &line[..i];
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+/// One source line split into code and comment parts.
+struct GoLine {
+    /// Code with comments removed (whitespace preserved).
+    code: String,
+    /// Comment text on this line, delimiters stripped. For `//`
+    /// comments this is the rest of the line; for `/* */` blocks it
+    /// is the inner text (possibly empty on delimiter-only lines).
+    comment: String,
+    /// True when the line carries comment syntax and no code tokens -
+    /// i.e. it can be part of a doc/preamble comment group.
+    comment_only: bool,
+}
+
+/// Split one line into code and comment, tracking `/* */` state
+/// across lines. Byte-wise so UTF-8 content survives.
+fn go_scan_line(raw: &str, in_comment: &mut bool) -> GoLine {
+    let b = raw.as_bytes();
+    let mut code: Vec<u8> = Vec::with_capacity(b.len());
+    let mut comment: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let mut saw_comment = false;
+    let mut saw_code = false;
+    while i < b.len() {
+        if *in_comment {
+            saw_comment = true;
+            if b[i..].starts_with(b"*/") {
+                *in_comment = false;
+                i += 2;
+            } else {
+                comment.push(b[i]);
+                i += 1;
+            }
+        } else if b[i..].starts_with(b"//") {
+            saw_comment = true;
+            comment.extend_from_slice(&b[i + 2..]);
+            break;
+        } else if b[i..].starts_with(b"/*") {
+            saw_comment = true;
+            *in_comment = true;
+            i += 2;
+        } else {
+            if !b[i].is_ascii_whitespace() {
+                saw_code = true;
+            }
+            code.push(b[i]);
+            i += 1;
+        }
+    }
+    GoLine {
+        code: String::from_utf8_lossy(&code).into_owned(),
+        comment: String::from_utf8_lossy(&comment).into_owned(),
+        comment_only: saw_comment && !saw_code,
+    }
+}
+
+/// Quoted string literals in a line of Go code.
+fn go_quoted(s: &str) -> Vec<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'"' {
+            let start = i + 1;
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                if b[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < b.len() {
+                out.push(s[start..i].to_string());
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// One import spec found in a .go file.
+#[derive(Debug)]
+struct GoSpec {
+    /// Import path as written (`"fmt"`, `"github.com/x/y"`, `"C"`).
+    path: String,
+}
+
+/// Imports plus cgo facts extracted from one .go file's text.
+#[derive(Default)]
+struct GoRefs {
+    specs: Vec<GoSpec>,
+    /// `-l<name>` flags and pkg-config names from `#cgo` directives.
+    cgo_libs: Vec<String>,
+    /// `#include "local.h"` paths from the cgo preamble.
+    cgo_includes: Vec<String>,
+}
+
+/// Extract import specs and cgo preamble facts with a line scanner.
+/// Import declarations only appear at top level in Go, and `import`
+/// inside a comment or string is already stripped, so any remaining
+/// `import` line is a real declaration.
+fn go_file_refs(text: &str) -> GoRefs {
+    let mut out = GoRefs::default();
+    let mut in_comment = false;
+    let mut in_block = false;
+    let mut cgo_lines: Vec<usize> = Vec::new();
+    let mut scanned: Vec<GoLine> = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let gl = go_scan_line(raw, &mut in_comment);
+        let line = gl.code.trim().to_string();
+        scanned.push(gl);
+        if line.is_empty() {
+            continue;
+        }
+        if in_block {
+            if line == ")" {
+                in_block = false;
+                continue;
+            }
+            for p in go_quoted(&line) {
+                if p == "C" {
+                    cgo_lines.push(i);
+                }
+                out.specs.push(GoSpec { path: p });
+            }
+            continue;
+        }
+        if line == "import (" {
+            in_block = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("import") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                let inner = &rest[1..];
+                if inner.contains(')') {
+                    // `import("a" "b")` - inline parenthesized specs.
+                    for p in go_quoted(inner) {
+                        if p == "C" {
+                            cgo_lines.push(i);
+                        }
+                        out.specs.push(GoSpec { path: p });
+                    }
+                } else {
+                    in_block = true;
+                }
+                continue;
+            }
+            for p in go_quoted(rest) {
+                if p == "C" {
+                    cgo_lines.push(i);
+                }
+                out.specs.push(GoSpec { path: p });
+            }
+        }
+    }
+    // cgo preamble: the comment group immediately above each `import
+    // "C"` spec/declaration carries `#cgo` flags and `#include`s.
+    // Works for both // line comments and /* */ block preambles.
+    for &i in &cgo_lines {
+        let mut j = i;
+        let mut comments: Vec<&str> = Vec::new();
+        while j > 0 {
+            j -= 1;
+            let gl = &scanned[j];
+            if gl.comment_only {
+                comments.push(gl.comment.as_str());
+            } else {
+                break;
+            }
+        }
+        for c in comments.iter().rev() {
+            let c = c.trim();
+            if c.is_empty() {
+                continue;
+            }
+            if let Some(directive) = c.strip_prefix("#cgo") {
+                for tok in directive.split_whitespace() {
+                    if let Some(lib) = tok.strip_prefix("-l") {
+                        if !lib.is_empty() {
+                            out.cgo_libs.push(lib.to_string());
+                        }
+                    }
+                }
+                // `pkg-config: foo bar` names real native deps too.
+                if let Some(pc) = directive.split("pkg-config:").nth(1) {
+                    for name in pc.split(|c: char| c.is_whitespace() || c == ',') {
+                        let name = name.trim();
+                        if !name.is_empty() && !name.starts_with('-') {
+                            out.cgo_libs.push(format!("pkg-config:{name}"));
+                        }
+                    }
+                }
+            } else if let Some(inc) = c
+                .strip_prefix("#include")
+                .map(str::trim)
+            {
+                // Only quoted includes are project-local files;
+                // <...> are system headers.
+                if let Some(inner) = inc
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                {
+                    out.cgo_includes.push(inner.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolve one import path against a file's module context.
+/// Returns the edge target node name, or None for stdlib imports
+/// (no edge - the standard library is not a dependency).
+fn go_import_target(
+    path: &str,
+    module: Option<&GoModInfo>,
+) -> Option<String> {
+    let Some(mi) = module else {
+        // No go.mod in scope: still record the declared import as a
+        // bare node (version unknowable), unless it is clearly
+        // standard library.
+        let first = path.split('/').next().unwrap_or(path);
+        if !first.contains('.') {
+            return None;
+        }
+        return Some(path.to_string());
+    };
+    // Local package: the main module itself or a subpackage of it.
+    if path == mi.module || path.starts_with(&format!("{}/", mi.module)) {
+        return Some(format!("gopkg:{path}"));
+    }
+    // External: longest require-prefix wins, same rule the go tool
+    // uses to map an import path to its providing module. The bare
+    // module path is the target so the edge lands on the same node
+    // go.mod/go.sum edges already produce.
+    let mut best: Option<&str> = None;
+    for (req, _) in &mi.requires {
+        if path == req || path.starts_with(&format!("{req}/")) {
+            if best.is_none_or(|b| req.len() > b.len()) {
+                best = Some(req);
+            }
+        }
+    }
+    if let Some(req) = best {
+        return Some(req.to_string());
+    }
+    // Standard library: first path element has no dot ("fmt",
+    // "net/http", "encoding/json"). Everything else is an external
+    // import we could not pin to a require - still a declared dep.
+    let first = path.split('/').next().unwrap_or(path);
+    if !first.contains('.') {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+fn scan_go_impl(root: &Path) -> Result<ScanOutput> {
+    // Collect go.mod files first - they define module context for
+    // every .go file beneath them (nearest ancestor wins, matching
+    // the go tool's nested-module rule).
+    let mut gomod_files: Vec<(String, PathBuf)> = Vec::new();
+    walk_files(root, root, &mut |rel, abs| {
+        if rel == "go.mod" || rel.ends_with("/go.mod") {
+            gomod_files.push((rel, abs));
+        }
+    });
+    gomod_files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut mod_by_dir: BTreeMap<String, GoModInfo> = BTreeMap::new();
+    for (rel, abs) in &gomod_files {
+        let Ok(bytes) = fs::read(abs) else { continue };
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(info) = parse_go_mod_info(&text) {
+            // "a/b/go.mod" -> module root dir "a/b"; "go.mod" -> "".
+            let dir = rel
+                .strip_suffix("/go.mod")
+                .map(str::to_string)
+                .unwrap_or_default();
+            mod_by_dir.insert(dir, info);
+        }
+    }
+
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    walk_ext(root, root, &["go"], &mut files)?;
+    // vendor/ trees are vendored copies of external modules - their
+    // imports are already represented by the parent's go.mod.
+    files.retain(|(rel, _)| !rel.split('/').any(|s| s == "vendor"));
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let extracted = files
+        .par_iter()
+        .map(|(rel, abs)| {
+            let bytes = fs::read(abs)
+                .map_err(|e| Error::Usage(format!("{}: {e}", abs.display())))?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            Ok((rel.clone(), go_file_refs(&text)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut edges: EdgeList = Vec::new();
+    let mut nodes: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    let mut dep_nodes: BTreeSet<String> = BTreeSet::new();
+
+    for ((rel, _abs), (_rel2, refs)) in files.iter().zip(extracted) {
+        // Nearest ancestor go.mod = this file's module.
+        let mut module: Option<&GoModInfo> = None;
+        let mut dir = parent_rel(rel).to_string();
+        loop {
+            if let Some(mi) = mod_by_dir.get(&dir) {
+                module = Some(mi);
+                break;
+            }
+            if dir.is_empty() {
+                break;
+            }
+            dir = parent_rel(&dir).to_string();
+        }
+
+        let mut deps: BTreeMap<String, EdgeKind> = BTreeMap::new();
+
+        // Package membership: every .go file belongs to the package
+        // at its directory. Convention-derived, so Heuristic.
+        if let Some(mi) = module {
+            let mod_dir = mod_dir_of(rel, &mod_by_dir);
+            let pkg = go_package_path(mi, rel, mod_dir.as_deref());
+            if !pkg.is_empty() {
+                let node = format!("gopkg:{pkg}");
+                note_dep(&mut deps, node.clone(), EdgeKind::Heuristic);
+                dep_nodes.insert(node);
+            }
+        }
+
+        for spec in &refs.specs {
+            if spec.path == "C" {
+                note_dep(&mut deps, "native:cgo".to_string(), EdgeKind::Resolved);
+                dep_nodes.insert("native:cgo".to_string());
+                continue;
+            }
+            if let Some(target) = go_import_target(&spec.path, module) {
+                note_dep(&mut deps, target.clone(), EdgeKind::Declared);
+                dep_nodes.insert(target);
+            }
+        }
+
+        // cgo preamble facts: `-l` libs and pkg-config names are
+        // native deps; quoted #includes are project files.
+        for lib in &refs.cgo_libs {
+            let node = format!("native:{lib}");
+            note_dep(&mut deps, node.clone(), EdgeKind::Resolved);
+            dep_nodes.insert(node);
+        }
+        let parent = parent_rel(rel);
+        for inc in &refs.cgo_includes {
+            if let Some(dep) = normalize_rel(parent, inc)
+                .filter(|c| root.join(c.as_str()).is_file() && c.as_str() != rel.as_str())
+            {
+                note_dep(&mut deps, dep, EdgeKind::Resolved);
+            }
+        }
+
+        for (dep, kind) in deps {
+            edges.push((rel.clone(), dep, None, kind));
+        }
+    }
+    nodes.extend(dep_nodes);
+    nodes.sort();
+    nodes.dedup();
+    Ok(ScanOutput {
+        edges,
+        nodes,
+        warnings: Vec::new(),
+    })
+}
+
+/// Directory (root-relative) of the go.mod governing `rel`, found by
+/// walking ancestors - mirrors the module lookup in `scan_go_impl`.
+fn mod_dir_of<'a>(
+    rel: &str,
+    mod_by_dir: &'a BTreeMap<String, GoModInfo>,
+) -> Option<String> {
+    let mut dir = parent_rel(rel).to_string();
+    loop {
+        if mod_by_dir.contains_key(&dir) {
+            return Some(dir);
+        }
+        if dir.is_empty() {
+            return None;
+        }
+        dir = parent_rel(&dir).to_string();
+    }
+}
+
+/// Import-path form of the package containing `rel`: the module path
+/// plus the file's directory relative to the module root.
+fn go_package_path(mi: &GoModInfo, rel: &str, mod_dir: Option<&str>) -> String {
+    let dir = parent_rel(rel);
+    match mod_dir {
+        Some("") | None => {
+            if dir.is_empty() {
+                mi.module.clone()
+            } else {
+                // File is outside the module root (shouldn't happen -
+                // mod_dir was found as an ancestor) - fall back to
+                // module + dir anyway for a stable node name.
+                format!("{}/{}", mi.module, dir)
+            }
+        }
+        Some(md) => {
+            if dir == md {
+                mi.module.clone()
+            } else {
+                // dir is md + "/" + sub by construction.
+                let sub = dir.strip_prefix(md).unwrap_or(dir);
+                let sub = sub.trim_start_matches('/');
+                if sub.is_empty() {
+                    mi.module.clone()
+                } else {
+                    format!("{}/{sub}", mi.module)
+                }
+            }
+        }
+    }
 }
 
 /// Per-file extraction result carried from the parallel parse phase

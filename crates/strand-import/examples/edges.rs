@@ -1,7 +1,7 @@
 //! Dump scan edges as sorted `src -> dst` lines - for diffing scanner
 //! implementations and debugging resolution.
 //!
-//! Usage: cargo run -p strand-import --example edges -- <dir> [--lang rust|python|js|all]
+//! Usage: cargo run -p strand-import --example edges -- <dir> [--lang rust|python|js|go|all]
 
 use std::path::PathBuf;
 
@@ -14,9 +14,13 @@ fn main() {
         Some("rust") => Lang::Rust,
         Some("python") => Lang::Python,
         Some("js") => Lang::Js,
+        Some("go") => Lang::Go,
         _ => {
-            let out = scan::scan_project(&dir, &[Lang::Rust, Lang::Python, Lang::Js])
-                .expect("scan failed");
+            let out = scan::scan_project(
+                &dir,
+                &[Lang::Rust, Lang::Python, Lang::Js, Lang::Go],
+            )
+            .expect("scan failed");
             print_out(&out);
             return;
         }

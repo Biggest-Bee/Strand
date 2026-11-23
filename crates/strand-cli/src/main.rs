@@ -168,6 +168,8 @@ enum ScanLang {
     Python,
     /// JavaScript/TypeScript (.ts/.tsx/.js/.jsx/.mjs/.cjs).
     Js,
+    /// Go sources (.go): import specs resolved against go.mod modules.
+    Go,
     /// All supported languages merged (default).
     All,
 }
@@ -574,7 +576,8 @@ fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
         ScanLang::Rust => vec![Lang::Rust],
         ScanLang::Python => vec![Lang::Python],
         ScanLang::Js => vec![Lang::Js],
-        ScanLang::All => vec![Lang::Rust, Lang::Python, Lang::Js],
+        ScanLang::Go => vec![Lang::Go],
+        ScanLang::All => vec![Lang::Rust, Lang::Python, Lang::Js, Lang::Go],
     };
     let scan = strand_import::scan::scan_project(&root, &langs)?;
     for w in &scan.warnings {
@@ -618,7 +621,10 @@ fn cmd_trace(a: TraceArgs) -> strand_core::Result<()> {
         PathBuf::from(format!("{name}.strand"))
     });
     use strand_import::scan::Lang;
-    let scan = strand_import::scan::scan_project(&root, &[Lang::Rust, Lang::Python, Lang::Js])?;
+    let scan = strand_import::scan::scan_project(
+        &root,
+        &[Lang::Rust, Lang::Python, Lang::Js, Lang::Go],
+    )?;
     for w in &scan.warnings {
         eprintln!("warning: {w}");
     }

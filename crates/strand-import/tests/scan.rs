@@ -1588,3 +1588,134 @@ fn scan_registry_configs() {
         out.edges
     );
 }
+
+// ---------- Go scanner ----------
+
+/// Fixture Go module: stdlib, external, local package, alias/block
+/// imports, and a cgo file.
+fn go_fixture(root: &Path) {
+    w(
+        root,
+        "go.mod",
+        "module example.com/proj\n\ngo 1.22\n\nrequire (\n\tgithub.com/foo/bar v1.2.3\n\tgolang.org/x/mod v0.20.0 // indirect\n)\n",
+    );
+    w(
+        root,
+        "cmd/app/main.go",
+        "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\n\tbar \"github.com/foo/bar\"\n\t\"github.com/foo/bar/sub\"\n\t. \"golang.org/x/mod/semver\"\n\t_ \"example.com/proj/internal/secret\"\n\n\t\"example.com/proj/pkg/util\"\n)\n\nfunc main() { fmt.Println(bar.X, http.DefaultClient) }\n",
+    );
+    w(
+        root,
+        "pkg/util/util.go",
+        "package util\n\nimport \"strings\"\n\nfunc Up(s string) string { return strings.ToUpper(s) }\n",
+    );
+    w(
+        root,
+        "internal/secret/s.go",
+        "package secret\n\nimport \"os\"\n\nvar Env = os.Getenv(\"X\")\n",
+    );
+    // cgo file: preamble carries -l flag and a quoted include.
+    w(
+        root,
+        "nativebind/bind.go",
+        "package nativebind\n\n/*\n#include <stdio.h>\n#include \"local.h\"\n#cgo LDFLAGS: -lfoo -lbar\n#cgo pkg-config: openssl\n*/\nimport \"C\"\n\nfunc Bind() {}\n",
+    );
+    w(root, "nativebind/local.h", "int x;\n");
+    // vendor copy must be skipped entirely.
+    w(root, "vendor/github.com/foo/bar/v.go", "package bar\nimport \"fmt\"\n");
+    // import inside comments/strings must not produce edges.
+    w(
+        root,
+        "cmd/app/notes.go",
+        "package main\n\n// import \"github.com/evil/dep\"\nvar s = `import \"also/evil\"`\n/* import \"block/evil\" */\n",
+    );
+}
+
+#[test]
+fn scan_go_imports_and_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    go_fixture(dir.path());
+    let out = scan_lang(dir.path(), Lang::Go).unwrap();
+    let has = |d: &str| out.edges.iter().any(|(_, b, ..)| b == d);
+
+    // External imports resolve to their providing module (longest
+    // require prefix), bridging to go.mod/go.sum nodes.
+    assert!(has("github.com/foo/bar"), "edges: {:?}", out.edges);
+    // `github.com/foo/bar/sub` is served by module github.com/foo/bar.
+    assert!(has("golang.org/x/mod"), "edges: {:?}", out.edges);
+    // Local packages become gopkg: nodes.
+    assert!(has("gopkg:example.com/proj/pkg/util"), "edges: {:?}", out.edges);
+    assert!(
+        has("gopkg:example.com/proj/internal/secret"),
+        "edges: {:?}",
+        out.edges
+    );
+    // Stdlib imports produce no edges.
+    assert!(!has("fmt") && !has("net/http") && !has("strings") && !has("os"));
+    // Comment/string/block-comment imports are ignored.
+    assert!(!has("github.com/evil/dep") && !has("also/evil") && !has("block/evil"));
+    // vendor/ files are skipped.
+    assert!(!out.nodes.iter().any(|n| n.contains("vendor/")));
+    // cgo: native marker + -l libs + pkg-config + local include edge.
+    assert!(has("native:cgo"), "edges: {:?}", out.edges);
+    assert!(has("native:foo") && has("native:bar"), "edges: {:?}", out.edges);
+    assert!(has("native:pkg-config:openssl"), "edges: {:?}", out.edges);
+    assert!(has("nativebind/local.h"), "edges: {:?}", out.edges);
+    // Package membership edges exist (file -> its gopkg node).
+    assert!(
+        out.edges.iter().any(|(s, d, ..)| {
+            s == "pkg/util/util.go" && d == "gopkg:example.com/proj/pkg/util"
+        }),
+        "edges: {:?}",
+        out.edges
+    );
+    // cmd/app/main.go is in package example.com/proj/cmd/app.
+    assert!(
+        out.edges.iter().any(|(s, d, ..)| {
+            s == "cmd/app/main.go" && d == "gopkg:example.com/proj/cmd/app"
+        }),
+        "edges: {:?}",
+        out.edges
+    );
+}
+
+#[test]
+fn scan_go_nested_module_and_no_go_mod() {
+    let dir = tempfile::tempdir().unwrap();
+    // Nested module: inner go.mod shadows the outer one for its files.
+    w(dir.path(), "go.mod", "module example.com/outer\n");
+    w(
+        dir.path(),
+        "inner/go.mod",
+        "module example.com/inner\n\nrequire github.com/a/b v0.0.1\n",
+    );
+    w(
+        dir.path(),
+        "inner/x.go",
+        "package inner\n\nimport (\n\t\"example.com/inner/sub\"\n\t\"github.com/a/b\"\n\t\"github.com/a/b/c\"\n)\n",
+    );
+    w(dir.path(), "inner/sub/s.go", "package sub\n");
+    // File with no go.mod anywhere: dotted imports still recorded
+    // bare, stdlib skipped.
+    w(
+        dir.path(),
+        "loose/y.go",
+        "package loose\n\nimport (\n\t\"fmt\"\n\t\"example.com/unknown/pkg\"\n)\n",
+    );
+    let out = scan_lang(dir.path(), Lang::Go).unwrap();
+    let has = |d: &str| out.edges.iter().any(|(_, b, ..)| b == d);
+    assert!(has("gopkg:example.com/inner/sub"), "edges: {:?}", out.edges);
+    assert!(has("github.com/a/b"), "edges: {:?}", out.edges);
+    // github.com/a/b/c resolves through require github.com/a/b.
+    assert!(has("example.com/unknown/pkg"), "edges: {:?}", out.edges);
+    assert!(!has("fmt"));
+    // loose/y.go sits under the root go.mod, so it belongs to the
+    // outer module's `loose` package - membership edge expected.
+    assert!(
+        out.edges.iter().any(|(s, d, ..)| {
+            s == "loose/y.go" && d == "gopkg:example.com/outer/loose"
+        }),
+        "edges: {:?}",
+        out.edges
+    );
+}
