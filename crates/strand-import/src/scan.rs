@@ -1516,7 +1516,10 @@ fn crate_src_rel(abs: &Path, root: &Path) -> Option<String> {
 
 /// Join `base` (a `/`-separated rel dir) with `p`, resolving `.` and `..`.
 /// Returns `None` if the result escapes the scan root.
-fn normalize_rel(base: &str, p: &str) -> Option<String> {
+/// Join `p` onto `base` (both `/`-separated rel paths),
+/// resolving `.`/`..`; `None` if `..` escapes the root.
+#[doc(hidden)]
+pub fn normalize_rel(base: &str, p: &str) -> Option<String> {
     let mut segs: Vec<&str> = if base.is_empty() {
         Vec::new()
     } else {
@@ -5291,7 +5294,9 @@ fn resolve_py_exact(names: &BTreeSet<String>, base: &str, segs: &[String]) -> Op
 
 // ---------- JS/TS scanner ----------
 
-const JS_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"];
+/// JavaScript/TypeScript source extensions scanned by `Lang::Js`.
+#[doc(hidden)]
+pub const JS_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"];
 
 fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
     let mut files: Vec<(String, PathBuf)> = Vec::new();
@@ -5457,7 +5462,9 @@ fn scan_js_impl(root: &Path) -> Result<ScanOutput> {
 }
 
 /// tree-sitter grammar for a JS/TS file extension.
-fn js_language_for(rel: &str) -> tree_sitter::Language {
+/// tree-sitter grammar for a JS/TS file extension.
+#[doc(hidden)]
+pub fn js_language_for(rel: &str) -> tree_sitter::Language {
     let lower = rel.to_lowercase();
     if lower.ends_with(".tsx") {
         return tree_sitter_typescript::LANGUAGE_TSX.into();
@@ -5495,7 +5502,11 @@ fn js_glob_expand(names: &BTreeSet<String>, bases: &[&str], pattern: &str) -> Ve
 }
 
 /// Resolve a normalized relative JS spec to a file: exact, +ext, /index+ext.
-fn resolve_js(names: &BTreeSet<String>, norm: &str) -> Option<String> {
+/// Resolve an extensionless/dotted JS specifier against the
+/// scanned file set: exact, `+ext`, `.d.ts`, `/index.*`, and the
+/// NodeNext `.js`->`.ts` style remap.
+#[doc(hidden)]
+pub fn resolve_js(names: &BTreeSet<String>, norm: &str) -> Option<String> {
     if names.contains(norm) {
         return Some(norm.to_string());
     }

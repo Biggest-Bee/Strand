@@ -3670,7 +3670,9 @@ dependencies = [
  "thiserror 2.0.21",
  "toml",
  "tree-sitter",
+ "tree-sitter-javascript",
  "tree-sitter-python",
+ "tree-sitter-typescript",
  "ureq",
 ]
 

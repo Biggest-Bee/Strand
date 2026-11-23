@@ -963,7 +963,45 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
     }
 
     let t_ipa = std::time::Instant::now();
-    let res = ipa::analyze_parsed(&parsed, &file_set);
+    let mut res = ipa::analyze_parsed(&parsed, &file_set);
+
+    // JS/TS dynamic import()/require() IPA. JS trees aren't shared
+    // by the scan (only Python trees are), so JS files parse here;
+    // projects without JS pay nothing.
+    let js_names: BTreeSet<String> = scan
+        .nodes
+        .iter()
+        .filter(|n| {
+            let l = n.to_lowercase();
+            l.ends_with(".json")
+                || strand_import::scan::JS_EXTS
+                    .iter()
+                    .any(|e| l.ends_with(&format!(".{e}")))
+        })
+        .cloned()
+        .collect();
+    let js_files: Vec<(String, PathBuf)> = js_names
+        .iter()
+        .map(|n| (n.clone(), root.join(n)))
+        .collect();
+    let js_parsed: Vec<deep::js_ipa::JsFile> = deep::js_ipa::analyze_files(&js_files)
+        .into_iter()
+        .filter_map(|(_, f)| f)
+        .collect();
+    if !js_parsed.is_empty() {
+        let t_js = std::time::Instant::now();
+        let js_res = deep::js_ipa::analyze_js_parsed(&js_parsed, &js_names);
+        eprintln!(
+            "js ipa: {} edges, {} resolved, {} unresolved ({:.1?})",
+            js_res.edges.len(),
+            js_res.resolved,
+            js_res.unresolved.len(),
+            t_js.elapsed()
+        );
+        res.edges.extend(js_res.edges);
+        res.unresolved.extend(js_res.unresolved);
+        res.resolved += js_res.resolved;
+    }
     eprintln!(
         "ipa: {} edges inferred, {} resolved, {} unresolved ({:.1?})",
         res.edges.len(),
