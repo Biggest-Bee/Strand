@@ -852,6 +852,7 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
     use deep::{callgraph, ipa, models, solver};
     use strand_import::scan::{scan_project_with_py, Lang};
 
+    let t0 = std::time::Instant::now();
     let root = strip_verbatim(a.dir.canonicalize()?);
     let out = a
         .output
@@ -863,11 +864,12 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
     let (scan, py_src) =
         scan_project_with_py(&root, &[Lang::Python, Lang::Js, Lang::Rust, Lang::Go])?;
     eprintln!(
-        "scan: {} nodes, {} edges, {} warnings ({:.1?})",
+        "scan: {} nodes, {} edges, {} warnings ({:.1?}; total {:.1?})",
         scan.nodes.len(),
         scan.edges.len(),
         scan.warnings.len(),
-        t_scan.elapsed()
+        t_scan.elapsed(),
+        t0.elapsed()
     );
     for w in &scan.warnings {
         eprintln!("  warn: {w}");
@@ -882,9 +884,10 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
     let t_parse = std::time::Instant::now();
     let parsed = ipa::parse_all_sources(py_src);
     eprintln!(
-        "parse_all: {} files ({:.1?})",
+        "parse_all: {} files ({:.1?}; total {:.1?})",
         parsed.len(),
-        t_parse.elapsed()
+        t_parse.elapsed(),
+        t0.elapsed()
     );
 
     let t_cg = std::time::Instant::now();
@@ -896,6 +899,7 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
         cg.stats.resolution_rate() * 100.0,
         t_cg.elapsed()
     );
+    eprintln!("  [stage] total {:.1?}", t0.elapsed());
     if a.dump_callgraph {
         for ((cm, cf), (tm, tf)) in &cg.edges {
             println!("{cm}.{cf} -> {tm}.{tf}");
@@ -953,6 +957,9 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
                 f.confidence * 100.0
             );
         }
+        // Summaries are dead weight until process exit; skipping the
+        // drop saves teardown time on large repos (deep_exit reclaims).
+        std::mem::forget(sol);
     }
 
     let t_ipa = std::time::Instant::now();
@@ -964,6 +971,7 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
         res.unresolved.len(),
         t_ipa.elapsed()
     );
+    eprintln!("  [stage] total {:.1?}", t0.elapsed());
     for u in res.unresolved.iter().take(20) {
         eprintln!("  unresolved: {u}");
     }
@@ -972,7 +980,7 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
         for (s, d, k) in &res.edges {
             println!("{s} -> {d} [{k:?}]");
         }
-        return Ok(());
+        deep_exit(t0);
     }
 
     let mut b = GraphBuilder::new();
@@ -990,7 +998,18 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
         stats.n_nodes,
         stats.n_edges
     );
-    Ok(())
+    deep_exit(t0)
+}
+
+/// `strand deep` holds every Python file's syntax tree plus the full
+/// call graph in memory; on large repos dropping them costs >1s and
+/// the Windows heap serializes the frees anyway. All remaining
+/// values are plain memory (trees, strings, vecs) with no files,
+/// locks, or sockets open, so exiting directly lets the OS reclaim
+/// it - stdout is line-buffered so output is already flushed.
+fn deep_exit(t0: std::time::Instant) -> ! {
+    eprintln!("  [stage] total {:.1?}", t0.elapsed());
+    std::process::exit(0);
 }
 
 fn root_name(root: &Path) -> String {
