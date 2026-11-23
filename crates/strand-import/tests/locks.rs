@@ -481,7 +481,7 @@ sdks:
 "#;
     let raw = strand_import::parse(text, Format::PubspecLock).unwrap();
     assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "chars@1.4.0"));
-    assert!(raw.iter().any(|(s, d, ..)| d == "collection@1.19.0"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "collection@1.19.0"));
 }
 
 #[test]
@@ -593,23 +593,23 @@ snapshot:
 "#;
     let raw = strand_import::parse(text, Format::StackLock).unwrap();
     assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "aeson@2.2.1.0"));
-    assert!(raw.iter().any(|(s, d, ..)| d == "text@2.0.2"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "text@2.0.2"));
 }
 
 #[test]
 fn mix_lock_flat() {
     let text = "%{\n  \"decimal\": {:hex, :decimal, \"2.0.0\", \"abc\", [:mix], [{:hex, :foo, \"1.0\", \"x\", [:mix], [], \"hexpm\", \"y\"}], \"hexpm\", \"z\"},\n  \"phoenix\": {:hex, :phoenix, \"1.7.21\", \"abc\", [:mix], [], \"hexpm\", \"z\"}\n}\n";
     let raw = strand_import::parse(text, Format::MixLock).unwrap();
-    assert!(raw.iter().any(|(s, d, ..)| d == "decimal@2.0.0"));
-    assert!(raw.iter().any(|(s, d, ..)| d == "phoenix@1.7.21"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "decimal@2.0.0"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "phoenix@1.7.21"));
 }
 
 #[test]
 fn cartfile_resolved_flat() {
     let text = "github \"Alamofire/Alamofire\" \"5.9.1\"\ngit \"https://x/y\" \"abc123\"\n";
     let raw = strand_import::parse(text, Format::CartfileResolved).unwrap();
-    assert!(raw.iter().any(|(s, d, ..)| d == "Alamofire/Alamofire@5.9.1"));
-    assert!(raw.iter().any(|(s, d, ..)| d == "https://x/y@abc123"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "Alamofire/Alamofire@5.9.1"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "https://x/y@abc123"));
 }
 
 #[test]
@@ -623,9 +623,9 @@ fn deno_lock_flat() {
   }
 }"#;
     let raw = strand_import::parse(text, Format::DenoLock).unwrap();
-    assert!(raw.iter().any(|(s, d, ..)| d == "https://deno.land/x/fresh@1.6.8/mod.ts"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "https://deno.land/x/fresh@1.6.8/mod.ts"));
     // npm:-prefixed keys normalize to bare name@version nodes.
-    assert!(raw.iter().any(|(s, d, ..)| d == "lodash@4.17.21"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "lodash@4.17.21"));
 }
 
 #[test]
@@ -656,7 +656,7 @@ fn gradle_verification_components() {
 </verification-metadata>"#;
     let raw = strand_import::parse(text, Format::GradleVerification).unwrap();
     assert!(raw.iter().any(|(s, d, ..)| s == "(lockfile)" && d == "com.google.guava:guava@31.1-jre"));
-    assert!(raw.iter().any(|(s, d, ..)| d == "junit:junit@4.13.2"));
+    assert!(raw.iter().any(|(_, d, ..)| d == "junit:junit@4.13.2"));
 }
 
 #[test]
