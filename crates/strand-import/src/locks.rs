@@ -1723,39 +1723,206 @@ fn deno_url_node(key: &str) -> Option<String> {
     None
 }
 
+/// Split a deno.lock package key `name@version` into (name, version),
+/// tolerating peer suffixes (`1.2.3_peer@4.5.6` -> `1.2.3`) and
+/// `npm:`/`jsr:` protocol prefixes.
+fn deno_split_key(key: &str) -> (String, String) {
+    let key = key
+        .strip_prefix("npm:")
+        .or_else(|| key.strip_prefix("jsr:"))
+        .unwrap_or(key);
+    // Last '@' followed by a digit starts the version (scoped names
+    // keep their leading '@').
+    let bytes = key.as_bytes();
+    let mut cut = None;
+    for (i, &c) in bytes.iter().enumerate().skip(1) {
+        if c == b'@'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|d| d.is_ascii_digit())
+        {
+            cut = Some(i);
+        }
+    }
+    match cut {
+        Some(i) => {
+            let name = &key[..i];
+            let ver = key[i + 1..].split('_').next().unwrap_or("");
+            (name.to_string(), ver.to_string())
+        }
+        None => (key.to_string(), String::new()),
+    }
+}
+
+/// Parse one deno.lock `dependencies` entry: `"name"`,
+/// `"name@version"`, `"@scope/name@version"`, optionally prefixed
+/// `npm:`/`jsr:`. Returns (name, Option<version>).
+fn deno_dep_spec(spec: &str) -> (String, Option<String>) {
+    let (name, ver) = deno_split_key(spec.trim().trim_matches('"'));
+    (name, if ver.is_empty() { None } else { Some(ver) })
+}
+
+/// deno.lock v5 records real edges: `npm`/`jsr` entries carry a
+/// `dependencies` array of resolved specs (`"ms"`, `"@scope/p@1.2.3"`),
+/// `workspace.dependencies` lists the root's specifiers (resolved
+/// through `specifiers`), and `remote`/`workspace` stay flat nodes.
+/// Bare dep names resolve through the lock's own `name@version`
+/// index: unique version pins, several versions emit may-edges.
 pub fn deno_lock(text: &str) -> Result<EdgeList> {
     let v: serde_json::Value =
         serde_json::from_str(text).map_err(|e| err(format!("deno.lock: {e}")))?;
     let mut edges: EdgeList = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for section in ["remote", "npm", "jsr", "workspace"] {
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut nodes: BTreeSet<String> = BTreeSet::new();
+
+    let push = |edges: &mut EdgeList,
+                    seen: &mut BTreeSet<(String, String)>,
+                    nodes: &mut BTreeSet<String>,
+                    src: &str,
+                    dst: String| {
+        if !dst.is_empty() {
+            nodes.insert(dst.clone());
+            if seen.insert((src.to_string(), dst.clone())) {
+                edges.push((
+                    src.to_string(),
+                    dst,
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
+            }
+        }
+    };
+
+    // Index every locked `name@version` node for bare-name dep
+    // resolution.
+    let mut index = VerIndex::default();
+    for section in ["npm", "jsr"] {
         if let Some(obj) = v[section].as_object() {
             for key in obj.keys() {
-                if seen.insert(key.clone()) {
-                    edges.push((
-                        FLAT_SRC.to_string(),
-                        key.clone(),
-                        None,
-                        strand_core::EdgeKind::Static,
-                    ));
+                let (n, ver) = deno_split_key(key);
+                if !ver.is_empty() {
+                    index.add(&nv(&n, &ver));
                 }
-                // Remote URLs also yield a normalized `name@version`
-                // node so they bridge with manifest deps.
-                if let Some(n) = deno_url_node(key) {
-                    if seen.insert(n.clone()) {
-                        edges.push((
-                            FLAT_SRC.to_string(),
-                            n,
-                            None,
-                            strand_core::EdgeKind::Static,
-                        ));
+            }
+        }
+    }
+
+    // npm/jsr packages: node declarations + dependencies edges.
+    for section in ["npm", "jsr"] {
+        let Some(obj) = v[section].as_object() else { continue };
+        for (key, meta) in obj {
+            let (n, ver) = deno_split_key(key);
+            let node = nv(&n, &ver);
+            if node.is_empty() {
+                continue;
+            }
+            nodes.insert(node.clone());
+            // Self-loop node declaration for leaf packages.
+            if seen.insert((node.clone(), node.clone())) {
+                edges.push((
+                    node.clone(),
+                    node.clone(),
+                    None,
+                    strand_core::EdgeKind::Static,
+                ));
+            }
+            if let Some(deps) = meta["dependencies"].as_array() {
+                for d in deps {
+                    let Some(spec) = d.as_str() else { continue };
+                    let (dn, dver) = deno_dep_spec(spec);
+                    let dsts = match dver {
+                        Some(dv) => vec![nv(&dn, &dv)],
+                        None => index.resolve(&dn, &mut edges, &mut seen),
+                    };
+                    for dst in dsts {
+                        push(&mut edges, &mut seen, &mut nodes, &node, dst);
                     }
                 }
             }
         }
     }
+
+    // workspace.dependencies: root specifiers resolved through the
+    // `specifiers` map ("npm:chalk@^5" -> "5.6.2").
+    let spec_map: std::collections::BTreeMap<String, String> = v["specifiers"]
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .map(|(k, val)| (k.clone(), val.as_str().unwrap_or("").to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(deps) = v["workspace"]["dependencies"].as_array() {
+        for d in deps {
+            let Some(spec) = d.as_str() else { continue };
+            // specifier -> resolved version via specifiers map.
+            let resolved = spec_map.get(spec).cloned();
+            // Name is everything before the last '@' (ranges like
+            // ^5.6.2 follow it); protocol prefixes stripped.
+            let bare = spec
+                .strip_prefix("npm:")
+                .or_else(|| spec.strip_prefix("jsr:"))
+                .unwrap_or(spec);
+            let n = match bare.rsplit_once('@') {
+                Some((n, _)) if !n.is_empty() => n,
+                _ => bare,
+            };
+            let mut ver = resolved.unwrap_or_default();
+            if ver.is_empty() {
+                // No specifier entry: use the spec's own version
+                // part when it is an exact pin.
+                if let Some((_, v)) = bare.rsplit_once('@') {
+                    if v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                        ver = v.to_string();
+                    }
+                }
+            }
+            // spec_map values can carry peer suffixes too.
+            let ver = ver.split('_').next().unwrap_or("").to_string();
+            let dst = nv(n, &ver);
+            push(&mut edges, &mut seen, &mut nodes, FLAT_SRC, dst);
+        }
+    }
+
+    // remote entries stay flat nodes; remote URLs also yield
+    // normalized name@version nodes. workspace.members keys are
+    // local paths, emitted as flat nodes too.
+    for section in ["remote", "workspace"] {
+        let Some(obj) = v[section].as_object() else { continue };
+        let entries: Vec<&String> = if section == "workspace" {
+            obj.get("members")
+                .and_then(|m| m.as_object())
+                .map(|m| m.keys().collect())
+                .unwrap_or_default()
+        } else {
+            obj.keys().collect()
+        };
+        for key in entries {
+                if nodes.insert(key.clone()) {
+                    if seen.insert((FLAT_SRC.to_string(), key.clone())) {
+                        edges.push((
+                            FLAT_SRC.to_string(),
+                            key.clone(),
+                            None,
+                            strand_core::EdgeKind::Static,
+                        ));
+                    }
+                }
+                if let Some(n) = deno_url_node(key) {
+                    push(&mut edges, &mut seen, &mut nodes, FLAT_SRC, n);
+                }
+        }
+    }
+
     if edges.is_empty() {
         return Err(err("deno.lock: no locked specifiers found"));
+    }
+    // Emit node declarations for every collected node that has no
+    // edges yet (flat remote/workspace entries).
+    for n in nodes {
+        if seen.insert((n.clone(), n.clone())) {
+            edges.push((n.clone(), n.clone(), None, strand_core::EdgeKind::Static));
+        }
     }
     Ok(edges)
 }
@@ -2159,4 +2326,114 @@ pub fn bun_lockb(bytes: &[u8]) -> Result<EdgeList> {
         return Err(err("bun.lockb: no packages found"));
     }
     Ok(edges)
+}
+
+// ---------- gradle.lockfile ----------
+
+/// Parse `gradle.lockfile`: one `group:name:version=config,...`
+/// coordinate per line (the part before `=` is the coordinate).
+/// Flat node list `group:name@version`, same shape as
+/// verification-metadata components.
+pub fn gradle_lockfile(text: &str) -> Result<EdgeList> {
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let coord = t.split('=').next().unwrap_or(t).trim();
+        let parts: Vec<&str> = coord.split(':').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let (g, a, v) = (parts[0], parts[1], parts[2]);
+        if g.is_empty() || a.is_empty() || v.is_empty() {
+            continue;
+        }
+        let node = nv(&format!("{g}:{a}"), v);
+        if seen.insert(node.clone()) {
+            edges.push((
+                FLAT_SRC.to_string(),
+                node,
+                None,
+                strand_core::EdgeKind::Static,
+            ));
+        }
+    }
+    if edges.is_empty() {
+        return Err(err("gradle.lockfile: no coordinates"));
+    }
+    Ok(edges)
+}
+
+// ---------- gradle module cache (.module / .pom) ----------
+
+/// Extract `(group, module, version)` dependency triples from a
+/// Gradle Module Metadata `.module` file (JSON). Every variant's
+/// `dependencies` array contributes; `version.requires` wins over
+/// `prefers`, empty when neither is present.
+pub fn gradle_module_deps(text: &str) -> Vec<(String, String, String)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let Some(variants) = v["variants"].as_array() else {
+        return out;
+    };
+    for var in variants {
+        let Some(deps) = var["dependencies"].as_array() else {
+            continue;
+        };
+        for d in deps {
+            let (Some(g), Some(m)) = (
+                d["group"].as_str(),
+                d["module"].as_str(),
+            ) else {
+                continue;
+            };
+            let ver = d["version"]["requires"]
+                .as_str()
+                .or_else(|| d["version"]["prefers"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if seen.insert((g.to_string(), m.to_string(), ver.clone())) {
+                out.push((g.to_string(), m.to_string(), ver));
+            }
+        }
+    }
+    out
+}
+
+/// Extract `(group, artifact, version)` dependency triples from a
+/// `.pom` file: `<dependencies>` blocks minus dependencyManagement
+/// and build sections; `import`-scoped BOM entries skipped.
+pub fn pom_deps(text: &str) -> Vec<(String, String, String)> {
+    let no_parent = strip_section(text, "parent");
+    let clean = strip_section(
+        &strip_section(&no_parent, "dependencyManagement"),
+        "build",
+    );
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for block in xml_blocks(&clean, "dependencies") {
+        for dep in xml_blocks(&block, "dependency") {
+            let scope = first_tag_text(&dep, "scope").unwrap_or_default();
+            if scope == "import" || scope == "test" {
+                continue;
+            }
+            let (Some(g), Some(a)) = (
+                first_tag_text(&dep, "groupId"),
+                first_tag_text(&dep, "artifactId"),
+            ) else {
+                continue;
+            };
+            let v = first_tag_text(&dep, "version").unwrap_or_default();
+            if seen.insert((g.clone(), a.clone(), v.clone())) {
+                out.push((g, a, v));
+            }
+        }
+    }
+    out
 }

@@ -136,6 +136,8 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
         "deno.lock",
         "conan.lock",
         "flake.lock",
+        "gradle.lockfile",
+        "verification-metadata.xml",
     ];
     let mut lock_files: Vec<(String, PathBuf)> = Vec::new();
     walk_files(root, root, &mut |rel, abs| {
@@ -191,6 +193,42 @@ pub fn scan_project(root: &Path, langs: &[Lang]) -> Result<ScanOutput> {
                 &mut lock_nodes,
             ),
             Err(e) => warnings.push(format!("{rel}: lockfile parse: {e}")),
+        }
+    }
+    // Gradle module cache: verification-metadata/gradle.lockfile are
+    // flat inventories, but ~/.gradle/caches/modules-2/files-2.1
+    // holds each component's .module/.pom with real dependency
+    // edges. Probe it when a gradle project is present.
+    {
+        let gradle_engaged = lock_nodes
+            .get("gradle")
+            .is_some_and(|m| !m.is_empty())
+            || manifest_edges
+                .iter()
+                .any(|(s, ..)| manifest_group(s) == Some("gradle"));
+        if gradle_engaged {
+            let mut coords: BTreeSet<String> = BTreeSet::new();
+            if let Some(m) = lock_nodes.get("gradle") {
+                for ids in m.values() {
+                    coords.extend(ids.iter().cloned());
+                }
+            }
+            // Manifest-declared `group:name` deps without a locked
+            // version cannot locate cache dirs; skip them.
+            if !coords.is_empty() {
+                let ces = gradle_cache_edges(&coords);
+                if !ces.is_empty() {
+                    ingest_lock_edges(
+                        "(gradle-cache)",
+                        ces,
+                        Some("gradle"),
+                        false,
+                        &mut nodes,
+                        &mut edges,
+                        &mut lock_nodes,
+                    );
+                }
+            }
         }
     }
     // Bridge: manifest `package.json -> my-app` becomes
@@ -305,7 +343,7 @@ fn lock_group(fmt: crate::Format) -> Option<&'static str> {
         CartfileResolved => Some("carthage"),
         DenoLock => Some("deno"),
         ConanLock => Some("conan"),
-        GradleVerification => Some("gradle"),
+        GradleVerification | GradleLockfile => Some("gradle"),
         GoMod | GoSum => Some("go"),
         _ => None,
     }
@@ -318,7 +356,7 @@ fn is_flat_lock(fmt: crate::Format) -> bool {
     matches!(
         fmt,
         SwiftResolved | PubspecLock | StackLock | MixLock | CartfileResolved
-            | DenoLock | GradleVerification
+            | DenoLock | GradleVerification | GradleLockfile
     )
 }
 
@@ -4564,4 +4602,187 @@ fn jsonc(text: &str) -> String {
         }
     }
     out
+}
+
+// ---------- gradle module cache ----------
+
+/// Split a `group:name@version` lock node into its Maven
+/// coordinates. Returns None for nodes without a pinned version.
+fn gradle_coord_parts(node: &str) -> Option<(String, String, String)> {
+    let bytes = node.as_bytes();
+    let mut cut = None;
+    for (i, &c) in bytes.iter().enumerate().skip(1) {
+        if c == b'@'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|d| d.is_ascii_digit())
+        {
+            cut = Some(i);
+        }
+    }
+    let i = cut?;
+    let ver = node[i + 1..].to_string();
+    let ga = &node[..i];
+    let (g, a) = ga.split_once(':')?;
+    if g.is_empty() || a.is_empty() || ver.is_empty() {
+        return None;
+    }
+    Some((g.to_string(), a.to_string(), ver))
+}
+
+/// Node id for Maven coordinates: `group:name@version`, or bare
+/// `group:name` when version is empty.
+fn gradle_node(g: &str, a: &str, ver: &str) -> String {
+    if ver.is_empty() {
+        format!("{g}:{a}")
+    } else {
+        format!("{g}:{a}@{ver}")
+    }
+}
+
+/// Read dependency triples from a component's cache dir: prefer
+/// `.module` (Gradle Module Metadata, exact versions), fall back to
+/// `.pom`.
+fn gradle_component_deps(dir: &Path) -> Vec<(String, String, String)> {
+    // files-2.1/<g>/<a>/<v>/<sha1>/<file>: one sha1 dir per artifact.
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut module_text = None;
+    let mut pom_text = None;
+    for e in entries.flatten() {
+        let Ok(files) = fs::read_dir(e.path()) else { continue };
+        for f in files.flatten() {
+            let name = f.file_name().to_string_lossy().to_lowercase();
+            if name.ends_with(".module") && module_text.is_none() {
+                module_text = fs::read_to_string(f.path()).ok();
+            } else if name.ends_with(".pom") && pom_text.is_none() {
+                pom_text = fs::read_to_string(f.path()).ok();
+            }
+        }
+    }
+    if let Some(t) = module_text {
+        crate::locks::gradle_module_deps(&t)
+    } else if let Some(t) = pom_text {
+        crate::locks::pom_deps(&t)
+    } else {
+        Vec::new()
+    }
+}
+
+/// BFS the Gradle module cache from locked `group:name@version`
+/// coordinates, emitting `component -> component` edges from
+/// `.module`/`.pom` dependency declarations. Bounded by MAX_PARSE
+/// so huge caches stay fast; the visited set keeps it terminating.
+fn gradle_cache_edges(seed: &BTreeSet<String>) -> EdgeList {
+    const MAX_PARSE: usize = 4000;
+    let Some(home) = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+    else {
+        return Vec::new();
+    };
+    let root = PathBuf::from(home).join(".gradle/caches/modules-2/files-2.1");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut edges: EdgeList = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    // Self-loop declarations for every node we emit.
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    let push_node = |edges: &mut EdgeList,
+                         seen: &mut BTreeSet<(String, String)>,
+                         declared: &mut BTreeSet<String>,
+                         src: &str,
+                         dst: String| {
+        if dst.is_empty() {
+            return;
+        }
+        declared.insert(dst.clone());
+        if seen.insert((src.to_string(), dst.clone())) {
+            edges.push((
+                src.to_string(),
+                dst,
+                None,
+                EdgeKind::Static,
+            ));
+        }
+    };
+
+    // known[(g,a)] = versions seen so far, for versionless deps.
+    let mut known: BTreeMap<(String, String), BTreeSet<String>> =
+        BTreeMap::new();
+    let mut queue: Vec<(String, String, String)> = Vec::new();
+    let mut visited: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for n in seed {
+        if let Some((g, a, v)) = gradle_coord_parts(n) {
+            known.entry((g.clone(), a.clone())).or_default().insert(v.clone());
+            queue.push((g, a, v));
+        }
+    }
+
+    let mut parsed = 0usize;
+    while let Some((g, a, v)) = queue.pop() {
+        if !visited.insert((g.clone(), a.clone(), v.clone())) {
+            continue;
+        }
+        if parsed >= MAX_PARSE {
+            break;
+        }
+        parsed += 1;
+        let src_node = gradle_node(&g, &a, &v);
+        let dir = root.join(&g).join(&a).join(&v);
+        let triples = gradle_component_deps(&dir);
+        for (dg, da, dv) in triples {
+            let dsts: Vec<String> = if !dv.is_empty() {
+                let node = gradle_node(&dg, &da, &dv);
+                known
+                    .entry((dg.clone(), da.clone()))
+                    .or_default()
+                    .insert(dv.clone());
+                // Enqueue so transitive deps resolve too.
+                queue.push((dg.clone(), da.clone(), dv.clone()));
+                vec![node]
+            } else {
+                // Versionless dep (pom without <version>): resolve
+                // against everything seen so far.
+                match known.get(&(dg.clone(), da.clone())) {
+                    Some(vs) if vs.len() == 1 => {
+                        let only = vs.iter().next().unwrap().clone();
+                        vec![gradle_node(&dg, &da, &only)]
+                    }
+                    Some(vs) if !vs.is_empty() => {
+                        // May-edge to bare coord + disambiguation.
+                        let bare = gradle_node(&dg, &da, "");
+                        for ver in vs {
+                            let pin = gradle_node(&dg, &da, ver);
+                            declared.insert(pin.clone());
+                            if seen.insert((bare.clone(), pin.clone())) {
+                                edges.push((
+                                    bare.clone(),
+                                    pin,
+                                    None,
+                                    EdgeKind::Static,
+                                ));
+                            }
+                        }
+                        vec![bare]
+                    }
+                    _ => vec![gradle_node(&dg, &da, "")],
+                }
+            };
+            for dst in dsts {
+                push_node(&mut edges, &mut seen, &mut declared, &src_node, dst);
+            }
+        }
+        declared.insert(src_node.clone());
+    }
+
+    // Node declarations for srcs and dsts.
+    for n in declared {
+        if seen.insert((n.clone(), n.clone())) {
+            edges.push((n.clone(), n.clone(), None, EdgeKind::Static));
+        }
+    }
+    edges
 }

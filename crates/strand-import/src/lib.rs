@@ -65,6 +65,8 @@ pub enum Format {
     ConanLock,
     /// `gradle/verification-metadata.xml`.
     GradleVerification,
+    /// `gradle.lockfile` (flat resolved coordinates).
+    GradleLockfile,
     /// `flake.lock` (Nix).
     FlakeLock,
     /// `webpack --json` stats output (per-module resolved deps).
@@ -106,6 +108,7 @@ pub fn parse(text: &str, format: Format) -> Result<EdgeList> {
         Format::DenoLock => locks::deno_lock(text),
         Format::ConanLock => locks::conan_lock(text),
         Format::GradleVerification => locks::gradle_verification(text),
+        Format::GradleLockfile => locks::gradle_lockfile(text),
         Format::FlakeLock => locks::flake_lock(text),
         Format::WebpackStats => bundler::webpack_stats(text),
         Format::EsbuildMeta => bundler::esbuild_meta(text),
@@ -140,6 +143,7 @@ pub fn detect_format(path: &std::path::Path, text: &str) -> Format {
             "deno.lock" => return Format::DenoLock,
             "conan.lock" => return Format::ConanLock,
             "verification-metadata.xml" => return Format::GradleVerification,
+            "gradle.lockfile" => return Format::GradleLockfile,
             "flake.lock" => return Format::FlakeLock,
             _ => {}
         }

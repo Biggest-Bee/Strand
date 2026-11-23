@@ -624,7 +624,8 @@ fn deno_lock_flat() {
 }"#;
     let raw = strand_import::parse(text, Format::DenoLock).unwrap();
     assert!(raw.iter().any(|(s, d, ..)| d == "https://deno.land/x/fresh@1.6.8/mod.ts"));
-    assert!(raw.iter().any(|(s, d, ..)| d == "npm:lodash@4.17.21"));
+    // npm:-prefixed keys normalize to bare name@version nodes.
+    assert!(raw.iter().any(|(s, d, ..)| d == "lodash@4.17.21"));
 }
 
 #[test]
@@ -773,10 +774,111 @@ fn deno_lock_url_nodes() {
       },
       "npm": { "lodash@4.17.21": { "integrity": "x" } }
     }"#;
-    let e = edges(text, Format::DenoLock);
-    let dsts: Vec<&str> = e.iter().map(|(_, d)| d.as_str()).collect();
+    let raw = strand_import::parse(text, Format::DenoLock).unwrap();
+    let dsts: Vec<&str> = raw.iter().map(|(_, d, ..)| d.as_str()).collect();
     assert!(dsts.contains(&"std@0.224.0"));
     assert!(dsts.contains(&"react@18.2.0"));
     assert!(dsts.contains(&"@luca/flag@1.0.0"));
     assert!(dsts.contains(&"lodash@4.17.21"));
+}
+
+#[test]
+fn deno_lock_dependency_edges() {
+    // Real deno.lock v5 shape: npm entries carry dependencies
+    // arrays with bare names and name@version pins; workspace
+    // dependencies resolve through specifiers.
+    let text = r#"{
+      "version": "5",
+      "specifiers": {
+        "npm:chalk@^5.6.2": "5.6.2",
+        "npm:debug@4": "4.4.3"
+      },
+      "npm": {
+        "chalk@5.6.2": {
+          "integrity": "sha512-x"
+        },
+        "debug@4.4.3": {
+          "integrity": "sha512-y",
+          "dependencies": ["ms"]
+        },
+        "ms@2.1.3": {
+          "integrity": "sha512-z"
+        },
+        "@actions/glob@0.5.0": {
+          "integrity": "sha512-w",
+          "dependencies": ["@actions/core", "minimatch@3.1.2"]
+        },
+        "@actions/core@1.11.1": {
+          "integrity": "sha512-v"
+        },
+        "minimatch@3.1.2": {
+          "integrity": "sha512-u"
+        }
+      },
+      "workspace": {
+        "dependencies": ["npm:chalk@^5.6.2", "npm:debug@4"]
+      }
+    }"#;
+    let e = edges(text, Format::DenoLock);
+    let has = |s: &str, d: &str| e.iter().any(|(a, b)| a == s && b == d);
+    // package -> dep edges
+    assert!(has("debug@4.4.3", "ms@2.1.3"));
+    assert!(has("@actions/glob@0.5.0", "@actions/core@1.11.1"));
+    assert!(has("@actions/glob@0.5.0", "minimatch@3.1.2"));
+    // workspace root deps resolved through specifiers
+    assert!(e.iter().any(|(a, d)| {
+        (a.contains("deno") || a == "(lockfile)") && d == "chalk@5.6.2"
+    }));
+    assert!(e.iter().any(|(_, d)| d == "debug@4.4.3"));
+    // node declarations for leaf packages (self-loops, filtered
+    // out of edges() so check the raw parse)
+    let raw = strand_import::parse(text, Format::DenoLock).unwrap();
+    assert!(raw.iter().any(|(a, b, ..)| a == "ms@2.1.3" && b == "ms@2.1.3"));
+    assert!(raw.iter().any(|(a, b, ..)| a == "chalk@5.6.2" && b == "chalk@5.6.2"));
+}
+
+#[test]
+fn gradle_lockfile_flat() {
+    let text = "# lockfile\ncom.google.guava:guava:31.1-jre=compileClasspath,runtimeClasspath\norg.slf4j:slf4j-api:1.7.36=runtimeClasspath\n\n";
+    let f = strand_import::detect_format(
+        std::path::Path::new("gradle.lockfile"),
+        text,
+    );
+    assert_eq!(f, Format::GradleLockfile);
+    let e = edges(text, Format::GradleLockfile);
+    let dsts: Vec<&str> = e.iter().map(|(_, d)| d.as_str()).collect();
+    assert!(dsts.contains(&"com.google.guava:guava@31.1-jre"));
+    assert!(dsts.contains(&"org.slf4j:slf4j-api@1.7.36"));
+    assert_eq!(e.len(), 2);
+}
+
+#[test]
+fn gradle_module_and_pom_deps() {
+    let module = r#"{
+      "format": "1.1",
+      "component": {"group": "com.google.guava", "module": "guava", "version": "31.1-jre"},
+      "variants": [
+        {"name": "apiElements", "dependencies": [
+          {"group": "com.google.guava", "module": "failureaccess", "version": {"requires": "1.0.1"}},
+          {"group": "com.google.guava", "module": "listenablefuture", "version": {"requires": "9999.0-empty-to-avoid-conflict-with-guava"}}
+        ]},
+        {"name": "runtimeElements", "dependencies": [
+          {"group": "org.checkerframework", "module": "checker-qual", "version": {"requires": "3.12.0"}}
+        ]}
+      ]
+    }"#;
+    let deps = strand_import::locks::gradle_module_deps(module);
+    assert!(deps.contains(&("com.google.guava".into(), "failureaccess".into(), "1.0.1".into())));
+    assert!(deps.contains(&("org.checkerframework".into(), "checker-qual".into(), "3.12.0".into())));
+    assert_eq!(deps.len(), 3);
+
+    let pom = r#"<project><dependencies>
+      <dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13.2</version><scope>test</scope></dependency>
+      <dependency><groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId><version>3.12.0</version></dependency>
+      <dependency><groupId>com.google.code.gson</groupId><artifactId>gson</artifactId></dependency>
+    </dependencies></project>"#;
+    let deps = strand_import::locks::pom_deps(pom);
+    assert!(deps.contains(&("org.apache.commons".into(), "commons-lang3".into(), "3.12.0".into())));
+    assert!(deps.contains(&("com.google.code.gson".into(), "gson".into(), "".into())));
+    assert_eq!(deps.len(), 2); // test-scoped junit skipped
 }
