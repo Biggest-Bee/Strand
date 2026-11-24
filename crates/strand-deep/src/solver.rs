@@ -480,6 +480,84 @@ def main():
     }
 
     #[test]
+    fn ctor_seed_resolves_instance_method() {
+        // `r = Runner()` in main's scope lets `r.run(...)` resolve to
+        // Runner.run; `self` must not shift cmd off arg position 0.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+class Runner:
+    def run(self, cmd):
+        subprocess.call(cmd)
+
+def main():
+    r = Runner()
+    r.run(os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "instance method call should propagate taint: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn class_call_resolves_init() {
+        // `Runner(x)` invokes Runner.__init__.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+class Runner:
+    def __init__(self, cmd):
+        subprocess.call(cmd)
+
+def main():
+    Runner(os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "class call should reach __init__ sink: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn staticmethod_keeps_first_param() {
+        // @staticmethod has no receiver - arg 0 binds param 0.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+class Runner:
+    @staticmethod
+    def run(cmd):
+        subprocess.call(cmd)
+
+def main():
+    r = Runner()
+    r.run(os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")),
+            "staticmethod arg should bind param 0: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
     fn taint_argv_to_eval() {
         let out = run(&[(
             "app.py",

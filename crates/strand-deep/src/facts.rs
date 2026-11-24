@@ -1675,6 +1675,29 @@ fn resolve_callee(node: Node, ctx: &Ctx) -> Option<(String, String)> {
                     return Some((ctx.f.module.clone(), info.qualname.clone()));
                 }
             }
+            // Class instantiation `C()` -> `C.__init__` / `C.__new__`.
+            if let Some((m, class)) =
+                crate::ipa::py_name_ctor_target(name, ctx.f, &ctx.rbind)
+            {
+                for dunder in ["__init__", "__new__"] {
+                    let qual = format!("{class}.{dunder}");
+                    let known = if m == ctx.f.module {
+                        ctx.f
+                            .funcs
+                            .values()
+                            .flatten()
+                            .any(|i| i.qualname == qual)
+                    } else {
+                        // Imported module: optimistic, like module
+                        // attribute calls - a missing summary degrades
+                        // to unknown_call_result.
+                        true
+                    };
+                    if known {
+                        return Some((m, qual));
+                    }
+                }
+            }
             None
         }
         "attribute" => {
@@ -1697,6 +1720,29 @@ fn resolve_callee(node: Node, ctx: &Ctx) -> Option<(String, String)> {
                             }
                         }
                         return None;
+                    }
+                }
+            }
+            // Instance method via constructor seed: `r.m()` where an
+            // enclosing scope binds `r = C()`.
+            if obj.kind() == "identifier" {
+                if let Ok(oname) = obj.utf8_text(text.as_bytes()) {
+                    if let Some((m, class)) =
+                        crate::ipa::py_ctor_seed_at(node, ctx.f, oname)
+                    {
+                        let qual = format!("{class}.{fname}");
+                        let known = if m == ctx.f.module {
+                            ctx.f
+                                .funcs
+                                .values()
+                                .flatten()
+                                .any(|i| i.qualname == qual)
+                        } else {
+                            true
+                        };
+                        if known {
+                            return Some((m, qual));
+                        }
                     }
                 }
             }

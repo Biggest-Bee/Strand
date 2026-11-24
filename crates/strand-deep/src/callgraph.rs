@@ -177,6 +177,20 @@ fn resolve_call(
                         .unwrap_or_default();
                 }
             }
+            // Class instantiation `C()` -> `C.__init__` / `C.__new__`.
+            if let Some((m, class)) =
+                crate::ipa::py_name_ctor_target(name, f, rbind)
+            {
+                for dunder in ["__init__", "__new__"] {
+                    let qual = format!("{class}.{dunder}");
+                    if methods.contains(&(m.clone(), qual.clone())) {
+                        stats.resolved_method += 1;
+                        return caller
+                            .map(|c| vec![(c, (m, qual))])
+                            .unwrap_or_default();
+                    }
+                }
+            }
             stats.unknown_name += 1;
             Vec::new()
         }
@@ -210,6 +224,23 @@ fn resolve_call(
                         }
                         stats.unknown_method += 1;
                         return Vec::new();
+                    }
+                }
+            }
+            // Instance method via constructor seed: `r.m()` where an
+            // enclosing scope binds `r = C()`.
+            if obj.kind() == "identifier" {
+                if let Ok(oname) = obj.utf8_text(text.as_bytes()) {
+                    if let Some((m, class)) =
+                        crate::ipa::py_ctor_seed_at(call, f, oname)
+                    {
+                        let qual = format!("{class}.{fname}");
+                        if methods.contains(&(m.clone(), qual.clone())) {
+                            stats.resolved_method += 1;
+                            return caller
+                                .map(|c| vec![(c, (m, qual))])
+                                .unwrap_or_default();
+                        }
                     }
                 }
             }

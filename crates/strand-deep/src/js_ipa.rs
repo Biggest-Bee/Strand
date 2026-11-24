@@ -40,6 +40,11 @@ pub struct JsFile {
     /// Function short name -> info (declarations, arrows/functions
     /// bound by declarator, methods).
     pub funcs: HashMap<String, Vec<FuncInfo>>,
+    /// Constructor seeds: scope key (function-node start_byte, or
+    /// `u32::MAX` for module scope) -> var -> (module spec, "" =
+    /// same file; class name). From `x = new C()` / `x = new m.C()`
+    /// assignments in that scope. Lets `x.m()` resolve to `C.m`.
+    pub ctor_seeds: HashMap<u32, HashMap<String, (String, String)>>,
 }
 
 fn parse_js(text: &str, rel: &str) -> Option<Tree> {
@@ -118,6 +123,7 @@ fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> JsFile {
     let (mut bindings, mut consts, mut funcs) =
         (HashMap::new(), HashMap::new(), HashMap::new());
     collect_facts(tree.root_node(), &text, &mut bindings, &mut consts, &mut funcs, rel);
+    let ctor_seeds = collect_ctor_seeds(tree.root_node(), &text, &bindings);
     JsFile {
         rel: rel.to_string(),
         tree,
@@ -125,6 +131,181 @@ fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> JsFile {
         bindings,
         consts,
         funcs,
+        ctor_seeds,
+    }
+}
+
+/// Node kinds that open a new seed scope (their bodies don't share
+/// locals with the enclosing scope).
+fn is_js_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "method_definition"
+            | "generator_function_declaration"
+            | "generator_function"
+    )
+}
+
+/// Collect `x = new C()` constructor seeds per scope. Each scope's
+/// scan prunes nested scopes so inner-function bindings never leak
+/// outward; the module scope uses key `u32::MAX`.
+fn collect_ctor_seeds(
+    root: Node,
+    text: &str,
+    bindings: &HashMap<String, (String, Option<String>)>,
+) -> HashMap<u32, HashMap<String, (String, String)>> {
+    let mut out: HashMap<u32, HashMap<String, (String, String)>> = HashMap::new();
+    // Module scope first.
+    scan_js_scope(root, text, bindings, u32::MAX, &mut out);
+    // Every nested scope node gets its own scan.
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            if !ch.is_named() {
+                continue;
+            }
+            if is_js_scope(ch.kind()) {
+                scan_js_scope(ch, text, bindings, ch.start_byte() as u32, &mut out);
+            }
+            stack.push(ch);
+        }
+    }
+    out
+}
+
+/// Scan one scope's subtree (pruning nested scopes) for
+/// `name = new C()` bindings.
+fn scan_js_scope(
+    scope: Node,
+    text: &str,
+    bindings: &HashMap<String, (String, Option<String>)>,
+    key: u32,
+    out: &mut HashMap<u32, HashMap<String, (String, String)>>,
+) {
+    let mut stack = vec![scope];
+    while let Some(n) = stack.pop() {
+        if n.id() != scope.id() && is_js_scope(n.kind()) {
+            continue; // nested scope - scanned under its own key
+        }
+        match n.kind() {
+            "variable_declarator" => {
+                let name = n.child_by_field_name("name");
+                let value = n.child_by_field_name("value");
+                if let (Some(nm), Some(v)) = (name, value) {
+                    if nm.kind() == "identifier" && v.kind() == "new_expression" {
+                        if let Some(ctor) = v.child_by_field_name("constructor") {
+                            if let Some((spec, class)) =
+                                js_ctor_target(ctor, text, bindings)
+                            {
+                                if let Ok(var) = nm.utf8_text(text.as_bytes()) {
+                                    out.entry(key).or_default().insert(
+                                        var.to_string(),
+                                        (spec, class),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "assignment_expression" => {
+                let left = n.child_by_field_name("left");
+                let right = n.child_by_field_name("right");
+                if let (Some(l), Some(r)) = (left, right) {
+                    if l.kind() == "identifier" && r.kind() == "new_expression" {
+                        if let Some(ctor) = r.child_by_field_name("constructor") {
+                            if let Some((spec, class)) =
+                                js_ctor_target(ctor, text, bindings)
+                            {
+                                if let Ok(var) = l.utf8_text(text.as_bytes()) {
+                                    out.entry(key).or_default().insert(
+                                        var.to_string(),
+                                        (spec, class),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            if ch.is_named() {
+                stack.push(ch);
+            }
+        }
+    }
+}
+
+/// Look up a constructor seed for `var` visible at `node`: walk
+/// ancestors innermost-first so closures shadow correctly, then the
+/// module scope. Returns (module spec, class name).
+pub fn ctor_seed_at(node: Node, f: &JsFile, var: &str) -> Option<(String, String)> {
+    let mut anc = node.parent();
+    while let Some(n) = anc {
+        if is_js_scope(n.kind()) {
+            let key = n.start_byte() as u32;
+            if let Some(hit) = f
+                .ctor_seeds
+                .get(&key)
+                .and_then(|m| m.get(var))
+            {
+                return Some(hit.clone());
+            }
+        }
+        anc = n.parent();
+    }
+    f.ctor_seeds
+        .get(&u32::MAX)
+        .and_then(|m| m.get(var))
+        .cloned()
+}
+
+/// Resolve a `new C()` / `new m.C()` constructor to (module spec, ""
+/// for same file, class name). `spec` stays unresolved here -
+/// `resolve_spec` maps it at the call site.
+pub fn js_ctor_target(
+    ctor: Node,
+    text: &str,
+    bindings: &HashMap<String, (String, Option<String>)>,
+) -> Option<(String, String)> {
+    match ctor.kind() {
+        "identifier" => {
+            let name = ctor.utf8_text(text.as_bytes()).ok()?;
+            match bindings.get(name) {
+                // Imported binding: class name is the export member,
+                // falling back to the local name for default imports.
+                Some((spec, member)) => {
+                    let class = member
+                        .as_deref()
+                        .filter(|m| *m != "default")
+                        .unwrap_or(name)
+                        .to_string();
+                    Some((spec.clone(), class))
+                }
+                // Same-file class (or unresolvable - verified later).
+                None => Some((String::new(), name.to_string())),
+            }
+        }
+        "member_expression" => {
+            // `new ns.C()` - ns must be a module binding.
+            let obj = ctor.child_by_field_name("object")?;
+            let prop = ctor.child_by_field_name("property")?;
+            if obj.kind() != "identifier" {
+                return None;
+            }
+            let ns = obj.utf8_text(text.as_bytes()).ok()?;
+            let (spec, _) = bindings.get(ns)?;
+            let class = prop.utf8_text(text.as_bytes()).ok()?.to_string();
+            Some((spec.clone(), class))
+        }
+        _ => None,
     }
 }
 

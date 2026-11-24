@@ -645,20 +645,24 @@ cargo test
   dependency-type distinctions (dev vs build vs optional, import vs
   require); importers that know the kind collapse them into one edge.
 - `strand deep` analysis is a **may-analysis without type
-  information**: receiver-method calls on unknown types, dynamic
-  dispatch, reflection, and FFI boundaries stay unresolved (counted in
-  the blind-spot report, never guessed). Findings are heuristic -
+  information**: dynamic dispatch, reflection, FFI boundaries, and
+  receivers that aren't plain seeded names (`self.x.m()`, `a.b.m()`,
+  values passed through parameters or returned from factories) stay
+  unresolved (counted in the blind-spot report, never guessed).
+  Instance methods do resolve when the receiver is bound by
+  `x = new C()` / `x = C()` in an enclosing scope, `new C()` reaches
+  `constructor`/`__init__`/`__new__`, and `this.m()` / `self.m()`
+  resolve inside the class body. Findings are heuristic -
   expect false positives on heavily dynamic code and false negatives
   where values flow through unsupported constructs. Per-language
-  coverage differs: instance-method calls (`obj.m()` on a `new X()`
-  receiver) stay unresolved in JS and Python - only `this.m()` /
-  `self.m()` inside the class body resolve - Go relies on syntactic
-  type seeding for cross-function method calls, and Rust reports no
-  local leak findings
+  coverage differs: Go relies on syntactic type seeding for
+  cross-function method calls, and Rust reports no local leak findings
   (RAII closes on drop) though `returns_unclosed` metadata still flows
-  through summaries. Model files (`crates/strand-deep/src/models/`)
-  define sources/sinks per language and are a starting point, not
-  exhaustive.
+  through summaries - note RAII suppression is unsound for
+  `mem::forget`, `Box::leak`, `ManuallyDrop`, and reference cycles,
+  which can leak without a finding. Model files
+  (`crates/strand-deep/src/models/`) define sources/sinks per language
+  and are a starting point, not exhaustive.
 - Store delta is in-memory, but commits auto-compact once it passes
   `Options::compact_threshold_ops` (default 1M ops, 0 disables) - the
   delta can still spike RAM between compactions, and readers pin their
@@ -666,8 +670,16 @@ cargo test
 - Crash safety covers WAL commits and manifest swaps; orphaned
   `*.tmp` files from interrupted writes are garbage-collected on open
   (writers only publish via rename).
-- mmap assumes files aren't truncated while open (inherent SIGBUS risk);
-  the write path always writes-then-renames.
+- mmap assumes files aren't truncated *while mapped* (inherent SIGBUS
+  risk - a crash, not a degraded result). Mitigations in place: open
+  validates magic, section bounds, and an xxh64 payload checksum, so
+  pre-existing corruption fails cleanly; every write goes through a
+  temp file + fsync + rename (manifest included); the `.strandb`
+  store holds an fd lock so a second writer gets a clear
+  read-only error instead of corrupting data. The residual case is
+  an external process truncating or rewriting a `.strand` file
+  in place during a read - avoid editing graph files while tools
+  have them open.
 - `strand scan` parses sources with real parsers - `syn` for Rust,
   tree-sitter for Python and JS/TS, a line scanner for Go import
   specs - so comments, string literals, and

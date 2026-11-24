@@ -1762,6 +1762,12 @@ pub fn resolve_callee(
     } else {
         node.child_by_field_name("function")?
     };
+    // `new C()` invokes the class constructor when one is defined.
+    if node.kind() == "new_expression" {
+        if let Some(hit) = js_ctor_method(node, f, parsed, file_index, file_set) {
+            return Some(hit);
+        }
+    }
     match func_node.kind() {
         "identifier" => {
             let name = func_node.utf8_text(f.text.as_bytes()).ok()?;
@@ -1799,6 +1805,16 @@ pub fn resolve_callee(
                 }
                 return None;
             }
+            // `r.m()` where an enclosing scope binds `r = new C()`.
+            if obj.kind() == "identifier" {
+                if let Ok(oname) = obj.utf8_text(f.text.as_bytes()) {
+                    if let Some(hit) = ctor_method_target(
+                        node, f, oname, fname, parsed, file_index, file_set,
+                    ) {
+                        return Some(hit);
+                    }
+                }
+            }
             // `ns.f()` / `m.f()` where m is a module binding.
             let module_file = object_module_js(obj, f, file_set)?;
             qualname_in(&module_file, fname, parsed, file_index).map(|q| (module_file, q))
@@ -1811,6 +1827,72 @@ pub fn resolve_callee(
             resolve_func_node(inner, f, parsed, file_index, file_set)
         }
         _ => None,
+    }
+}
+
+/// Resolve `var.method()` through constructor seeds: `var` was bound
+/// to `new C()` in an enclosing scope, so the callee is `C.method`
+/// in C's file (same file when the spec is empty).
+fn ctor_method_target(
+    node: Node,
+    f: &JsFile,
+    var: &str,
+    method: &str,
+    parsed: &[JsFile],
+    file_index: &HashMap<String, usize>,
+    file_set: &BTreeSet<String>,
+) -> Option<NodeId> {
+    let (spec, class) = js_ipa::ctor_seed_at(node, f, var)?;
+    if spec.is_empty() {
+        return find_method_qualname(f, &class, method).map(|q| (f.rel.clone(), q));
+    }
+    let rel = js_ipa::resolve_spec(&f.rel, &spec, file_set)?;
+    let idx = *file_index.get(&rel)?;
+    let tf = parsed.get(idx)?;
+    find_method_qualname(tf, &class, method).map(|q| (rel, q))
+}
+
+/// `new C()` -> the `C.constructor` method when defined, in the
+/// constructor's own file.
+fn js_ctor_method(
+    node: Node,
+    f: &JsFile,
+    parsed: &[JsFile],
+    file_index: &HashMap<String, usize>,
+    file_set: &BTreeSet<String>,
+) -> Option<NodeId> {
+    let ctor = node.child_by_field_name("constructor")?;
+    let (spec, class) = js_ipa::js_ctor_target(ctor, f.text.as_str(), &f.bindings)?;
+    if spec.is_empty() {
+        return find_method_qualname(f, &class, "constructor")
+            .map(|q| (f.rel.clone(), q));
+    }
+    let rel = js_ipa::resolve_spec(&f.rel, &spec, file_set)?;
+    let idx = *file_index.get(&rel)?;
+    let tf = parsed.get(idx)?;
+    find_method_qualname(tf, &class, "constructor").map(|q| (rel, q))
+}
+
+/// Qualname of method `m` on class `cls` in `tf`: exact
+/// `cls.m` match first, then a unique bare-method fallback (covers
+/// anonymous/default-export classes whose methods qualname as `m`).
+fn find_method_qualname(tf: &JsFile, cls: &str, m: &str) -> Option<String> {
+    let v = tf.funcs.get(m)?;
+    let want = format!("{cls}.{m}");
+    if let Some(info) = v.iter().find(|i| i.is_method && i.qualname == want) {
+        return Some(info.qualname.clone());
+    }
+    let mut cands: Vec<&str> = v
+        .iter()
+        .filter(|i| i.is_method)
+        .map(|i| i.qualname.as_str())
+        .collect();
+    cands.sort_unstable();
+    cands.dedup();
+    if cands.len() == 1 {
+        Some(cands[0].to_string())
+    } else {
+        None
     }
 }
 
@@ -2205,6 +2287,58 @@ main();
             out.findings.iter().any(|f| f.class == SinkKind::Shell
                 && f.source.contains("Env")),
             "rest param should receive arg 0 taint: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn ctor_seed_resolves_instance_method() {
+        // `const r = new Runner()` in main's scope lets `r.run(...)`
+        // resolve to Runner.run.
+        let out = run(&[(
+            "app.js",
+            r#"
+const cp = require('child_process');
+class Runner {
+  run(cmd) { cp.exec(cmd); }
+}
+function main() {
+  const r = new Runner();
+  r.run(process.env.X);
+}
+main();
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "instance method call should propagate taint: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn new_expr_resolves_constructor() {
+        // `new Runner(x)` invokes the constructor method.
+        let out = run(&[(
+            "app.js",
+            r#"
+const cp = require('child_process');
+class Runner {
+  constructor(cmd) { cp.exec(cmd); }
+}
+function main() {
+  new Runner(process.env.X);
+}
+main();
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "new expression should reach constructor sink: {:?}",
             out.findings
         );
     }

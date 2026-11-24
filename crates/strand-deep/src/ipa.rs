@@ -45,6 +45,11 @@ pub struct PyFile {
     /// `def` short name -> info (Vec: same-name defs are rare but
     /// legal; first entry wins for lookups).
     pub funcs: HashMap<String, Vec<FuncInfo>>,
+    /// Constructor seeds: scope key (function-definition start_byte,
+    /// or `u32::MAX` for module scope) -> var -> (resolved module,
+    /// class name). From `x = C()` / `x = m.C()` assignments in that
+    /// scope. Lets `x.m()` resolve to `C.m`.
+    pub ctor_seeds: HashMap<u32, HashMap<String, (String, String)>>,
 }
 
 /// Facts about one `def`: params, byte range, qualified name
@@ -305,6 +310,7 @@ pub fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> PyFile {
         bindings: HashMap::new(),
         consts: HashMap::new(),
         funcs: HashMap::new(),
+        ctor_seeds: HashMap::new(),
     };
     let root = f.tree.root_node();
     let text = f.text.clone();
@@ -314,6 +320,10 @@ pub fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> PyFile {
     f.bindings = bindings;
     f.consts = consts;
     f.funcs = funcs;
+    f.ctor_seeds = {
+        let rbind = resolve_bindings(&f);
+        collect_py_ctor_seeds(&f, &rbind)
+    };
     f
 }
 
@@ -529,6 +539,17 @@ fn collect_facts(
                                 t == "..." || t == "pass" || t.is_empty()
                             })
                             .unwrap_or(false);
+                        // Instance/class methods take the receiver
+                        // (`self`/`cls`) as param 0, but call args
+                        // never include it - drop that group so param
+                        // indices line up with argument positions.
+                        // `@staticmethod` has no receiver.
+                        if is_method
+                            && !params.is_empty()
+                            && !has_static_decorator(node, text)
+                        {
+                            params.remove(0);
+                        }
                         let entry = FuncInfo {
                             params,
                             start: node.start_byte(),
@@ -547,6 +568,30 @@ fn collect_facts(
             _ => {}
         }
     }
+}
+
+/// Whether a `def` carries `@staticmethod` (no receiver param).
+/// Decorators are siblings of `function_definition` under
+/// `decorated_definition`, not children.
+fn has_static_decorator(node: Node, text: &str) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "decorated_definition" {
+        return false;
+    }
+    let mut c = parent.walk();
+    for ch in parent.children(&mut c) {
+        if ch.kind() == "decorator"
+            && ch
+                .utf8_text(text.as_bytes())
+                .map(|t| t.contains("staticmethod"))
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_dyn_import_call(call: Node, text: &str) -> bool {
@@ -669,6 +714,163 @@ pub fn resolve_bindings(f: &PyFile) -> RBindings {
                 .map(|m| (local.clone(), (m, member.clone())))
         })
         .collect()
+}
+
+/// Node kinds that open a new seed scope for Python.
+fn is_py_scope(kind: &str) -> bool {
+    kind == "function_definition" || kind == "lambda"
+}
+
+/// Collect `x = C()` constructor seeds per scope. Each scope's scan
+/// prunes nested function/lambda scopes; class bodies are transparent
+/// (their assignments belong to the enclosing scope). Module scope
+/// uses key `u32::MAX`.
+pub fn collect_py_ctor_seeds(
+    f: &PyFile,
+    rbind: &RBindings,
+) -> HashMap<u32, HashMap<String, (String, String)>> {
+    let mut out: HashMap<u32, HashMap<String, (String, String)>> = HashMap::new();
+    let text = f.text.as_str();
+    scan_py_scope(f.tree.root_node(), text, f, rbind, u32::MAX, &mut out);
+    // Every function_definition is its own scope.
+    let mut stack = vec![f.tree.root_node()];
+    while let Some(n) = stack.pop() {
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            if !ch.is_named() {
+                continue;
+            }
+            if ch.kind() == "function_definition" {
+                scan_py_scope(ch, text, f, rbind, ch.start_byte() as u32, &mut out);
+            }
+            stack.push(ch);
+        }
+    }
+    out
+}
+
+/// Scan one scope's subtree (pruning nested function/lambda scopes)
+/// for `name = C()` bindings.
+fn scan_py_scope(
+    scope: Node,
+    text: &str,
+    f: &PyFile,
+    rbind: &RBindings,
+    key: u32,
+    out: &mut HashMap<u32, HashMap<String, (String, String)>>,
+) {
+    let mut stack = vec![scope];
+    while let Some(n) = stack.pop() {
+        if n.id() != scope.id() && is_py_scope(n.kind()) {
+            continue;
+        }
+        if n.kind() == "assignment" {
+            let left = n.child_by_field_name("left");
+            let right = n.child_by_field_name("right");
+            if let (Some(l), Some(r)) = (left, right) {
+                if l.kind() == "identifier" && r.kind() == "call" {
+                    if let Some((module, class)) =
+                        py_ctor_target(r, f, rbind, text)
+                    {
+                        if let Ok(var) = l.utf8_text(text.as_bytes()) {
+                            out.entry(key)
+                                .or_default()
+                                .insert(var.to_string(), (module, class));
+                        }
+                    }
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            if ch.is_named() {
+                stack.push(ch);
+            }
+        }
+    }
+}
+
+/// Resolve a `C()` / `m.C()` constructor call to (module, class).
+/// Module is already absolutized; same-file guesses use `f.module`
+/// and are verified against the methods index at the call site.
+fn py_ctor_target(
+    call: Node,
+    f: &PyFile,
+    rbind: &RBindings,
+    text: &str,
+) -> Option<(String, String)> {
+    let func = call.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => {
+            let name = func.utf8_text(text.as_bytes()).ok()?;
+            py_name_ctor_target(name, f, rbind)
+        }
+        "attribute" => {
+            let attr = func.child_by_field_name("attribute")?;
+            let class = attr.utf8_text(text.as_bytes()).ok()?.to_string();
+            let obj = func.child_by_field_name("object")?;
+            // `m.C()` where m is a known module.
+            if let Some(m) = object_module(obj, rbind, text) {
+                return Some((m, class));
+            }
+            // `Outer.C()` where Outer is a same-file class: the
+            // method qualname is `Outer.C.m`.
+            if obj.kind() == "identifier" {
+                if let Ok(on) = obj.utf8_text(text.as_bytes()) {
+                    let prefix = format!("{on}.");
+                    let is_class = f.funcs.values().flatten().any(|i| {
+                        i.is_method && i.qualname.starts_with(&prefix)
+                    });
+                    if is_class {
+                        return Some((f.module.clone(), format!("{on}.{class}")));
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `C()` where C is a bare name: imported class -> its module,
+/// otherwise a same-file guess.
+pub fn py_name_ctor_target(
+    name: &str,
+    f: &PyFile,
+    rbind: &RBindings,
+) -> Option<(String, String)> {
+    match rbind.get(name) {
+        // `from m import C [as x]` - member is the class name in m.
+        Some((m, Some(member))) => Some((m.clone(), member.clone())),
+        // `import C` then `C()` - C is a module, not a class.
+        Some((_, None)) => None,
+        // Same-file class guess (verified against methods later).
+        None => Some((f.module.clone(), name.to_string())),
+    }
+}
+
+/// Look up a constructor seed for `var` visible at `node`: walk
+/// ancestors innermost-first (closures shadow correctly), then the
+/// module scope. Returns (module, class name).
+pub fn py_ctor_seed_at(node: Node, f: &PyFile, var: &str) -> Option<(String, String)> {
+    let mut anc = node.parent();
+    while let Some(n) = anc {
+        if n.kind() == "function_definition" {
+            let key = n.start_byte() as u32;
+            if let Some(hit) = f
+                .ctor_seeds
+                .get(&key)
+                .and_then(|m| m.get(var))
+            {
+                return Some(hit.clone());
+            }
+        }
+        anc = n.parent();
+    }
+    f.ctor_seeds
+        .get(&u32::MAX)
+        .and_then(|m| m.get(var))
+        .cloned()
 }
 
 /// Module an attribute-call object expression refers to, if statically
