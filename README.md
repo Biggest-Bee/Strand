@@ -117,13 +117,21 @@ strand build frontend.csv backend.csv meta.json -o all.strand
 cargo metadata --format-version 1 > meta.json
 strand build meta.json -o deps.strand
 
-# Or straight from lockfiles/manifests (auto-detected by filename):
+# Or straight from lockfiles/manifests (auto-detected by filename;
+# renamed files are content-sniffed. ~30 formats: Cargo.lock,
+# package-lock/npm-shrinkwrap, yarn.lock, pnpm-lock.yaml, bun.lock,
+# deno.lock, poetry/uv/pdm/conda locks, go.mod/go.sum/go.work.sum,
+# pom.xml, Gradle lockfiles + verification metadata,
+# composer/Gemfile/Podfile/Carthage locks, NuGet paket/
+# packages.lock.json, Swift Package.resolved, pubspec, stack, mix,
+# conan, flake, Julia manifest, rebar, renv):
 strand build Cargo.lock -o deps.strand      # Rust
 strand build package-lock.json -o deps.strand  # npm
 strand build poetry.lock -o deps.strand    # Python/poetry
 strand build go.mod -o deps.strand         # Go
 strand build pom.xml -o deps.strand        # Maven
-# (--format cargo-lock|npm-lock|poetry-lock|go-mod|pom overrides)
+# (--format auto|csv|cargo|cargo-lock|npm-lock|poetry-lock|go-mod|
+#  pom|webpack|esbuild overrides detection)
 
 # Scan a project folder and build a source-level dependency graph
 # (skips target/, .git/, node_modules/, and build-output dirs like
@@ -136,15 +144,35 @@ strand scan ./my-project -o deps.strand
 # __import__() calls, and entry points from pyproject.toml/setup.cfg/
 # setup.py - variable-referenced dicts included), JS/TS
 # (import/export-from/require, index resolution,
-# tsconfig/jsconfig paths+extends+baseUrl, package.json "imports").
+# tsconfig/jsconfig paths+extends+baseUrl, package.json "imports"),
+# Go (import specs resolved against go.mod modules and package dirs).
 # A file argument scans its project root (nearest ancestor manifest).
 # Edges static analysis can't see can be declared manually:
 #   # strand: depends-on pkg/target.py   (Python)
 #   // strand: depends-on src/b.rs       (Rust/JS/TS)
+#   // strand: depends-on util/helper.go (Go)
 # Dynamic sites it can't resolve (computed module names, require(expr),
 # computed entry_points) are reported as per-file warnings.
-# --lang rust|python|js restricts to one language; default scans all.
+# --lang rust|python|js|go restricts to one language; default scans all.
 strand scan ./my-project --lang python -o pydeps.strand
+
+# `scan` also picks up dependency manifests and config files
+# language-agnostically: requirements*.txt, pyproject.toml, Pipfile,
+# setup.cfg/py, package.json, Cargo.toml, composer.json, Gemfile,
+# pubspec.yaml(+overrides), Podfile, Package.swift, deno.json,
+# environment.yml, *.csproj/*.fsproj/*.vbproj + Directory.Packages.props,
+# paket.dependencies, libs.versions.toml, stack.yaml, mix.exs,
+# Cartfile, conanfile.txt/py, vcpkg.json, flake.nix/shell.nix,
+# build.zig.zon, gleam.toml, pixi.toml, shard.yml, cpanfile,
+# *.rockspec, dub.json, description, deps.edn/bb.edn/project.clj,
+# *.sbt, rebar.config, *.cabal, CMakeLists.txt/*.cmake, meson.build,
+# chart.yaml, Brewfile, docker-compose/compose.yml, Dockerfile/
+# *.dockerfile FROM images, .github/workflows + .gitlab-ci.yml `uses:`,
+# .cargo/config*, .npmrc, pip.conf/ini, .pypirc, Bazel
+# WORKSPACE/MODULE.bazel/.bzl, Gradle *.gradle(.kts), Terraform *.tf,
+# and version pins (.python-version/.nvmrc/.tool-versions). Lockfile
+# transitive chains and local package-cache probes (pub, Go module,
+# NuGet, Maven) layer on top wherever those ecosystems' caches exist.
 
 # Python projects: merge runtime-observed edges. Runs your command
 # under an import hook, so computed import_module() names, getattr
@@ -152,12 +180,15 @@ strand scan ./my-project --lang python -o pydeps.strand
 # real edges (coverage = what the command exercised):
 strand trace ./my-project -o traced.strand -- pytest
 
-# Deep scan: everything `scan` does, plus interprocedural analysis
+# Deep scan: everything `scan` does (same .strand output unless
+# --ipa-only), plus interprocedural analysis
 # (the `strand-deep` engine - call graphs, dynamic-import()
 # resolution, and taint/null/leak findings) for Python, JS/TS, Go,
 # and Rust. Slower than `scan`; use for security/bug review:
 strand deep ./my-project --analyze
+strand deep ./my-project -o deep.strand   # custom graph output
 
+#   -o, --output     output .strand file (default: <dir-name>.strand)
 #   --analyze        print taint/null/leak findings with call paths
 #                    and confidence, plus a blind-spot report for
 #                    calls the analyzer couldn't resolve
@@ -234,7 +265,10 @@ strand impact deps.strand my-lib --min-confidence declared
 strand deps deps.strand app --min-confidence static   # literal imports only
 ```
 
-Every command accepts `--json` for CI use.
+The analysis commands (`info`, `nodes`, `deps`, `impact`, `why`,
+`cycles`, `top`, `order`, `roots`, `leaves`, `common`, `check`,
+`diff`) accept `--json` for CI use; `build`/`scan`/`trace`/`deep`
+write graphs and reports, and `export` emits DOT/Mermaid.
 
 ## The store (`strand-store`)
 
@@ -310,6 +344,12 @@ also works from any directory.
   otherwise - analyses work identically on the merged view); **Close**
   unloads the current graph; **Instructions** opens a full reference of
   every button and canvas gesture.
+- **Deep scan…** picks any project directory and runs the
+  `strand-deep` engine on a worker thread - the same taint/null/leak
+  solvers as `strand deep --analyze` for Python, JS/TS, Go, and Rust.
+  Findings land in the report panel grouped by language with per-
+  language solver stats. Works with no graph open; independent of the
+  canvas.
 - First launch shows a short **card tutorial** (right arrow or Next to
   advance); a marker file in `~/.strand/` means it only appears once.
 - Pick nodes A and B three ways: the boxes autocomplete as you type (up
@@ -483,7 +523,7 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
 
 ## Testing
 
-`cargo test` runs ~76 tests across the workspace:
+`cargo test` runs ~263 tests across the workspace:
 
 - **core algorithms** (`strand-core/tests/algorithms.rs`): BFS/depths,
   shortest & k-shortest paths, non-shortest `paths_within_depth`,
@@ -533,16 +573,25 @@ kind of blast-radius answer `--git-diff` + `--max-impact` is built for.
 - **rule engine unit tests** (`strand-cli/src/check.rs`): rules-file
   parsing, comment/blank handling, malformed-rule rejection, substring
   vs glob pattern semantics (`*`/`?`).
-- **lockfile importers** (`strand-import/tests/locks.rs`): all five
-  formats incl. npm nested `node_modules` resolution and `name@version`
-  disambiguation when multiple versions are installed, poetry
-  dev-dependencies, go.mod directive boundaries, pom parent inheritance,
-  and format auto-detection.
+- **lockfile importers** (`strand-import/tests/locks.rs`): the major
+  formats incl. npm nested `node_modules` resolution and
+  `name@version` disambiguation when multiple versions are installed,
+  poetry dev-dependencies, go.mod directive boundaries, pom parent
+  inheritance, and format auto-detection.
+- **deep-analysis engine** (`strand-deep`, 51 tests): taint
+  env-to-shell/SQL cross-function flows, sanitizer stops, null/None/
+  nil/Option guard narrowing, per-index array and per-field struct
+  tracking, resource leaks incl. defer/RAII handling, method-call
+  resolution via receiver types, cross-file/cross-package module
+  flows, `include_str!`/`format!` handling, and SCC fixpoint
+  convergence.
 
 Tests live next to the code: `crates/strand-core/tests/` (algorithms,
 proptest, roundtrip/corruption/determinism), `crates/strand-cli/`
 (`tests/cli.rs` end-to-end plus `src/check.rs` unit tests),
-`crates/strand-import/tests/` (`scan.rs`, `locks.rs`), and
+`crates/strand-deep/src/` (per-language solver unit tests inline),
+`crates/strand-import/tests/` (`scan.rs`, `locks.rs`, `manifests.rs`,
+`caches.rs`, `bundler.rs`, `resolution.rs`), and
 `crates/strand-store/tests/store.rs`.
 
 ```console
@@ -595,6 +644,19 @@ cargo test
   format, and old readers ignore the tail. There are still no
   dependency-type distinctions (dev vs build vs optional, import vs
   require); importers that know the kind collapse them into one edge.
+- `strand deep` analysis is a **may-analysis without type
+  information**: receiver-method calls on unknown types, dynamic
+  dispatch, reflection, and FFI boundaries stay unresolved (counted in
+  the blind-spot report, never guessed). Findings are heuristic -
+  expect false positives on heavily dynamic code and false negatives
+  where values flow through unsupported constructs. Per-language
+  coverage differs: JS class-instance method resolution and destructured
+  params are limited, Go relies on syntactic type seeding for
+  cross-function method calls, and Rust reports no local leak findings
+  (RAII closes on drop) though `returns_unclosed` metadata still flows
+  through summaries. Model files (`crates/strand-deep/src/models/`)
+  define sources/sinks per language and are a starting point, not
+  exhaustive.
 - Store delta is in-memory, but commits auto-compact once it passes
   `Options::compact_threshold_ops` (default 1M ops, 0 disables) - the
   delta can still spike RAM between compactions, and readers pin their
@@ -605,17 +667,19 @@ cargo test
 - mmap assumes files aren't truncated while open (inherent SIGBUS risk);
   the write path always writes-then-renames.
 - `strand scan` parses sources with real parsers - `syn` for Rust,
-  tree-sitter for Python and JS/TS - so comments, string literals, and
+  tree-sitter for Python and JS/TS, a line scanner for Go import
+  specs - so comments, string literals, and
   grouped `use` trees (`use a::{b, c::d}`) are handled by the grammar,
   not text matching. It handles `mod`/`use`/`#[path]`/`include!` (Rust),
   `import`/`from` incl. relative imports and literal
   `import_module()`/`__import__()` calls, plus entry-point targets
   from `pyproject.toml`, `setup.cfg`, and `setup.py` (the config file
-  becomes the edge source) (Python), and
+  becomes the edge source) (Python),
   `import`/`export-from`/`require`/dynamic `import()` (JS/TS),
   including `tsconfig`/`jsconfig` `paths` aliases and
   `baseUrl` (JSONC-tolerant, `extends` chains followed, nearest config
-  per file for monorepos) and `package.json` `"imports"` (`#alias`).
+  per file for monorepos) and `package.json` `"imports"` (`#alias`),
+  and `import` specs resolved against `go.mod` modules (Go).
   Computed imports are resolved when every piece is a literal-derived
   constant: a per-file set-of-strings pass folds `+`, f-strings,
   `%`, `.format`, `"".join`, ternaries, dict subscripts, and loops over

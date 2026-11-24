@@ -32,8 +32,8 @@ enum Commands {
     /// Build a .strand graph from CSV/TSV edge lists or cargo metadata JSON.
     /// Accepts multiple input files; all edges are merged.
     Build(BuildArgs),
-    /// Scan a directory of Rust sources and build a file-level
-    /// dependency graph from `mod`/`use` statements.
+    /// Scan a project directory and build a source-level dependency
+    /// graph (Rust, Python, JS/TS, Go; `--lang` to restrict).
     Scan(ScanArgs),
     /// Scan a project, run a command under a Python import tracer,
     /// and merge observed runtime edges into the graph.
