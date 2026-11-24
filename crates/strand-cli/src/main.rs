@@ -39,9 +39,10 @@ enum Commands {
     /// and merge observed runtime edges into the graph.
     /// Usage: `strand trace <dir> -- <command...>` (e.g. `-- pytest`).
     Trace(TraceArgs),
-    /// Deep scan: static graph plus Python interprocedural analysis
-    /// (call graph, dynamic-import resolution, taint/null/leak
-    /// findings). Slower than `scan`; use for security/bug review.
+    /// Deep scan: static graph plus interprocedural analysis for
+    /// Python, JS/TS, Go, and Rust (call graphs, dynamic-import
+    /// resolution, taint/null/leak findings). Slower than `scan`;
+    /// use for security/bug review.
     Deep(DeepArgs),
     /// Show graph statistics.
     Info(InfoArgs),
@@ -229,7 +230,8 @@ struct DeepArgs {
     /// Run taint/null/leak analysis and print findings.
     #[arg(long)]
     analyze: bool,
-    /// Model directory for `--analyze` (default: embedded python.toml).
+    /// Model directory for `--analyze` (default: embedded per-language
+    /// TOML models: python/js/go/rust).
     #[arg(long)]
     models: Option<PathBuf>,
 }

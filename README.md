@@ -10,7 +10,9 @@ memory-mapped **CSR (compressed sparse row) graph engine**.
 
 Strand answers the question *"what breaks if I change X?"* in a second or
 two, even on graphs with tens of millions of edges, with no server and
-no query language:
+no query language. `strand deep` goes further: offline interprocedural
+analysis (taint, null, resource-leak findings) for Python, JS/TS, Go,
+and Rust source trees.
 
 ```console
 $ strand build deps.csv -o deps.strand
@@ -43,6 +45,8 @@ merged view.
 ```
 crates/
   strand-core/      file format, mmap reader, builder, algorithms
+  strand-deep/      interprocedural analysis engine (IPA + taint/null/leak
+                    solvers for Python, JS/TS, Go, Rust)
   strand-import/    importers (cargo metadata JSON, CSV/TSV edge lists)
   strand-cli/       the `strand` binary
   strand-store/     embeddable read-write store (base + WAL delta)
@@ -147,6 +151,30 @@ strand scan ./my-project --lang python -o pydeps.strand
 # lazy-imports, and entry points actually loaded at runtime become
 # real edges (coverage = what the command exercised):
 strand trace ./my-project -o traced.strand -- pytest
+
+# Deep scan: everything `scan` does, plus interprocedural analysis
+# (the `strand-deep` engine - call graphs, dynamic-import()
+# resolution, and taint/null/leak findings) for Python, JS/TS, Go,
+# and Rust. Slower than `scan`; use for security/bug review:
+strand deep ./my-project --analyze
+
+#   --analyze        print taint/null/leak findings with call paths
+#                    and confidence, plus a blind-spot report for
+#                    calls the analyzer couldn't resolve
+#   --dump-callgraph print resolved `module.func -> module.func` edges
+#   --ipa-only       run IPA + solver only; skip writing the graph
+#   --models <dir>   override the embedded per-language TOML models
+#                    (python/js/go/rust sources, sinks, sanitizers)
+#
+# Example finding:
+#   [Shell] main.go:20 exec.Command - src:Env (via main -> Server.Run) [90%]
+#
+# Bug classes: taint (env/request/file data -> shell/SQL/eval sinks),
+# null/None/nil/Option reaching derefs or unwraps, and resource leaks
+# (defer/RAII-aware). Sources, sinks and sanitizers are TOML data -
+# see crates/strand-deep/src/models/. The same engine is available
+# to the GUI ("Deep scan..." button) and as a library:
+#   strand_deep::analyze::analyze_project(root)
 
 # Analyze:
 strand info deps.strand
