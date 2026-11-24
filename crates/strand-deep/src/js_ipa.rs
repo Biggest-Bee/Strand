@@ -70,7 +70,7 @@ fn parse_js(text: &str, rel: &str) -> Option<Tree> {
     })
 }
 
-/// All `call_expression` nodes via a tree-sitter query compiled for
+/// All `call_expression` and `new_expression` nodes via a tree-sitter query compiled for
 /// the file's own grammar (JS vs TS vs TSX node ids differ).
 pub fn call_nodes<'a>(f: &'a JsFile) -> Vec<Node<'a>> {
     use tree_sitter::StreamingIterator;
@@ -96,7 +96,7 @@ fn call_query(f: &JsFile) -> &'static tree_sitter::Query {
         TSX_Q.get_or_init(|| {
             tree_sitter::Query::new(
                 &tree_sitter_typescript::LANGUAGE_TSX.into(),
-                "(call_expression) @call",
+                "(call_expression) @call (new_expression) @call",
             )
             .expect("tsx call query")
         })
@@ -104,7 +104,7 @@ fn call_query(f: &JsFile) -> &'static tree_sitter::Query {
         TS_Q.get_or_init(|| {
             tree_sitter::Query::new(
                 &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                "(call_expression) @call",
+                "(call_expression) @call (new_expression) @call",
             )
             .expect("ts call query")
         })
@@ -112,7 +112,7 @@ fn call_query(f: &JsFile) -> &'static tree_sitter::Query {
         JS_Q.get_or_init(|| {
             tree_sitter::Query::new(
                 &tree_sitter_javascript::LANGUAGE.into(),
-                "(call_expression) @call",
+                "(call_expression) @call (new_expression) @call",
             )
             .expect("js call query")
         })
