@@ -60,7 +60,7 @@ pub struct CtxJs<'a> {
 pub fn analyze_function_js<'a>(
     f: &'a JsFile,
     func_node: Node,
-    params: &[String],
+    params: &[Vec<String>],
     qualname: &str,
     model: &Model,
     summaries: &HashMap<NodeId, Summary>,
@@ -92,15 +92,17 @@ pub fn analyze_function_js<'a>(
         pending_result: None,
     };
     let mut env: HashMap<String, VarState> = globals.cloned().unwrap_or_default();
-    for (i, p) in params.iter().enumerate() {
-        env.insert(
-            p.clone(),
-            VarState {
-                taint: Some(format!("param:{i}")),
-                is_none: false,
-                resource: None,
-            },
-        );
+    for (i, group) in params.iter().enumerate() {
+        for p in group {
+            env.insert(
+                p.clone(),
+                VarState {
+                    taint: Some(format!("param:{i}")),
+                    is_none: false,
+                    resource: None,
+                },
+            );
+        }
     }
     walk_body(func_node, &mut ctx, &mut env);
 
@@ -2152,6 +2154,59 @@ main();
             .filter(|f| f.class == SinkKind::Shell)
             .collect();
         assert_eq!(hits.len(), 1, "only o.cmd should flag: {:?}", out.findings);
+    }
+
+    #[test]
+    fn destructured_param_keeps_position() {
+        // `cmd` is positional arg 1; the destructured first param must
+        // not shift it to index 0.
+        let out = run(&[(
+            "app.js",
+            r#"
+const cp = require('child_process');
+function run({ cfg }, cmd) {
+  cp.exec(cmd);
+}
+function main() {
+  run({ cfg: 1 }, process.env.X);
+}
+main();
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "destructured param must not shift cmd off position 1: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn rest_param_binds_trailing_args() {
+        // `...rest` occupies position 0; the named param after it in
+        // the pattern still lines up with call arg 0's group? No -
+        // rest binds args from its position onward; `first` here is
+        // position 0's group? rest_pattern is one group: call arg 0.
+        let out = run(&[(
+            "app.js",
+            r#"
+const cp = require('child_process');
+function run(...cmds) {
+  cp.exec(cmds[0]);
+}
+function main() {
+  run(process.env.X);
+}
+main();
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")),
+            "rest param should receive arg 0 taint: {:?}",
+            out.findings
+        );
     }
 
     #[test]

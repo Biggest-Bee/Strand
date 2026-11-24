@@ -19,7 +19,7 @@ struct FuncRef {
     file_idx: usize,
     /// Byte range of the function-ish node (None = module root).
     range: Option<(usize, usize)>,
-    params: Vec<String>,
+    params: Vec<Vec<String>>,
     qualname: String,
 }
 

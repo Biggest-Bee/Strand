@@ -51,7 +51,11 @@ pub struct PyFile {
 /// (`Class.method` for methods), and whether it's a method.
 #[derive(Clone)]
 pub struct FuncInfo {
-    pub params: Vec<String>,
+    /// Names bound per formal-parameter position: `params[i]` is the
+    /// group of identifiers bound by parameter `i` (a destructured
+    /// param binds several names; separators bind none). Positional
+    /// index `i` always matches call argument `i`.
+    pub params: Vec<Vec<String>>,
     pub start: usize,
     pub end: usize,
     pub qualname: String,
@@ -249,7 +253,7 @@ fn specifier_template(
     arg: Node,
     text: &str,
     f: &PyFile,
-    params: &[String],
+    params: &[Vec<String>],
 ) -> Option<(String, String, String)> {
     let parts = expr_parts(arg, text, f, 0)?;
     let names: Vec<&Part> = parts
@@ -262,7 +266,7 @@ fn specifier_template(
     let Part::Name(pname) = names[0] else {
         return None;
     };
-    if !params.iter().any(|p| p == pname) {
+    if !params.iter().any(|g| g.iter().any(|p| p == pname)) {
         return None;
     }
     // Rebuild prefix/suffix around the single Name part.
@@ -440,14 +444,14 @@ fn collect_facts(
             "function_definition" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     if let Ok(name) = name_node.utf8_text(text.as_bytes()) {
-                        let mut params = Vec::new();
+                        let mut params: Vec<Vec<String>> = Vec::new();
                         if let Some(pn) = node.child_by_field_name("parameters") {
                             let mut pc = pn.walk();
                             for p in pn.children(&mut pc) {
                                 match p.kind() {
                                     "identifier" => {
                                         if let Ok(t) = p.utf8_text(text.as_bytes()) {
-                                            params.push(t.to_string());
+                                            params.push(vec![t.to_string()]);
                                         }
                                     }
                                     "default_parameter" | "typed_parameter" => {
@@ -457,12 +461,30 @@ fn collect_facts(
                                                 if let Ok(t) =
                                                     d.utf8_text(text.as_bytes())
                                                 {
-                                                    params.push(t.to_string());
+                                                    params.push(vec![t.to_string()]);
                                                 }
                                                 break;
                                             }
                                         }
                                     }
+                                    // `*args` / `**kwargs` bind a name
+                                    // and occupy a parameter position.
+                                    "list_splat_pattern"
+                                    | "dictionary_splat_pattern" => {
+                                        let mut sc = p.walk();
+                                        for d in p.children(&mut sc) {
+                                            if d.kind() == "identifier" {
+                                                if let Ok(t) =
+                                                    d.utf8_text(text.as_bytes())
+                                                {
+                                                    params.push(vec![t.to_string()]);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    // Bare `*` and `/` separators
+                                    // consume no argument - skip.
                                     _ => {}
                                 }
                             }
@@ -755,10 +777,12 @@ struct CallRec {
 fn callsite_param_arg<'t>(
     call: Node<'t>,
     caller: &PyFile,
-    func_params: &[String],
+    func_params: &[Vec<String>],
     param: &str,
 ) -> Option<Node<'t>> {
-    let idx = func_params.iter().position(|p| p == param)?;
+    let idx = func_params
+        .iter()
+        .position(|g| g.iter().any(|p| p == param))?;
     let args = call.child_by_field_name("arguments")?;
     let mut positional: Vec<Node> = Vec::new();
     let mut keyword: Option<Node> = None;

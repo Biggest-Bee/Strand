@@ -40,7 +40,7 @@ struct FuncRef {
     file_idx: usize,
     /// Byte range of the function_definition (None = module root).
     range: Option<(usize, usize)>,
-    params: Vec<String>,
+    params: Vec<Vec<String>>,
     qualname: String,
 }
 
@@ -428,6 +428,53 @@ def main():
                 && f.source.contains("Env")
                 && f.via.len() >= 2),
             "expected interprocedural shell finding, got {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn splat_param_keeps_position() {
+        // `*args` occupies position 1; `cmd` must still bind arg 2,
+        // not shift to index 1.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+def run(*args, cmd):
+    subprocess.call(cmd)
+
+def main():
+    run("a", cmd=os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")),
+            "keyword-only cmd should resolve via keyword arg: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn positional_after_default_keeps_index() {
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+def run(opts=None, cmd=None):
+    subprocess.call(cmd)
+
+def main():
+    run(None, os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "cmd at position 1 must bind arg 1: {:?}",
             out.findings
         );
     }

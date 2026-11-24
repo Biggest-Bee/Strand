@@ -155,7 +155,7 @@ pub struct FuncAnalysis {
 pub fn analyze_function(
     f: &PyFile,
     func_node: Node,
-    params: &[String],
+    params: &[Vec<String>],
     qualname: &str,
     model: &Model,
     summaries: &HashMap<(String, String), Summary>,
@@ -184,15 +184,17 @@ pub fn analyze_function(
     // params/locals shadow via insert.
     let mut env: HashMap<String, VarState> =
         globals.cloned().unwrap_or_default();
-    for (i, p) in params.iter().enumerate() {
-        env.insert(
-            p.clone(),
-            VarState {
-                taint: Some(format!("param:{i}")),
-                is_none: false,
-                resource: None,
-            },
-        );
+    for (i, group) in params.iter().enumerate() {
+        for p in group {
+            env.insert(
+                p.clone(),
+                VarState {
+                    taint: Some(format!("param:{i}")),
+                    is_none: false,
+                    resource: None,
+                },
+            );
+        }
     }
     walk_suite(func_node, &mut ctx, &mut env);
 

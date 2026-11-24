@@ -598,7 +598,7 @@ proptest, roundtrip/corruption/determinism), `crates/strand-cli/`
 cargo test
 ```
 
-## Limitations (honest list)
+## Limitations
 
 - No query language - Rust API + CLI + desktop GUI.
 - The GUI canvas caps at 100k nodes / 300k edges with level-of-detail
@@ -650,9 +650,11 @@ cargo test
   the blind-spot report, never guessed). Findings are heuristic -
   expect false positives on heavily dynamic code and false negatives
   where values flow through unsupported constructs. Per-language
-  coverage differs: JS class-instance method resolution and destructured
-  params are limited, Go relies on syntactic type seeding for
-  cross-function method calls, and Rust reports no local leak findings
+  coverage differs: instance-method calls (`obj.m()` on a `new X()`
+  receiver) stay unresolved in JS and Python - only `this.m()` /
+  `self.m()` inside the class body resolve - Go relies on syntactic
+  type seeding for cross-function method calls, and Rust reports no
+  local leak findings
   (RAII closes on drop) though `returns_unclosed` metadata still flows
   through summaries. Model files (`crates/strand-deep/src/models/`)
   define sources/sinks per language and are a starting point, not

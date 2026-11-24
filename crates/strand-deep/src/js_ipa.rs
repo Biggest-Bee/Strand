@@ -443,34 +443,97 @@ fn bind_object_pattern(
 
 /// Params of a function-ish node: identifiers plus the first
 /// identifier inside TS `required_parameter`/`optional_parameter`.
-pub fn fn_params(node: Node, text: &str) -> Vec<String> {
+/// Formal parameters as one name-group per position: `params[i]`
+/// holds every identifier bound by parameter `i` (destructured params
+/// bind several; `...rest` binds its name). Index `i` always matches
+/// call argument `i` - patterns can no longer shift positions.
+pub fn fn_params(node: Node, text: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let Some(pn) = node.child_by_field_name("parameters") else {
         return out;
     };
     let mut c = pn.walk();
     for p in pn.children(&mut c) {
+        if !p.is_named() {
+            continue;
+        }
         match p.kind() {
-            "identifier" => {
-                if let Ok(t) = p.utf8_text(text.as_bytes()) {
-                    out.push(t.to_string());
+            // TS `this` parameter: type-level only, consumes no arg.
+            "this" => continue,
+            "identifier"
+            | "required_parameter"
+            | "optional_parameter"
+            | "assignment_pattern"
+            | "object_pattern"
+            | "array_pattern"
+            | "rest_pattern" => {
+                // TS `this: Foo` parameter: the binding target itself
+                // is `this`, which consumes no call argument. Only
+                // check the binding position - `a = this.x` is a
+                // normal param whose default mentions `this`.
+                let is_this = if p.kind() == "required_parameter"
+                    || p.kind() == "optional_parameter"
+                {
+                    p.children(&mut p.walk())
+                        .find(|ch| ch.is_named())
+                        .is_some_and(|ch| ch.kind() == "this")
+                } else {
+                    false
+                };
+                if is_this {
+                    continue;
                 }
-            }
-            "required_parameter" | "optional_parameter" | "assignment_pattern" => {
-                let mut sc = p.walk();
-                for d in p.children(&mut sc) {
-                    if d.kind() == "identifier" {
-                        if let Ok(t) = d.utf8_text(text.as_bytes()) {
-                            out.push(t.to_string());
-                        }
-                        break;
-                    }
-                }
+                out.push(param_names(p, text));
             }
             _ => {}
         }
     }
     out
+}
+
+/// All identifiers bound by a parameter pattern (object/array/rest/
+/// pair/assignment patterns, defaults excluded).
+fn param_names(node: Node, text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_param_names(node, text, &mut out);
+    out
+}
+
+fn collect_param_names(node: Node, text: &str, out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            if let Ok(t) = node.utf8_text(text.as_bytes()) {
+                out.push(t.to_string());
+            }
+        }
+        "object_pattern"
+        | "array_pattern"
+        | "rest_pattern"
+        | "parenthesized_expression"
+        | "required_parameter"
+        | "optional_parameter" => {
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                if ch.is_named() && ch.kind() != "type_annotation" {
+                    collect_param_names(ch, text, out);
+                }
+            }
+        }
+        "pair_pattern" => {
+            if let Some(v) = node.child_by_field_name("value") {
+                collect_param_names(v, text, out);
+            }
+        }
+        // Only the left side binds; the default expression does not.
+        "assignment_pattern" => {
+            if let Some(l) = node.child_by_field_name("left") {
+                collect_param_names(l, text, out);
+            } else if let Some(l) = node.named_child(0) {
+                collect_param_names(l, text, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_func_decl(node: Node, text: &str, funcs: &mut HashMap<String, Vec<FuncInfo>>) {
@@ -686,7 +749,7 @@ fn specifier_template(
     arg: Node,
     text: &str,
     f: &JsFile,
-    params: &[String],
+    params: &[Vec<String>],
 ) -> Option<(String, String, String)> {
     let parts = expr_parts(arg, text, f, 0)?;
     let names: Vec<&Part> = parts
@@ -699,7 +762,7 @@ fn specifier_template(
     let Part::Name(pname) = names[0] else {
         return None;
     };
-    if !params.iter().any(|p| p == pname) {
+    if !params.iter().any(|g| g.iter().any(|p| p == pname)) {
         return None;
     }
     let mut prefix = String::new();
@@ -963,15 +1026,17 @@ struct CallRec {
     end: usize,
 }
 
-/// Positional argument for `param` (JS has no keyword args; destructured
-/// params aren't collected so `position` misses -> unresolved, honest).
+/// Positional argument for `param` (JS has no keyword args; position
+/// is the index of the group containing `param`).
 fn callsite_param_arg<'t>(
     call: Node<'t>,
     _caller: &JsFile,
-    func_params: &[String],
+    func_params: &[Vec<String>],
     param: &str,
 ) -> Option<Node<'t>> {
-    let idx = func_params.iter().position(|p| p == param)?;
+    let idx = func_params
+        .iter()
+        .position(|g| g.iter().any(|p| p == param))?;
     let args = call.child_by_field_name("arguments")?;
     let mut positional: Vec<Node> = Vec::new();
     let mut c = args.walk();
