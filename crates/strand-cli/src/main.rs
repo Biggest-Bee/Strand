@@ -11,7 +11,7 @@ use strand_core::{EdgeKind, Graph, GraphBuilder, MergeOp};
 use strand_import::{self, Format};
 
 mod check;
-mod deep;
+use strand_deep as deep;
 mod export;
 mod trace;
 mod update_check;

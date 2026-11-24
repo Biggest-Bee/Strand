@@ -8,11 +8,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::deep::facts::{Summary, VarState};
-use crate::deep::facts_js::{self, analyze_function_js};
-use crate::deep::js_ipa::{self, JsFile};
-use crate::deep::models::Model;
-use crate::deep::solver::{order_sccs, tarjan_scc, NodeId, SolveOutput, SolveStats};
+use crate::facts::{Summary, VarState};
+use crate::facts_js::{self, analyze_function_js};
+use crate::js_ipa::{self, JsFile};
+use crate::models::Model;
+use crate::solver::{order_sccs, tarjan_scc, NodeId, SolveOutput, SolveStats};
 
 /// A function to analyze: where its body node lives.
 struct FuncRef {
@@ -38,7 +38,7 @@ fn collect_funcs(parsed: &[JsFile]) -> HashMap<NodeId, FuncRef> {
                 qualname: "<module>".to_string(),
             },
         );
-        let mut by_qual: HashMap<String, &crate::deep::ipa::FuncInfo> = HashMap::new();
+        let mut by_qual: HashMap<String, &crate::ipa::FuncInfo> = HashMap::new();
         for infos in f.funcs.values() {
             for info in infos {
                 by_qual.insert(info.qualname.clone(), info);
@@ -171,7 +171,7 @@ pub fn solve_js(parsed: &[JsFile], file_set: &BTreeSet<String>, model: &Model) -
     let mut summaries: HashMap<NodeId, Summary> = HashMap::new();
     let mut findings_dedup: HashMap<
         (SinkKindKey, String, u32, String, String),
-        crate::deep::facts::Finding,
+        crate::facts::Finding,
     > = HashMap::new();
     let mut stats = SolveStats {
         functions: funcs.len(),
@@ -246,7 +246,7 @@ pub fn solve_js(parsed: &[JsFile], file_set: &BTreeSet<String>, model: &Model) -
         }
     }
 
-    let mut findings: Vec<crate::deep::facts::Finding> = findings_dedup.into_values().collect();
+    let mut findings: Vec<crate::facts::Finding> = findings_dedup.into_values().collect();
     findings.sort_by(|a, b| {
         (&a.file, a.line, format!("{:?}", a.class), &a.sink).cmp(&(
             &b.file,
@@ -266,4 +266,4 @@ pub fn solve_js(parsed: &[JsFile], file_set: &BTreeSet<String>, model: &Model) -
 
 /// Wrapper for Ord on SinkKind in the dedup key (mirrors solver.rs).
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Debug)]
-struct SinkKindKey(crate::deep::models::SinkKind);
+struct SinkKindKey(crate::models::SinkKind);

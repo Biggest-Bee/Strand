@@ -12,10 +12,10 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::deep::callgraph;
-use crate::deep::facts::{analyze_function, Finding, Summary, VarState};
-use crate::deep::ipa::PyFile;
-use crate::deep::models::{Model, SinkKind};
+use crate::callgraph;
+use crate::facts::{analyze_function, Finding, Summary, VarState};
+use crate::ipa::PyFile;
+use crate::models::{Model, SinkKind};
 
 /// Node id: (module, qualname). "<module>" = top-level code.
 pub type NodeId = (String, String);
@@ -61,7 +61,7 @@ fn collect_funcs(parsed: &[PyFile]) -> HashMap<NodeId, FuncRef> {
         // Group by qualname; prefer the last non-stub definition
         // (Python semantics: later def shadows earlier; overload
         // stubs are `...` bodies).
-        let mut by_qual: HashMap<String, &crate::deep::ipa::FuncInfo> = HashMap::new();
+        let mut by_qual: HashMap<String, &crate::ipa::FuncInfo> = HashMap::new();
         for infos in f.funcs.values() {
             for info in infos {
                 let e = by_qual.entry(info.qualname.clone()).or_insert(info);
@@ -114,7 +114,7 @@ fn func_node<'t>(f: &'t PyFile, r: &FuncRef) -> Option<Node<'t>> {
 
 /// Iterative Tarjan SCC. Returns components in reverse topological
 /// order already? No - returns in Tarjan order; we sort by finish.
-pub(crate) fn tarjan_scc(nodes: &HashSet<NodeId>, adj: &HashMap<NodeId, Vec<NodeId>>) -> Vec<Vec<NodeId>> {
+pub fn tarjan_scc(nodes: &HashSet<NodeId>, adj: &HashMap<NodeId, Vec<NodeId>>) -> Vec<Vec<NodeId>> {
     // Iterative Tarjan.
     struct Frame {
         node: NodeId,
@@ -193,7 +193,7 @@ pub(crate) fn tarjan_scc(nodes: &HashSet<NodeId>, adj: &HashMap<NodeId, Vec<Node
 /// topo order already (sinks first) for this formulation - but we
 /// verify by sorting on a computed finish order. Safer: build cond
 /// graph and Kahn it.
-pub(crate) fn order_sccs(
+pub fn order_sccs(
     sccs: Vec<Vec<NodeId>>,
     adj: &HashMap<NodeId, Vec<NodeId>>,
 ) -> Vec<Vec<NodeId>> {
@@ -403,8 +403,8 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let parsed = crate::deep::ipa::parse_all(&map);
-        let model = crate::deep::models::python_default().unwrap();
+        let parsed = crate::ipa::parse_all(&map);
+        let model = crate::models::python_default().unwrap();
         solve(&parsed, &model)
     }
 

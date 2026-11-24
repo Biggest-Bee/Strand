@@ -27,30 +27,30 @@ const MAX_CALL_SITES: usize = 64;
 const MAX_STRINGS: usize = 64;
 
 /// One Python file's parsed view.
-pub(crate) struct PyFile {
+pub struct PyFile {
     /// Project-root-relative path, `/`-separated, `.py` suffix.
-    pub(crate) rel: String,
+    pub rel: String,
     /// Dotted module name (`pkg.loader`; `__init__` stripped).
-    pub(crate) module: String,
-    pub(crate) tree: Tree,
-    pub(crate) text: String,
+    pub module: String,
+    pub tree: Tree,
+    pub text: String,
     /// Local name -> (module key, member). `member=None` means the
     /// local name refers to the module itself (`import m [as x]`).
     /// `member=Some(f)` means `from m import f [as x]` - `f` may be a
     /// function OR a submodule (resolved by usage context).
     /// Module keys may start with `.` for relative imports.
-    pub(crate) bindings: HashMap<String, (String, Option<String>)>,
+    pub bindings: HashMap<String, (String, Option<String>)>,
     /// Module-level `NAME = "literal"` constants.
-    pub(crate) consts: HashMap<String, String>,
+    pub consts: HashMap<String, String>,
     /// `def` short name -> info (Vec: same-name defs are rare but
     /// legal; first entry wins for lookups).
-    pub(crate) funcs: HashMap<String, Vec<FuncInfo>>,
+    pub funcs: HashMap<String, Vec<FuncInfo>>,
 }
 
 /// Facts about one `def`: params, byte range, qualified name
 /// (`Class.method` for methods), and whether it's a method.
 #[derive(Clone)]
-pub(crate) struct FuncInfo {
+pub struct FuncInfo {
     pub params: Vec<String>,
     pub start: usize,
     pub end: usize,
@@ -112,7 +112,7 @@ fn parse_ts(text: &str) -> Option<Tree> {
 /// rather than a full Rust-side tree walk. Order matches document
 /// order, same as the old stack walk produced for stats purposes
 /// (callgraph sorts/dedups edges anyway; IPA indexes by byte range).
-pub(crate) fn call_nodes<'a>(f: &'a PyFile) -> Vec<Node<'a>> {
+pub fn call_nodes<'a>(f: &'a PyFile) -> Vec<Node<'a>> {
     use tree_sitter::StreamingIterator;
     static QUERY: std::sync::OnceLock<tree_sitter::Query> = std::sync::OnceLock::new();
     let query = QUERY.get_or_init(|| {
@@ -284,7 +284,7 @@ fn specifier_template(
     Some((pname.clone(), prefix, suffix))
 }
 
-pub(crate) fn analyze_file(rel: &str, text: &str) -> Option<PyFile> {
+pub fn analyze_file(rel: &str, text: &str) -> Option<PyFile> {
     let tree = parse_ts(text)?;
     Some(analyze_file_tree(rel, text.to_string(), tree))
 }
@@ -292,7 +292,7 @@ pub(crate) fn analyze_file(rel: &str, text: &str) -> Option<PyFile> {
 /// Build a `PyFile` from an already-parsed tree - used when the
 /// caller obtained trees from `strand_import::scan_project_with_py`
 /// so each file is parsed exactly once.
-pub(crate) fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> PyFile {
+pub fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> PyFile {
     let mut f = PyFile {
         rel: rel.to_string(),
         module: module_of(rel),
@@ -613,7 +613,7 @@ fn dyn_sites(f: &PyFile) -> Vec<DynSite> {
 /// Resolve a possibly-relative module key against the importer's
 /// module. `from . import x` in `pkg.loader` -> base `pkg`;
 /// `from ..a import b` -> parent of pkg.
-pub(crate) fn resolve_module_key(key: &str, importer_module: &str) -> Option<String> {
+pub fn resolve_module_key(key: &str, importer_module: &str) -> Option<String> {
     if !key.starts_with('.') {
         return Some(key.to_string());
     }
@@ -637,9 +637,9 @@ pub(crate) fn resolve_module_key(key: &str, importer_module: &str) -> Option<Str
 /// Resolved import bindings for one file: local name ->
 /// (absolutized module, member). Computed once per file so call
 /// resolution doesn't redo relative-import math per call site.
-pub(crate) type RBindings = HashMap<String, (String, Option<String>)>;
+pub type RBindings = HashMap<String, (String, Option<String>)>;
 
-pub(crate) fn resolve_bindings(f: &PyFile) -> RBindings {
+pub fn resolve_bindings(f: &PyFile) -> RBindings {
     f.bindings
         .iter()
         .filter_map(|(local, (mk, member))| {
@@ -652,7 +652,7 @@ pub(crate) fn resolve_bindings(f: &PyFile) -> RBindings {
 /// Module an attribute-call object expression refers to, if statically
 /// known. `m.f()` where m is `import m [as x]` / `from p import m`,
 /// and dotted chains `a.b.c.f()` from `import a.b.c`.
-pub(crate) fn object_module(obj: Node, rbind: &RBindings, text: &str) -> Option<String> {
+pub fn object_module(obj: Node, rbind: &RBindings, text: &str) -> Option<String> {
     match obj.kind() {
         "identifier" => {
             let name = obj.utf8_text(text.as_bytes()).ok()?;

@@ -192,6 +192,8 @@ struct StrandApp {
     layout_flag: Arc<AtomicBool>,
     /// In-flight full-name collection for autocomplete/browse.
     names_rx: Option<Receiver<Vec<String>>>,
+    /// In-flight deep (taint/null/leak) project scan.
+    deep_rx: Option<Receiver<(String, Vec<ReportRow>, String)>>,
 }
 
 const MAX_VIZ_NODES: usize = 100_000;
@@ -551,6 +553,7 @@ impl StrandApp {
             analysis_rx: None,
             depths_rx: None,
             names_rx: None,
+            deep_rx: None,
             layout_flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -613,6 +616,64 @@ impl StrandApp {
     }
 
     /// Unload the current graph/store and return to the empty state.
+    /// Deep scan: pick a project directory, run the strand-deep
+    /// taint/null/leak solvers on a worker thread, report findings.
+    /// Independent of any open graph - this scans source, not .strand.
+    fn run_deep_scan(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Deep scan project directory")
+            .pick_folder()
+        else {
+            return;
+        };
+        let (tx, rx) = channel();
+        self.deep_rx = Some(rx);
+        self.status = format!("deep scan: {}", dir.display());
+        std::thread::spawn(move || {
+            let out = match strand_deep::analyze::analyze_project(&dir) {
+                Ok(rep) => {
+                    let mut lines = Vec::new();
+                    let mut n_findings = 0usize;
+                    for lang in &rep.languages {
+                        let s = &lang.stats;
+                        lines.push(row(format!(
+                            "== {}: {} functions, {} SCCs ({} cyclic), {} findings ==",
+                            lang.language, s.functions, s.sccs, s.cyclic_sccs, s.findings
+                        )));
+                        for f in &lang.findings {
+                            n_findings += 1;
+                            lines.push(row(format!(
+                                "[{:?}] {}:{} {} - {} (via {}) [{:.0}%]",
+                                f.class,
+                                f.file,
+                                f.line,
+                                f.sink,
+                                f.source,
+                                f.via.join(" -> "),
+                                f.confidence * 100.0
+                            )));
+                        }
+                    }
+                    if n_findings == 0 {
+                        lines.push(row("no findings"));
+                    }
+                    let status = format!(
+                        "deep scan: {} findings in {}",
+                        n_findings,
+                        dir.display()
+                    );
+                    (format!("deep scan: {}", dir.display()), lines, status)
+                }
+                Err(e) => (
+                    "deep scan failed".to_string(),
+                    vec![row(format!("error: {e}"))],
+                    format!("deep scan failed: {e}"),
+                ),
+            };
+            let _ = tx.send(out);
+        });
+    }
+
     fn close_graph(&mut self) {
         self.backend = None;
         self.source_label = "no graph open - File -> Open...".to_string();
@@ -825,6 +886,17 @@ impl StrandApp {
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.names_rx = None,
+            }
+        }
+        if let Some(rx) = &self.deep_rx {
+            match rx.try_recv() {
+                Ok((title, lines, status)) => {
+                    self.set_report(title, lines);
+                    self.status = status;
+                    self.deep_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.deep_rx = None,
             }
         }
     }
@@ -1871,6 +1943,9 @@ impl eframe::App for StrandApp {
                 }
                 if ui.button("Open store...").clicked() {
                     self.open_store();
+                }
+                if ui.button("Deep scan...").clicked() {
+                    self.run_deep_scan();
                 }
                 if ui.button("Close").clicked() {
                     self.close_graph();

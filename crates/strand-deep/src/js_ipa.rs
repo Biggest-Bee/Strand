@@ -17,29 +17,29 @@ use strand_core::EdgeKind;
 use rayon::prelude::*;
 use tree_sitter::{Node, Tree};
 
-use crate::deep::ipa::{FuncInfo, IpaOutput};
+use crate::ipa::{FuncInfo, IpaOutput};
 
 const MAX_CALL_SITES: usize = 64;
 const MAX_STRINGS: usize = 64;
 
 /// One JS/TS file's parsed view.
-pub(crate) struct JsFile {
+pub struct JsFile {
     /// Project-root-relative path (`/`-separated).
-    pub(crate) rel: String,
-    pub(crate) tree: Tree,
-    pub(crate) text: String,
+    pub rel: String,
+    pub tree: Tree,
+    pub text: String,
     /// Local name -> (module spec, member). `member=None` means the
     /// local name is the whole module (`import * as ns`,
     /// `const m = require('x')`); `member=Some(f)` is a named import,
     /// destructured require member, or the `"default"` export.
     /// Specs stay unresolved here; `call_targets` maps them through
     /// the scanned file set.
-    pub(crate) bindings: HashMap<String, (String, Option<String>)>,
+    pub bindings: HashMap<String, (String, Option<String>)>,
     /// `const NAME = "literal"` style constants.
-    pub(crate) consts: HashMap<String, String>,
+    pub consts: HashMap<String, String>,
     /// Function short name -> info (declarations, arrows/functions
     /// bound by declarator, methods).
-    pub(crate) funcs: HashMap<String, Vec<FuncInfo>>,
+    pub funcs: HashMap<String, Vec<FuncInfo>>,
 }
 
 fn parse_js(text: &str, rel: &str) -> Option<Tree> {
@@ -67,7 +67,7 @@ fn parse_js(text: &str, rel: &str) -> Option<Tree> {
 
 /// All `call_expression` nodes via a tree-sitter query compiled for
 /// the file's own grammar (JS vs TS vs TSX node ids differ).
-pub(crate) fn call_nodes<'a>(f: &'a JsFile) -> Vec<Node<'a>> {
+pub fn call_nodes<'a>(f: &'a JsFile) -> Vec<Node<'a>> {
     use tree_sitter::StreamingIterator;
     let q = call_query(f);
     let mut cursor = tree_sitter::QueryCursor::new();
@@ -129,13 +129,13 @@ fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> JsFile {
 }
 
 /// Build a `JsFile` from source text (parses internally).
-pub(crate) fn analyze_source(rel: &str, text: &str) -> Option<JsFile> {
+pub fn analyze_source(rel: &str, text: &str) -> Option<JsFile> {
     let tree = parse_js(text, rel)?;
     Some(analyze_file_tree(rel, text.to_string(), tree))
 }
 
 /// Build `JsFile`s from `(rel, abs)` paths in parallel.
-pub(crate) fn analyze_files(
+pub fn analyze_files(
     files: &[(String, std::path::PathBuf)],
 ) -> Vec<(String, Option<JsFile>)> {
     files
@@ -201,7 +201,7 @@ fn facts_query_rel(rel: &str) -> &'static tree_sitter::Query {
     }
 }
 
-pub(crate) fn spec_string(node: Node, text: &str) -> Option<String> {
+pub fn spec_string(node: Node, text: &str) -> Option<String> {
     if node.kind() != "string" {
         return None;
     }
@@ -305,7 +305,7 @@ fn collect_import(
     }
 }
 
-pub(crate) fn is_require_call(node: Node, text: &str) -> Option<String> {
+pub fn is_require_call(node: Node, text: &str) -> Option<String> {
     if node.kind() != "call_expression" {
         return None;
     }
@@ -443,7 +443,7 @@ fn bind_object_pattern(
 
 /// Params of a function-ish node: identifiers plus the first
 /// identifier inside TS `required_parameter`/`optional_parameter`.
-pub(crate) fn fn_params(node: Node, text: &str) -> Vec<String> {
+pub fn fn_params(node: Node, text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let Some(pn) = node.child_by_field_name("parameters") else {
         return out;
@@ -755,7 +755,7 @@ fn first_arg(call: Node) -> Option<Node> {
 /// Enclosing function of a node -> (name, info). JS functions get
 /// names from declarations, declarator-bound arrows/functions, and
 /// method definitions; anonymous/nested expressions are skipped.
-pub(crate) fn enclosing_func<'t>(node: Node<'t>, f: &'t JsFile) -> Option<(String, FuncInfo)> {
+pub fn enclosing_func<'t>(node: Node<'t>, f: &'t JsFile) -> Option<(String, FuncInfo)> {
     let mut anc = node.parent();
     while let Some(n) = anc {
         match n.kind() {
@@ -870,7 +870,7 @@ fn dyn_sites(f: &JsFile) -> Vec<DynSite> {
 /// bare/external specs. Mirrors strand-import's JS resolution:
 /// `./`,`../` resolve against the importer's dir; other path-like
 /// specs try project-root relative.
-pub(crate) fn resolve_spec(importer_rel: &str, spec: &str, names: &BTreeSet<String>) -> Option<String> {
+pub fn resolve_spec(importer_rel: &str, spec: &str, names: &BTreeSet<String>) -> Option<String> {
     use strand_import::scan::{normalize_rel, resolve_js};
     let parent = importer_rel
         .rsplit_once('/')
@@ -888,7 +888,7 @@ pub(crate) fn resolve_spec(importer_rel: &str, spec: &str, names: &BTreeSet<Stri
 }
 
 /// (module_rel, func) candidates a call's callee may invoke.
-pub(crate) fn call_targets(
+pub fn call_targets(
     func_node: Node,
     rbind: &HashMap<String, (String, Option<String>)>,
     f: &JsFile,
@@ -927,7 +927,7 @@ pub(crate) fn call_targets(
 }
 
 /// Module file a member-expression object refers to.
-pub(crate) fn object_module(
+pub fn object_module(
     obj: Node,
     rbind: &HashMap<String, (String, Option<String>)>,
     f: &JsFile,

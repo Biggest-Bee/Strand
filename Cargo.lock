@@ -3665,16 +3665,11 @@ dependencies = [
  "serde",
  "serde_json",
  "strand-core",
+ "strand-deep",
  "strand-import",
  "tempfile",
  "thiserror 2.0.21",
  "toml",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
  "ureq",
 ]
 
@@ -3694,6 +3689,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "strand-deep"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+ "serde",
+ "strand-core",
+ "strand-import",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "strand-gui"
 version = "0.3.7"
 dependencies = [
@@ -3703,6 +3715,7 @@ dependencies = [
  "rfd",
  "serde_json",
  "strand-core",
+ "strand-deep",
  "strand-store",
  "ureq",
 ]

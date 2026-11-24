@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::deep::ipa::{object_module, resolve_bindings, resolve_module_key, PyFile, RBindings};
-use crate::deep::models::{Model, SinkKind};
+use crate::ipa::{object_module, resolve_bindings, resolve_module_key, PyFile, RBindings};
+use crate::models::{Model, SinkKind};
 
 /// A concrete finding: untrusted/None/resource-violating value reached
 /// a sink inside one function.
@@ -73,7 +73,7 @@ pub struct Summary {
 
 impl Summary {
     /// Fixpoint comparison: flow fields only (findings accumulate).
-    pub(crate) fn flows_equal(&self, other: &Summary) -> bool {
+    pub fn flows_equal(&self, other: &Summary) -> bool {
         self.param_sinks == other.param_sinks
             && self.param_to_return == other.param_to_return
             && self.returns_tainted == other.returns_tainted
@@ -85,14 +85,14 @@ impl Summary {
 
 /// Per-variable state.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct VarState {
-    pub(crate) taint: Option<String>,
-    pub(crate) is_none: bool,
-    pub(crate) resource: Option<String>,
+pub struct VarState {
+    pub taint: Option<String>,
+    pub is_none: bool,
+    pub resource: Option<String>,
 }
 
 impl VarState {
-    pub(crate) fn join(&mut self, other: &VarState) {
+    pub fn join(&mut self, other: &VarState) {
         if self.taint.is_none() {
             self.taint = other.taint.clone();
         }

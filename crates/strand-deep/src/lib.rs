@@ -2,6 +2,7 @@
 //! research binary): Python call graph, dynamic-import resolution,
 //! and the taint/null/leak summary solver.
 
+pub mod analyze;
 pub mod callgraph;
 pub mod facts;
 pub mod facts_js;

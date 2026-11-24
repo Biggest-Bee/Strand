@@ -10,28 +10,28 @@ use rayon::prelude::*;
 use tree_sitter::{Node, Tree};
 
 /// One Go file's parsed view.
-pub(crate) struct GoFile {
+pub struct GoFile {
     /// Project-root-relative path (`/`-separated).
-    pub(crate) rel: String,
+    pub rel: String,
     /// Directory of `rel` - the package key ("." for root files).
-    pub(crate) dir: String,
+    pub dir: String,
     /// Package clause name.
-    pub(crate) package: String,
-    pub(crate) tree: Tree,
-    pub(crate) text: String,
+    pub package: String,
+    pub tree: Tree,
+    pub text: String,
     /// Local binding name -> (canonical package name, import path).
     /// Canonical name = target package clause for project imports,
     /// else last path element with `.vN` suffix stripped.
-    pub(crate) imports: HashMap<String, (String, String)>,
+    pub imports: HashMap<String, (String, String)>,
     /// Function/method short name -> info. Methods key by method
     /// name; qualname is "Func" or "Type.Method".
-    pub(crate) funcs: HashMap<String, Vec<GoFuncInfo>>,
+    pub funcs: HashMap<String, Vec<GoFuncInfo>>,
 }
 
 /// Go function metadata (extends the shared FuncInfo shape with the
 /// receiver for `recv.Method()` resolution).
 #[derive(Debug, Clone)]
-pub(crate) struct GoFuncInfo {
+pub struct GoFuncInfo {
     pub params: Vec<String>,
     pub start: usize,
     pub end: usize,
@@ -61,7 +61,7 @@ fn parse_go(text: &str) -> Option<Tree> {
 }
 
 /// All `call_expression` nodes via query.
-pub(crate) fn call_nodes<'a>(f: &'a GoFile) -> Vec<Node<'a>> {
+pub fn call_nodes<'a>(f: &'a GoFile) -> Vec<Node<'a>> {
     use std::sync::OnceLock;
     use tree_sitter::StreamingIterator;
     static Q: OnceLock<tree_sitter::Query> = OnceLock::new();
@@ -117,7 +117,7 @@ fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> Option<GoFile> {
 /// function-scoped vars and must only apply to that file.
 /// No dataflow - used only to order SCCs (the facts walk rebuilds
 /// precise types itself).
-pub(crate) fn seed_types(f: &GoFile) -> (HashMap<String, String>, HashMap<String, String>) {
+pub fn seed_types(f: &GoFile) -> (HashMap<String, String>, HashMap<String, String>) {
     let mut local = HashMap::new();
     let mut pkg = HashMap::new();
     use std::sync::OnceLock;
@@ -286,7 +286,7 @@ fn path_string(node: Node, text: &str) -> Option<String> {
 
 /// Last path element with a trailing `.vN` version stripped
 /// (`gopkg.in/yaml.v2` -> `yaml`).
-pub(crate) fn canonical_external(path: &str) -> String {
+pub fn canonical_external(path: &str) -> String {
     let last = path.rsplit('/').next().unwrap_or(path);
     if let Some((base, ver)) = last.rsplit_once('.') {
         if ver.len() <= 3 && ver.chars().all(|c| c.is_ascii_digit()) && !base.is_empty() {
@@ -429,7 +429,7 @@ fn param_names(node: Option<Node>, text: &str) -> Vec<String> {
 }
 
 /// `_type` node -> dotted type name for var_types seeding.
-pub(crate) fn type_name_pub(node: Node, text: &str) -> Option<String> {
+pub fn type_name_pub(node: Node, text: &str) -> Option<String> {
     match node.kind() {
         "type_identifier" => node
             .utf8_text(text.as_bytes())
@@ -469,7 +469,7 @@ pub(crate) fn type_name_pub(node: Node, text: &str) -> Option<String> {
 
 /// Nilable result types: pointer/slice/map/chan/interface/func and
 /// `error` (an interface). Named types are conservatively non-nil.
-pub(crate) fn type_nilable_pub(node: Node, text: &str) -> bool {
+pub fn type_nilable_pub(node: Node, text: &str) -> bool {
     match node.kind() {
         "pointer_type" | "slice_type" | "map_type" | "channel_type"
         | "interface_type" | "function_type" => true,
@@ -570,13 +570,13 @@ fn method_info(node: Node, text: &str) -> Option<GoFuncInfo> {
 }
 
 /// Build a `GoFile` from source text.
-pub(crate) fn analyze_source(rel: &str, text: &str) -> Option<GoFile> {
+pub fn analyze_source(rel: &str, text: &str) -> Option<GoFile> {
     let tree = parse_go(text)?;
     analyze_file_tree(rel, text.to_string(), tree)
 }
 
 /// Build `GoFile`s from `(rel, abs)` paths in parallel.
-pub(crate) fn analyze_files(
+pub fn analyze_files(
     files: &[(String, PathBuf)],
 ) -> Vec<(String, Option<GoFile>)> {
     files
@@ -592,14 +592,14 @@ pub(crate) fn analyze_files(
 
 /// Project module prefixes discovered from go.mod files: longest
 /// module path wins when resolving an import path to a directory.
-pub(crate) struct GoModules {
+pub struct GoModules {
     /// (module_path, dir_rel) sorted by path length desc at use site.
     pub prefixes: Vec<(String, String)>,
 }
 
 /// Discover go.mod files under `root` (bounded walk) and parse their
 /// `module` directives.
-pub(crate) fn discover_modules(root: &Path) -> GoModules {
+pub fn discover_modules(root: &Path) -> GoModules {
     let mut prefixes = Vec::new();
     // go.mod files may not be in file_set (scanner nodes differ);
     // walk the tree shallowly for them.
@@ -652,7 +652,7 @@ pub(crate) fn discover_modules(root: &Path) -> GoModules {
 }
 
 /// Resolve an import path to a project package dir, if any.
-pub(crate) fn resolve_import(mods: &GoModules, path: &str) -> Option<String> {
+pub fn resolve_import(mods: &GoModules, path: &str) -> Option<String> {
     for (mpath, mdir) in &mods.prefixes {
         if path == mpath {
             return Some(mdir.clone());
@@ -671,7 +671,7 @@ pub(crate) fn resolve_import(mods: &GoModules, path: &str) -> Option<String> {
 
 /// Enclosing function of a node -> GoFuncInfo (methods/functions/
 /// func literals bound by name). Returns qualname + info.
-pub(crate) fn enclosing_func<'t>(
+pub fn enclosing_func<'t>(
     node: Node<'t>,
     f: &'t GoFile,
 ) -> Option<(String, GoFuncInfo)> {

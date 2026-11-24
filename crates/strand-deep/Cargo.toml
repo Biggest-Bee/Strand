@@ -1,0 +1,23 @@
+[package]
+name = "strand-deep"
+version = "0.1.0"
+edition = "2021"
+description = "Interprocedural analysis engine: call graphs, dynamic-import resolution, and taint/null/leak summary solvers for Python, JS/TS, Go, and Rust"
+license = "Apache-2.0"
+repository = "https://github.com/Biggest-Bee/Strand"
+readme.workspace = true
+keywords = ["static-analysis", "taint-analysis", "interprocedural", "dependency-graph"]
+categories = ["development-tools", "parsing"]
+
+[dependencies]
+strand-core = { path = "../strand-core", version = "0.2.0" }
+strand-import = { path = "../strand-import", version = "0.14.0" }
+rayon.workspace = true
+toml = "1"
+serde.workspace = true
+tree-sitter = "0.27.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.25.0"
+tree-sitter-rust = "0.24.2"

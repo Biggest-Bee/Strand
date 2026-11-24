@@ -29,10 +29,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::deep::facts::{Finding, FuncAnalysis, PendingSink, Summary, VarState};
-use crate::deep::models::{Model, SinkKind};
-use crate::deep::rust_deep::{self, RsFile, RsFuncInfo};
-use crate::deep::solver::NodeId;
+use crate::facts::{Finding, FuncAnalysis, PendingSink, Summary, VarState};
+use crate::models::{Model, SinkKind};
+use crate::rust_deep::{self, RsFile, RsFuncInfo};
+use crate::solver::NodeId;
 
 const NODE_BUDGET: usize = 100_000;
 
@@ -1983,7 +1983,7 @@ fn call_ret_type(node: Node, ctx: &CtxRs) -> Option<String> {
 }
 
 /// Resolve this call's callee to (file_rel, qualname).
-pub(crate) fn resolve_callee(
+pub fn resolve_callee(
     node: Node,
     f: &RsFile,
     parsed: &[RsFile],
@@ -2322,9 +2322,9 @@ fn unknown_call_result(args: &[ExprVal], result: &mut ExprVal, ctx: &mut CtxRs, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deep::models::rust_default;
-    use crate::deep::rust_deep::analyze_source;
-    use crate::deep::solver::SolveOutput;
+    use crate::models::rust_default;
+    use crate::rust_deep::analyze_source;
+    use crate::solver::SolveOutput;
     use std::collections::BTreeSet;
 
     fn run(files: &[(&str, &str)]) -> SolveOutput {
@@ -2335,7 +2335,7 @@ mod tests {
         let _file_set: BTreeSet<String> =
             files.iter().map(|(k, _)| k.to_string()).collect();
         let model = rust_default().unwrap();
-        crate::deep::solver_rs::solve_rs(&parsed, &model)
+        crate::solver_rs::solve_rs(&parsed, &model)
     }
 
     #[test]

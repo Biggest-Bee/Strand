@@ -25,10 +25,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::deep::facts::{Finding, FuncAnalysis, PendingSink, Summary, VarState};
-use crate::deep::go_deep::{self, GoFile, GoFuncInfo, GoModules};
-use crate::deep::models::{Model, SinkKind};
-use crate::deep::solver::NodeId;
+use crate::facts::{Finding, FuncAnalysis, PendingSink, Summary, VarState};
+use crate::go_deep::{self, GoFile, GoFuncInfo, GoModules};
+use crate::models::{Model, SinkKind};
+use crate::solver::NodeId;
 
 const NODE_BUDGET: usize = 100_000;
 
@@ -1760,7 +1760,7 @@ fn walk_switch(node: Node, ctx: &mut CtxGo, env: &mut HashMap<String, VarState>)
 /// `types` = optional var->type env for `recv.Method()` resolution
 /// (present during facts walks; absent for callgraph building, which
 /// then leaves typed-method calls unresolved - conservative).
-pub(crate) fn resolve_callee(
+pub fn resolve_callee(
     node: Node,
     f: &GoFile,
     parsed: &[GoFile],
@@ -2008,18 +2008,18 @@ fn unknown_call_result(args: &[ExprVal], result: &mut ExprVal, ctx: &mut CtxGo, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deep::go_deep::{analyze_source, GoModules};
-    use crate::deep::models::go_default;
+    use crate::go_deep::{analyze_source, GoModules};
+    use crate::models::go_default;
     use std::collections::BTreeSet;
 
-    fn run(files: &[(&str, &str)]) -> crate::deep::solver::SolveOutput {
+    fn run(files: &[(&str, &str)]) -> crate::solver::SolveOutput {
         run_with_mods(files, GoModules { prefixes: vec![] })
     }
 
     fn run_with_mods(
         files: &[(&str, &str)],
         mods: GoModules,
-    ) -> crate::deep::solver::SolveOutput {
+    ) -> crate::solver::SolveOutput {
         let parsed: Vec<GoFile> = files
             .iter()
             .filter_map(|(rel, text)| analyze_source(rel, text))
@@ -2028,7 +2028,7 @@ mod tests {
             files.iter().map(|(k, _)| k.to_string()).collect();
         let _ = file_set;
         let model = go_default().unwrap();
-        crate::deep::solver_go::solve_go(&parsed, &mods, &model)
+        crate::solver_go::solve_go(&parsed, &mods, &model)
     }
 
     #[test]

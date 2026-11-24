@@ -1,24 +1,21 @@
-//! Bottom-up SCC solver for Go - mirrors `solver_js.rs` over
-//! `GoFile`s. NodeId = (package_dir, qualname) for functions and
-//! (file_rel, "<module>") for top-level code. Same Tarjan/order/
-//! fixpoint machinery; call edges resolve through
-//! `facts_go::resolve_callee` (package scope + import paths +
-//! type-env method resolution during analysis).
-//!
-//! Package-level variables are shared across a package's files:
-//! `<module>` environments and type environments merge per dir
-//! before function scopes are analyzed.
+//! Bottom-up SCC solver for Rust - mirrors `solver_go.rs` over
+//! `RsFile`s. NodeId = (file_rel, qualname): Rust items are
+//! file-scoped modules, so functions key per file. `<module>` covers
+//! top-level items (const/static initializers, macro calls).
+//! Call edges resolve through `facts_rs::resolve_callee` (same-file
+//! funcs, `::` paths via the module-suffix index, and type-env
+//! method resolution during analysis).
 
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::deep::facts::{Summary, VarState};
-use crate::deep::facts_go::{self, analyze_function_go};
-use crate::deep::go_deep::{self, GoFile, GoFuncInfo, GoModules};
-use crate::deep::models::Model;
-use crate::deep::solver::{order_sccs, tarjan_scc, NodeId, SolveOutput, SolveStats};
+use crate::facts::{Summary, VarState};
+use crate::facts_rs::{self, analyze_function_rs};
+use crate::models::Model;
+use crate::rust_deep::{self, RsFile, RsFuncInfo};
+use crate::solver::{order_sccs, tarjan_scc, NodeId, SolveOutput, SolveStats};
 
 /// A function to analyze: where its body node lives.
 struct FuncRef {
@@ -26,23 +23,15 @@ struct FuncRef {
     /// Byte range of the function-ish node (None = module root).
     range: Option<(usize, usize)>,
     /// Function metadata (None for `<module>`).
-    info: Option<GoFuncInfo>,
+    info: Option<RsFuncInfo>,
     qualname: String,
-
 }
 
-const FUNC_KINDS: &[&str] = &[
-    "function_declaration",
-    "method_declaration",
-    "func_literal",
-];
-
-/// Collect all analyzable Go functions: every FuncInfo + each file's
-/// top-level "<module>". Functions key by (package_dir, qualname) -
-/// Go scopes them per package, so same-name funcs in different files
-/// of one dir are the same entity (first definition wins; duplicate
-/// definitions are a compile error anyway).
-fn collect_funcs(parsed: &[GoFile]) -> HashMap<NodeId, FuncRef> {
+/// Collect all analyzable Rust functions: every FuncInfo + each
+/// file's top-level "<module>". Functions key by (file_rel,
+/// qualname) - Rust scopes them per module (file), so same-name
+/// funcs in different files are distinct entities.
+fn collect_funcs(parsed: &[RsFile]) -> HashMap<NodeId, FuncRef> {
     let mut out = HashMap::new();
     let mut seen: HashSet<NodeId> = HashSet::new();
     for (fi, f) in parsed.iter().enumerate() {
@@ -59,7 +48,7 @@ fn collect_funcs(parsed: &[GoFile]) -> HashMap<NodeId, FuncRef> {
         );
         for infos in f.funcs.values() {
             for info in infos {
-                let key = (f.dir.clone(), info.qualname.clone());
+                let key = (f.rel.clone(), info.qualname.clone());
                 if !seen.insert(key.clone()) {
                     continue;
                 }
@@ -78,27 +67,27 @@ fn collect_funcs(parsed: &[GoFile]) -> HashMap<NodeId, FuncRef> {
     out
 }
 
-/// package dir -> indices into `parsed`.
-fn pkg_dirs(parsed: &[GoFile]) -> HashMap<String, Vec<usize>> {
-    let mut out: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, f) in parsed.iter().enumerate() {
-        out.entry(f.dir.clone()).or_default().push(i);
-    }
-    out
+/// rel path -> file index.
+fn file_index(parsed: &[RsFile]) -> HashMap<String, usize> {
+    parsed
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.rel.clone(), i))
+        .collect()
 }
 
 /// Recover the function-ish node for a FuncRef.
-fn func_node<'t>(f: &'t GoFile, r: &FuncRef) -> Option<Node<'t>> {
+fn func_node<'t>(f: &'t RsFile, r: &FuncRef) -> Option<Node<'t>> {
     match r.range {
         None => Some(f.tree.root_node()),
         Some((s, e)) => {
             let n = f.tree.root_node().descendant_for_byte_range(s, e)?;
-            if FUNC_KINDS.contains(&n.kind()) {
+            if n.kind() == "function_item" {
                 return Some(n);
             }
             let mut cur = n;
             loop {
-                if FUNC_KINDS.contains(&cur.kind()) {
+                if cur.kind() == "function_item" {
                     return Some(cur);
                 }
                 cur = cur.parent()?;
@@ -107,38 +96,48 @@ fn func_node<'t>(f: &'t GoFile, r: &FuncRef) -> Option<Node<'t>> {
     }
 }
 
-/// Build Go call edges (caller NodeId -> callee NodeId) restricted
-/// to known functions. Resolution mirrors facts_go::resolve_callee
-/// with a syntactic seed-type env (receiver methods resolve via
-/// `s := &T{}` style declarations); the facts walk still applies
-/// summaries with its own precise type env.
+/// Build Rust call edges (caller NodeId -> callee NodeId)
+/// restricted to known functions. Resolution mirrors
+/// facts_rs::resolve_callee with no type env (typed-method calls
+/// stay unresolved here - the facts walk resolves them with types
+/// for summary application).
 fn build_callgraph(
-    parsed: &[GoFile],
-    pkg_dirs: &HashMap<String, Vec<usize>>,
-    mods: &GoModules,
+    parsed: &[RsFile],
+    index: &HashMap<String, usize>,
+    mod_index: &HashMap<String, usize>,
     node_set: &HashSet<NodeId>,
-    file_types: &[HashMap<String, String>],
 ) -> HashMap<NodeId, Vec<NodeId>> {
     let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     let mut seen: HashSet<(NodeId, NodeId)> = HashSet::new();
-    for (fi, f) in parsed.iter().enumerate() {
+    // Syntactic seed types (`let r = Runner::new()`, `let x: T`)
+    // let method calls resolve for edge-building; the facts walk
+    // rebuilds precise types during analysis.
+    let seed: HashMap<String, HashMap<String, String>> = parsed
+        .iter()
+        .map(|f| (f.rel.clone(), rust_deep::seed_types(f)))
+        .collect();
+    for f in parsed.iter() {
         // Cheap gate: file must contain a call-ish token.
         if !f.text.contains('(') {
             continue;
         }
-        let seed = &file_types[fi];
-        for call in go_deep::call_nodes(f) {
+        for call in rust_deep::call_nodes(f) {
             // Enclosing function -> caller NodeId.
-            let caller = match go_deep::enclosing_func(call, f) {
-                Some((_, info)) => (f.dir.clone(), info.qualname.clone()),
+            let caller = match rust_deep::enclosing_func(call, f) {
+                Some((qualname, _)) => (f.rel.clone(), qualname),
                 None => (f.rel.clone(), "<module>".to_string()),
             };
             if !node_set.contains(&caller) {
                 continue;
             }
-            let Some(callee) =
-                facts_go::resolve_callee(call, f, parsed, pkg_dirs, mods, Some(seed))
-            else {
+            let Some(callee) = facts_rs::resolve_callee(
+                call,
+                f,
+                parsed,
+                index,
+                mod_index,
+                seed.get(&f.rel),
+            ) else {
                 continue;
             };
             if node_set.contains(&callee) && callee != caller {
@@ -151,51 +150,22 @@ fn build_callgraph(
     adj
 }
 
-/// Run the full Go analysis.
-pub fn solve_go(
-    parsed: &[GoFile],
-    mods: &GoModules,
-    model: &Model,
-) -> SolveOutput {
+/// Run the full Rust analysis.
+pub fn solve_rs(parsed: &[RsFile], model: &Model) -> SolveOutput {
     let funcs = collect_funcs(parsed);
     let node_set: HashSet<NodeId> = funcs.keys().cloned().collect();
-    let dirs = pkg_dirs(parsed);
+    let index = file_index(parsed);
+    let mod_index = rust_deep::module_index(parsed);
 
-    // Syntactic seed types: package-level `var` decls merge per
-    // package dir; function-local decls stay per file (keyed by
-    // file index) to avoid cross-file name pollution.
-    let mut pkg_seed_types: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut file_seed_types: Vec<HashMap<String, String>> = vec![HashMap::new(); parsed.len()];
-    for (i, f) in parsed.iter().enumerate() {
-        let (local, pkg) = go_deep::seed_types(f);
-        file_seed_types[i] = local;
-        let t = pkg_seed_types.entry(f.dir.clone()).or_default();
-        for (k, v) in pkg {
-            t.entry(k).or_insert(v);
-        }
-    }
-    // Per-file view: package seeds overlaid with that file's locals.
-    let file_types: Vec<HashMap<String, String>> = parsed
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let mut m = pkg_seed_types.get(&f.dir).cloned().unwrap_or_default();
-            for (k, v) in &file_seed_types[i] {
-                m.insert(k.clone(), v.clone());
-            }
-            m
-        })
-        .collect();
-
-    let adj = build_callgraph(parsed, &dirs, mods, &node_set, &file_types);
+    let adj = build_callgraph(parsed, &index, &mod_index, &node_set);
 
     let sccs = tarjan_scc(&node_set, &adj);
     let ordered = order_sccs(sccs, &adj);
 
-    // Phase 0: per-file `<module>` analysis. Envs merge per package
-    // dir (package-level vars are shared); types merge likewise.
+    // Phase 0: per-file `<module>` analysis. Envs merge per file
+    // (Rust items are file-scoped); types merge likewise.
     let empty_sums: HashMap<NodeId, Summary> = HashMap::new();
-    let module_results: Vec<(usize, crate::deep::facts::FuncAnalysis, HashMap<String, String>)> =
+    let module_results: Vec<(usize, crate::facts::FuncAnalysis, HashMap<String, String>)> =
         funcs
             .values()
             .filter(|r| r.qualname == "<module>")
@@ -203,7 +173,7 @@ pub fn solve_go(
             .par_iter()
             .filter_map(|r| {
                 let f = &parsed[r.file_idx];
-                let (analysis, types) = analyze_function_go(
+                let (analysis, types) = analyze_function_rs(
                     f,
                     f.tree.root_node(),
                     None,
@@ -213,41 +183,32 @@ pub fn solve_go(
                     None,
                     None,
                     parsed,
-                    &dirs,
-                    mods,
+                    &index,
+                    &mod_index,
                 );
                 Some((r.file_idx, analysis, types))
             })
             .collect();
 
-    // Merge module envs + types per package dir.
-    let mut pkg_globals: HashMap<String, HashMap<String, VarState>> = HashMap::new();
-    let mut pkg_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // Merge module envs + types per file.
+    let mut file_globals: HashMap<String, HashMap<String, VarState>> = HashMap::new();
+    let mut file_types: HashMap<String, HashMap<String, String>> = HashMap::new();
     for (fi, analysis, types) in module_results {
-        let dir = parsed[fi].dir.clone();
-        let g = pkg_globals.entry(dir.clone()).or_default();
+        let rel = parsed[fi].rel.clone();
+        let g = file_globals.entry(rel.clone()).or_default();
         for (k, v) in analysis.env {
             g.entry(k).or_default().join(&v);
         }
-        let t = pkg_types.entry(dir).or_default();
+        let t = file_types.entry(rel).or_default();
         for (k, v) in types {
             t.entry(k).or_insert(v);
-        }
-    }
-    // Package-level seed types fill gaps the module walk did not
-    // reach (top-level `var s T` decls). Function-local seeds are
-    // deliberately excluded - they are file-scoped.
-    for (dir, seeds) in &pkg_seed_types {
-        let t = pkg_types.entry(dir.clone()).or_default();
-        for (k, v) in seeds {
-            t.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 
     let mut summaries: HashMap<NodeId, Summary> = HashMap::new();
     let mut findings_dedup: HashMap<
         (SinkKindKey, String, u32, String, String),
-        crate::deep::facts::Finding,
+        crate::facts::Finding,
     > = HashMap::new();
     let mut stats = SolveStats {
         functions: funcs.len(),
@@ -281,14 +242,14 @@ pub fn solve_go(
                 let globals = if is_module {
                     None
                 } else {
-                    pkg_globals.get(&f.dir)
+                    file_globals.get(&f.rel)
                 };
                 let pt = if is_module {
                     None
                 } else {
-                    pkg_types.get(&f.dir)
+                    file_types.get(&f.rel)
                 };
-                let (analysis, _types) = analyze_function_go(
+                let (analysis, _types) = analyze_function_rs(
                     f,
                     fnode,
                     fref.info.as_ref(),
@@ -298,8 +259,8 @@ pub fn solve_go(
                     globals,
                     pt,
                     parsed,
-                    &dirs,
-                    mods,
+                    &index,
+                    &mod_index,
                 );
                 if analysis.budget_hit {
                     stats.budget_exceeded += 1;
@@ -328,7 +289,7 @@ pub fn solve_go(
         }
     }
 
-    let mut findings: Vec<crate::deep::facts::Finding> = findings_dedup.into_values().collect();
+    let mut findings: Vec<crate::facts::Finding> = findings_dedup.into_values().collect();
     findings.sort_by(|a, b| {
         (&a.file, a.line, format!("{:?}", a.class), &a.sink).cmp(&(
             &b.file,
@@ -346,6 +307,6 @@ pub fn solve_go(
     }
 }
 
-/// Wrapper for Ord on SinkKind in the dedup key (mirrors solver_js).
+/// Wrapper for Ord on SinkKind in the dedup key (mirrors solver_js/go).
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Debug)]
-struct SinkKindKey(crate::deep::models::SinkKind);
+struct SinkKindKey(crate::models::SinkKind);

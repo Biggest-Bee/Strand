@@ -13,23 +13,23 @@ use tree_sitter::{Node, Tree};
 use tree_sitter::StreamingIterator;
 
 /// One Rust file's parsed view.
-pub(crate) struct RsFile {
+pub struct RsFile {
     /// Project-root-relative path (`/`-separated).
-    pub(crate) rel: String,
-    pub(crate) tree: Tree,
-    pub(crate) text: String,
+    pub rel: String,
+    pub tree: Tree,
+    pub text: String,
     /// Local binding name -> full `::` path (`use std::env::var`
     /// binds `var` -> `std::env::var`; `use x as y` binds `y` -> `x`).
     /// Wildcard imports (`use x::*`) are not modeled.
-    pub(crate) imports: HashMap<String, String>,
+    pub imports: HashMap<String, String>,
     /// Function/method short name -> info (methods key by method
     /// name; qualname is `f`, `Type::f`, or `mod::f`).
-    pub(crate) funcs: HashMap<String, Vec<RsFuncInfo>>,
+    pub funcs: HashMap<String, Vec<RsFuncInfo>>,
 }
 
 /// Rust function metadata.
 #[derive(Debug, Clone)]
-pub(crate) struct RsFuncInfo {
+pub struct RsFuncInfo {
     pub params: Vec<String>,
     pub start: usize,
     pub end: usize,
@@ -70,7 +70,7 @@ fn call_query() -> &'static tree_sitter::Query {
 }
 
 /// All `call_expression` nodes via query.
-pub(crate) fn call_nodes<'a>(f: &'a RsFile) -> Vec<Node<'a>> {
+pub fn call_nodes<'a>(f: &'a RsFile) -> Vec<Node<'a>> {
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut out = Vec::new();
     let mut matches = cursor.matches(call_query(), f.tree.root_node(), f.text.as_bytes());
@@ -87,7 +87,7 @@ fn short_name(qual: &str) -> String {
 }
 
 /// Build an `RsFile` from source text.
-pub(crate) fn analyze_source(rel: &str, text: &str) -> Option<RsFile> {
+pub fn analyze_source(rel: &str, text: &str) -> Option<RsFile> {
     let tree = parse_rs(text)?;
     let mut imports = HashMap::new();
     let mut funcs: HashMap<String, Vec<RsFuncInfo>> = HashMap::new();
@@ -102,7 +102,7 @@ pub(crate) fn analyze_source(rel: &str, text: &str) -> Option<RsFile> {
 }
 
 /// Build `RsFile`s from `(rel, abs)` paths in parallel.
-pub(crate) fn analyze_files(files: &[(String, PathBuf)]) -> Vec<(String, Option<RsFile>)> {
+pub fn analyze_files(files: &[(String, PathBuf)]) -> Vec<(String, Option<RsFile>)> {
     files
         .par_iter()
         .map(|(rel, abs)| {
@@ -115,7 +115,7 @@ pub(crate) fn analyze_files(files: &[(String, PathBuf)]) -> Vec<(String, Option<
 }
 
 /// `_type` node -> short type name for impl/receiver tracking.
-pub(crate) fn type_name_rs(node: Node, text: &str) -> Option<String> {
+pub fn type_name_rs(node: Node, text: &str) -> Option<String> {
     match node.kind() {
         "type_identifier" => node
             .utf8_text(text.as_bytes())
@@ -235,7 +235,7 @@ fn param_names(node: Option<Node>, text: &str) -> Vec<String> {
 
 /// All binding identifiers inside a pattern (identifier, mut_pattern,
 /// ref_pattern, tuple_pattern, struct_pattern field patterns, etc.).
-pub(crate) fn collect_pat_idents(node: Node, text: &str, out: &mut Vec<String>) {
+pub fn collect_pat_idents(node: Node, text: &str, out: &mut Vec<String>) {
     match node.kind() {
         "identifier" | "shorthand_field_identifier" => {
             if let Ok(t) = node.utf8_text(text.as_bytes()) {
@@ -417,7 +417,7 @@ fn join_path(prefix: &str, path: &str) -> String {
 /// Enclosing function of a node -> (qualname, info). Methods and
 /// nested-fn items both resolve through the file's funcs map by
 /// byte range.
-pub(crate) fn enclosing_func<'t>(
+pub fn enclosing_func<'t>(
     node: Node<'t>,
     f: &'t RsFile,
 ) -> Option<(String, RsFuncInfo)> {
@@ -443,7 +443,7 @@ pub(crate) fn enclosing_func<'t>(
 /// `let x = T::new()/T::default()`, `let x: T = ..` map binding ->
 /// type name. No dataflow - first binding wins; used only to order
 /// SCCs (the facts walk rebuilds precise types itself).
-pub(crate) fn seed_types(f: &RsFile) -> HashMap<String, String> {
+pub fn seed_types(f: &RsFile) -> HashMap<String, String> {
     let mut out = HashMap::new();
     seed_walk(f.tree.root_node(), f, &mut out);
     out
@@ -524,7 +524,7 @@ fn let_decl_type(node: Node, f: &RsFile) -> Option<String> {
 /// file to the file index, for cross-file call resolution.
 /// `src/util/helper.rs` yields `src::util::helper`, `util::helper`,
 /// `helper`; `a/b/mod.rs` yields `a::b`, `b`.
-pub(crate) fn module_index(parsed: &[RsFile]) -> HashMap<String, usize> {
+pub fn module_index(parsed: &[RsFile]) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for (i, f) in parsed.iter().enumerate() {
         let rel = f.rel.strip_suffix(".rs").unwrap_or(&f.rel);

@@ -11,6 +11,7 @@ categories = ["visualization"]
 
 [dependencies]
 strand-core = { path = "../strand-core", version = "0.2.0" }
+strand-deep = { path = "../strand-deep", version = "0.1.0" }
 strand-store = { path = "../strand-store", version = "0.2.2" }
 eframe = "0.35"
 rfd = "0.15"

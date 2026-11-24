@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use rayon::prelude::*;
 use tree_sitter::Node;
 
-use crate::deep::ipa::{resolve_bindings, resolve_module_key, PyFile, RBindings};
+use crate::ipa::{resolve_bindings, resolve_module_key, PyFile, RBindings};
 
 /// A resolved call edge: caller `(module, qualname)` -> callee
 /// `(module, qualname)`.
@@ -214,7 +214,7 @@ fn resolve_call(
                 }
             }
             // obj.attr() where obj is a known module.
-            match crate::deep::ipa::object_module(obj, rbind, text) {
+            match crate::ipa::object_module(obj, rbind, text) {
                 Some(m) => {
                     stats.resolved_import += 1;
                     caller
@@ -257,7 +257,7 @@ pub fn build(parsed: &[PyFile]) -> CallGraph {
             let rbind = resolve_bindings(f);
             let mut stats = CallStats::default();
             let mut edges = Vec::new();
-            for node in crate::deep::ipa::call_nodes(f) {
+            for node in crate::ipa::call_nodes(f) {
                 stats.total += 1;
                 for (caller, callee) in resolve_call(node, f, &rbind, &methods, &mut stats) {
                     edges.push((caller, callee));

@@ -15,10 +15,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::deep::facts::{Finding, FuncAnalysis, PendingSink, Summary, VarState};
-use crate::deep::js_ipa::{self, JsFile};
-use crate::deep::models::{Model, SinkKind};
-use crate::deep::solver::NodeId;
+use crate::facts::{Finding, FuncAnalysis, PendingSink, Summary, VarState};
+use crate::js_ipa::{self, JsFile};
+use crate::models::{Model, SinkKind};
+use crate::solver::NodeId;
 
 const NODE_BUDGET: usize = 100_000;
 
@@ -1748,7 +1748,7 @@ fn call_args(node: Node, ctx: &mut CtxJs, env: &mut HashMap<String, VarState>) -
 /// Resolve this call's callee to (module_rel, qualname) using the
 /// same rules as the JS call index: import/require bindings,
 /// same-file functions, `this.` methods, namespace member calls.
-pub(crate) fn resolve_callee(
+pub fn resolve_callee(
     node: Node,
     f: &JsFile,
     parsed: &[JsFile],
@@ -2026,16 +2026,16 @@ fn unknown_call_result(args: &[ExprVal], result: &mut ExprVal, ctx: &mut CtxJs, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deep::models::js_default;
+    use crate::models::js_default;
 
-    fn run(files: &[(&str, &str)]) -> crate::deep::solver::SolveOutput {
+    fn run(files: &[(&str, &str)]) -> crate::solver::SolveOutput {
         let file_set: BTreeSet<String> = files.iter().map(|(k, _)| k.to_string()).collect();
         let parsed: Vec<JsFile> = files
             .iter()
             .filter_map(|(rel, text)| js_ipa::analyze_source(rel, text))
             .collect();
         let model = js_default().unwrap();
-        crate::deep::solver_js::solve_js(&parsed, &file_set, &model)
+        crate::solver_js::solve_js(&parsed, &file_set, &model)
     }
 
     #[test]
