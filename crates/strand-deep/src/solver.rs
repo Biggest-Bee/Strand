@@ -257,13 +257,275 @@ pub fn order_sccs(
     order.into_iter().map(|i| sccs[i].clone()).collect()
 }
 
+/// Enclosing function_definition start_byte for `node`, or
+/// u32::MAX at module scope. Matches `py_ctor_seed_at` keys.
+fn scope_key_at(node: Node) -> u32 {
+    let mut anc = node.parent();
+    while let Some(n) = anc {
+        if n.kind() == "function_definition" {
+            return n.start_byte() as u32;
+        }
+        anc = n.parent();
+    }
+    u32::MAX
+}
+
+/// Class a seed/ctor expression resolves to, or None.
+fn seed_class_of(
+    node: Node,
+    f: &PyFile,
+    rb: &crate::ipa::RBindings,
+    extra: Option<&crate::ipa::FileSeeds>,
+) -> Option<(String, String)> {
+    let text = f.text.as_str();
+    match node.kind() {
+        "call" => crate::ipa::py_ctor_target(node, f, rb, text),
+        "identifier" => {
+            let name = node.utf8_text(text.as_bytes()).ok()?;
+            crate::ipa::py_ctor_seed_at(node, f, name, extra)
+        }
+        "attribute" => {
+            let key = crate::ipa::py_dotted(node, text)?;
+            crate::ipa::py_ctor_seed_at(node, f, &key, extra)
+        }
+        _ => None,
+    }
+}
+
+/// `return` expressions directly owned by `fnode` (nested defs,
+/// lambdas and classes excluded).
+fn return_exprs(fnode: Node) -> Vec<Node> {
+    let mut out = Vec::new();
+    let mut stack: Vec<Node> =
+        fnode.children(&mut fnode.walk()).collect();
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "function_definition" | "lambda" | "class_definition" => {}
+            "return_statement" => {
+                if let Some(e) = n.named_child(0) {
+                    out.push(e);
+                }
+            }
+            _ => stack.extend(n.children(&mut n.walk())),
+        }
+    }
+    out
+}
+
+/// LHS var key when `call` is the RHS of an assignment.
+fn assignment_lhs(call: Node, f: &PyFile) -> Option<String> {
+    let p = call.parent()?;
+    if p.kind() != "assignment" {
+        return None;
+    }
+    if p.child_by_field_name("right")?.id() != call.id() {
+        return None;
+    }
+    let left = p.child_by_field_name("left")?;
+    crate::ipa::py_seed_lhs(left, f.text.as_str())
+}
+
+/// One round of param/return type inference. A param (or
+/// assignment target) gets a seed only when every observed
+/// callsite/return agrees on a single class - disagreement stays
+/// unresolved rather than guessing.
+fn infer_seeds(
+    parsed: &[PyFile],
+    funcs: &HashMap<NodeId, FuncRef>,
+    cg: &callgraph::CallGraph,
+    prev: &crate::ipa::AllSeeds,
+) -> crate::ipa::AllSeeds {
+    use std::collections::HashSet;
+    let mut out = prev.clone();
+    let mut rb: HashMap<usize, crate::ipa::RBindings> = HashMap::new();
+
+    // Return class per function: all return exprs agree on one class.
+    let mut ret_cls: HashMap<NodeId, (String, String)> = HashMap::new();
+    for (nid, fr) in funcs {
+        if fr.qualname == "<module>" {
+            continue;
+        }
+        let f = &parsed[fr.file_idx];
+        let Some(fnode) = func_node(f, fr) else { continue };
+        let exprs = return_exprs(fnode);
+        if exprs.is_empty() {
+            continue;
+        }
+        if !rb.contains_key(&fr.file_idx) {
+            rb.insert(fr.file_idx, crate::ipa::resolve_bindings(f));
+        }
+        let r = &rb[&fr.file_idx];
+        let slice = prev.get(&fr.file_idx);
+        let mut cls: Option<(String, String)> = None;
+        let mut ok = true;
+        for e in exprs {
+            match seed_class_of(e, f, r, slice) {
+                Some(c) => match &cls {
+                    None => cls = Some(c),
+                    Some(p) if *p == c => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                },
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            if let Some(c) = cls {
+                ret_cls.insert(nid.clone(), c);
+            }
+        }
+    }
+
+    // (file_idx, scope_key, var) -> candidate classes.
+    let mut votes: HashMap<(usize, u32, String), HashSet<(String, String)>> =
+        HashMap::new();
+
+    for site in &cg.sites {
+        let Some(cfr) = funcs.get(&site.caller) else { continue };
+        let Some(tfr) = funcs.get(&site.callee) else { continue };
+        let cfi = cfr.file_idx;
+        let cf = &parsed[cfi];
+        let Some(call) = cf
+            .tree
+            .root_node()
+            .descendant_for_byte_range(site.start as usize, site.end as usize)
+        else {
+            continue;
+        };
+        if call.kind() != "call" {
+            continue;
+        }
+        let tf = &parsed[tfr.file_idx];
+        let tscope =
+            tfr.range.map(|r| r.0 as u32).unwrap_or(u32::MAX);
+        let cscope = scope_key_at(call);
+        let cslice = prev.get(&cfi);
+
+        // Callee has splat params -> positional mapping unreliable;
+        // only keyword args are safe to bind.
+        let callee_has_splat = func_node(tf, tfr).is_some_and(|fn_| {
+            let mut stack = vec![fn_];
+            while let Some(n) = stack.pop() {
+                if n.kind() == "parameters" {
+                    let mut cur = n.walk();
+                    if n
+                        .children(&mut cur)
+                        .any(|c| {
+                            c.kind().contains("splat")
+                                || matches!(c.kind(), "/" | "*")
+                        })
+                    {
+                        return true;
+                    }
+                }
+                stack.extend(n.children(&mut n.walk()));
+            }
+            false
+        });
+
+        let Some(argn) = call.child_by_field_name("arguments") else {
+            continue;
+        };
+        let kids: Vec<Node> =
+            argn.named_children(&mut argn.walk()).collect();
+        if kids.iter().any(|k| k.kind().contains("splat")) {
+            continue;
+        }
+        let pos: Vec<Node> = kids
+            .iter()
+            .filter(|k| k.kind() != "keyword_argument")
+            .copied()
+            .collect();
+        let kw: HashMap<String, Node> = kids
+            .iter()
+            .filter(|k| k.kind() == "keyword_argument")
+            .filter_map(|k| {
+                let name = k
+                    .child_by_field_name("name")?
+                    .utf8_text(cf.text.as_bytes())
+                    .ok()?
+                    .to_string();
+                let val = k.child_by_field_name("value")?;
+                Some((name, val))
+            })
+            .collect();
+
+        if !rb.contains_key(&cfi) {
+            rb.insert(cfi, crate::ipa::resolve_bindings(cf));
+        }
+        let cr = &rb[&cfi];
+
+        for (i, group) in tfr.params.iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let arg = if callee_has_splat {
+                // Positional indices past a splat are unreliable;
+                // only keyword binding is sound.
+                group.iter().find_map(|n| kw.get(n).copied())
+            } else {
+                pos.get(i)
+                    .copied()
+                    .or_else(|| group.iter().find_map(|n| kw.get(n).copied()))
+            };
+            let Some(arg) = arg else { continue };
+            if let Some(c) = seed_class_of(arg, cf, cr, cslice) {
+                for name in group {
+                    votes
+                        .entry((tfr.file_idx, tscope, name.clone()))
+                        .or_default()
+                        .insert(c.clone());
+                }
+            }
+        }
+
+        // `x = F()` where F provably returns class C -> seed x.
+        if let Some(rc) = ret_cls.get(&site.callee) {
+            if let Some(lhs) = assignment_lhs(call, cf) {
+                votes
+                    .entry((cfi, cscope, lhs))
+                    .or_default()
+                    .insert(rc.clone());
+            }
+        }
+    }
+
+    for ((fi, scope, var), set) in votes {
+        if set.len() == 1 {
+            let (m, c) = set.into_iter().next().unwrap();
+            out.entry(fi)
+                .or_default()
+                .entry(scope)
+                .or_default()
+                .insert(var, (m, c));
+        }
+    }
+    out
+}
+
 /// Run the full analysis.
 pub fn solve(parsed: &[PyFile], model: &Model) -> SolveOutput {
     let funcs = collect_funcs(parsed);
     let node_set: HashSet<NodeId> = funcs.keys().cloned().collect();
 
-    // Call graph edges -> adjacency restricted to known functions.
-    let cg = callgraph::build(parsed);
+    // Type inference fixpoint: inferred seeds widen the callgraph,
+    // which can enable further inference. Bounded; seeds only grow.
+    let mut extra = crate::ipa::AllSeeds::new();
+    let mut cg = callgraph::build(parsed, &extra);
+    for _ in 0..6 {
+        let next = infer_seeds(parsed, &funcs, &cg, &extra);
+        if next == extra {
+            break;
+        }
+        extra = next;
+        cg = callgraph::build(parsed, &extra);
+    }
+    cg = callgraph::build(parsed, &extra);
     let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     for ((cm, cf), (tm, tf)) in &cg.edges {
         let from = (cm.clone(), cf.clone());
@@ -296,6 +558,7 @@ pub fn solve(parsed: &[PyFile], model: &Model) -> SolveOutput {
                 model,
                 &empty_sums,
                 None,
+                extra.get(&r.file_idx),
             );
             Some((r.file_idx, analysis.env))
         })
@@ -344,6 +607,7 @@ pub fn solve(parsed: &[PyFile], model: &Model) -> SolveOutput {
                     model,
                     &summaries,
                     globals,
+                    extra.get(&fref.file_idx),
                 );
                 if analysis.budget_hit {
                     stats.budget_exceeded += 1;
@@ -502,6 +766,96 @@ def main():
                 && f.source.contains("Env")
                 && f.via.len() >= 2),
             "instance method call should propagate taint: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn param_type_inference_resolves_method() {
+        // `drive(r, cmd)` is only ever called with a Runner, so the
+        // callsite-agreement pass seeds r -> Runner inside drive.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+class Runner:
+    def run(self, cmd):
+        subprocess.call(cmd)
+
+def drive(r, cmd):
+    r.run(cmd)
+
+def main():
+    drive(Runner(), os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "param type inference should resolve r.run: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn return_type_seed_resolves_method() {
+        // make() always returns Runner -> `r = make()` seeds r.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+class Runner:
+    def run(self, cmd):
+        subprocess.call(cmd)
+
+def make():
+    return Runner()
+
+def main():
+    r = make()
+    r.run(os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "return type seed should resolve r.run: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn param_type_disagreement_stays_unresolved() {
+        // Two callsites disagree on r's class -> no seed, no guess.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+class Runner:
+    def run(self, cmd):
+        subprocess.call(cmd)
+
+class Other:
+    def run(self, cmd):
+        pass
+
+def drive(r, cmd):
+    r.run(cmd)
+
+def main():
+    drive(Runner(), os.environ["X"])
+    drive(Other(), "safe")
+"#,
+        )]);
+        assert!(
+            !out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")),
+            "disagreement must not guess a class: {:?}",
             out.findings
         );
     }

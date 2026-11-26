@@ -893,7 +893,7 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
     );
 
     let t_cg = std::time::Instant::now();
-    let cg = callgraph::build(&parsed);
+    let cg = callgraph::build(&parsed, &Default::default());
     eprintln!(
         "callgraph: {} edges, {} calls - {:.1}% resolved ({:.1?})",
         cg.edges.len(),

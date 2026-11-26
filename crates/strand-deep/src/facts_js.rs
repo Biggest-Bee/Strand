@@ -52,6 +52,8 @@ pub struct CtxJs<'a> {
     pub touches_unknown: bool,
     reported: HashSet<(SinkKind, u32, String, String)>,
     pending_result: Option<ExprVal>,
+    /// Inferred seeds for this file (param/return type propagation).
+    extra: Option<&'a crate::ipa::FileSeeds>,
 }
 
 /// Analyze a JS function body. `func_node` = function-ish node or
@@ -69,6 +71,7 @@ pub fn analyze_function_js<'a>(
     parsed: &'a [JsFile],
     file_index: &HashMap<String, usize>,
     module_level: bool,
+    extra: Option<&'a crate::ipa::FileSeeds>,
 ) -> FuncAnalysis {
     let mut ctx = CtxJs {
         f,
@@ -90,6 +93,7 @@ pub fn analyze_function_js<'a>(
         touches_unknown: false,
         reported: HashSet::new(),
         pending_result: None,
+        extra,
     };
     let mut env: HashMap<String, VarState> = globals.cloned().unwrap_or_default();
     for (i, group) in params.iter().enumerate() {
@@ -1627,7 +1631,7 @@ fn eval_call(node: Node, ctx: &mut CtxJs, env: &mut HashMap<String, VarState>) -
     }
 
     // 5. Callee resolution + summary application.
-    if let Some((cm, cf)) = resolve_callee(node, ctx.f, ctx.parsed, ctx.file_index, ctx.file_set) {
+    if let Some((cm, cf)) = resolve_callee(node, ctx.f, ctx.parsed, ctx.file_index, ctx.file_set, ctx.extra) {
         let key = (cm.clone(), cf.clone());
         if let Some(sum) = ctx.summaries.get(&key) {
             apply_summary(node, ctx, env, &args, sum, &format!("{cm}.{cf}"));
@@ -1756,6 +1760,7 @@ pub fn resolve_callee(
     parsed: &[JsFile],
     file_index: &HashMap<String, usize>,
     file_set: &BTreeSet<String>,
+    extra: Option<&crate::ipa::FileSeeds>,
 ) -> Option<NodeId> {
     let func_node = if node.kind() == "new_expression" {
         node.child_by_field_name("constructor")?
@@ -1805,14 +1810,23 @@ pub fn resolve_callee(
                 }
                 return None;
             }
-            // `r.m()` where an enclosing scope binds `r = new C()`.
-            if obj.kind() == "identifier" {
-                if let Ok(oname) = obj.utf8_text(f.text.as_bytes()) {
-                    if let Some(hit) = ctor_method_target(
-                        node, f, oname, fname, parsed, file_index, file_set,
-                    ) {
-                        return Some(hit);
-                    }
+            // `r.m()` / `this.x.m()` where an enclosing scope binds
+            // the receiver via `r = new C()` / `this.x = new C()`.
+            let recv_key = match obj.kind() {
+                "identifier" => obj
+                    .utf8_text(f.text.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string()),
+                "member_expression" | "subscript_expression" => {
+                    js_ipa::js_dotted(obj, f.text.as_str())
+                }
+                _ => None,
+            };
+            if let Some(key) = recv_key {
+                if let Some(hit) = ctor_method_target(
+                    node, f, &key, fname, parsed, file_index, file_set, extra,
+                ) {
+                    return Some(hit);
                 }
             }
             // `ns.f()` / `m.f()` where m is a module binding.
@@ -1824,7 +1838,7 @@ pub fn resolve_callee(
                 .children(&mut func_node.walk())
                 .find(|k| k.is_named())?;
             // Recurse with a synthetic check: resolve inner directly.
-            resolve_func_node(inner, f, parsed, file_index, file_set)
+            resolve_func_node(inner, f, parsed, file_index, file_set, extra)
         }
         _ => None,
     }
@@ -1841,8 +1855,9 @@ fn ctor_method_target(
     parsed: &[JsFile],
     file_index: &HashMap<String, usize>,
     file_set: &BTreeSet<String>,
+    extra: Option<&crate::ipa::FileSeeds>,
 ) -> Option<NodeId> {
-    let (spec, class) = js_ipa::ctor_seed_at(node, f, var)?;
+    let (spec, class) = js_ipa::ctor_seed_at(node, f, var, extra)?;
     if spec.is_empty() {
         return find_method_qualname(f, &class, method).map(|q| (f.rel.clone(), q));
     }
@@ -1902,6 +1917,7 @@ fn resolve_func_node(
     parsed: &[JsFile],
     file_index: &HashMap<String, usize>,
     file_set: &BTreeSet<String>,
+    extra: Option<&crate::ipa::FileSeeds>,
 ) -> Option<NodeId> {
     // Same logic as resolve_callee's dispatch, minus the call wrapper.
     match func_node.kind() {
@@ -1937,7 +1953,7 @@ fn resolve_func_node(
             let inner = func_node
                 .children(&mut func_node.walk())
                 .find(|k| k.is_named())?;
-            resolve_func_node(inner, f, parsed, file_index, file_set)
+            resolve_func_node(inner, f, parsed, file_index, file_set, extra)
         }
         _ => None,
     }
@@ -2314,6 +2330,57 @@ main();
                 && f.source.contains("Env")
                 && f.via.len() >= 2),
             "instance method call should propagate taint: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn param_type_inference_resolves_method() {
+        // drive(r, cmd) is only called with a Runner -> r seeds.
+        let out = run(&[(
+            "app.js",
+            r#"
+const cp = require('child_process');
+class Runner {
+  run(cmd) { cp.exec(cmd); }
+}
+function drive(r, cmd) { r.run(cmd); }
+function main() { drive(new Runner(), process.env.X); }
+main();
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "param type inference should resolve r.run: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn return_type_seed_resolves_method() {
+        // make() always returns new Runner() -> r seeds.
+        let out = run(&[(
+            "app.js",
+            r#"
+const cp = require('child_process');
+class Runner {
+  run(cmd) { cp.exec(cmd); }
+}
+function make() { return new Runner(); }
+function main() {
+  const r = make();
+  r.run(process.env.X);
+}
+main();
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "return type seed should resolve r.run: {:?}",
             out.findings
         );
     }

@@ -128,6 +128,8 @@ pub struct Ctx<'a> {
     nodes_left: usize,
     budget_hit: bool,
     pub findings: Vec<Finding>,
+    /// Inferred seeds for this file (param/return type propagation).
+    extra: Option<&'a crate::ipa::FileSeeds>,
     pub param_sinks: BTreeMap<usize, Vec<PendingSink>>,
     pub touches_unknown: bool,
     /// Dedup key for findings (same expr evaluated twice via
@@ -152,14 +154,15 @@ pub struct FuncAnalysis {
 
 /// Analyze a function body. `func_node` = function_definition or
 /// module; `params` = ordered param names; `qualname` = "mod.func".
-pub fn analyze_function(
-    f: &PyFile,
+pub fn analyze_function<'a>(
+    f: &'a PyFile,
     func_node: Node,
     params: &[Vec<String>],
     qualname: &str,
-    model: &Model,
-    summaries: &HashMap<(String, String), Summary>,
+    model: &'a Model,
+    summaries: &'a HashMap<(String, String), Summary>,
     globals: Option<&HashMap<String, VarState>>,
+    extra: Option<&'a crate::ipa::FileSeeds>,
 ) -> FuncAnalysis {
     let mut ctx = Ctx {
         f,
@@ -167,6 +170,7 @@ pub fn analyze_function(
         model,
         summaries,
         qualname,
+        extra,
         acquired: Vec::new(),
         released: HashSet::new(),
         escaped: HashSet::new(),
@@ -1723,26 +1727,31 @@ fn resolve_callee(node: Node, ctx: &Ctx) -> Option<(String, String)> {
                     }
                 }
             }
-            // Instance method via constructor seed: `r.m()` where an
-            // enclosing scope binds `r = C()`.
-            if obj.kind() == "identifier" {
-                if let Ok(oname) = obj.utf8_text(text.as_bytes()) {
-                    if let Some((m, class)) =
-                        crate::ipa::py_ctor_seed_at(node, ctx.f, oname)
-                    {
-                        let qual = format!("{class}.{fname}");
-                        let known = if m == ctx.f.module {
-                            ctx.f
-                                .funcs
-                                .values()
-                                .flatten()
-                                .any(|i| i.qualname == qual)
-                        } else {
-                            true
-                        };
-                        if known {
-                            return Some((m, qual));
-                        }
+            // Instance method via constructor seed: `r.m()` /
+            // `self.x.m()` where an enclosing scope binds the
+            // receiver via `r = C()` / `self.x = C()`.
+            let recv_key = match obj.kind() {
+                "identifier" => obj
+                    .utf8_text(text.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string()),
+                "attribute" => crate::ipa::py_dotted(obj, text),
+                _ => None,
+            };
+            if let Some(key) = recv_key {
+                if let Some((m, class)) = crate::ipa::py_ctor_seed_at(node, ctx.f, &key, ctx.extra) {
+                    let qual = format!("{class}.{fname}");
+                    let known = if m == ctx.f.module {
+                        ctx.f
+                            .funcs
+                            .values()
+                            .flatten()
+                            .any(|i| i.qualname == qual)
+                    } else {
+                        true
+                    };
+                    if known {
+                        return Some((m, qual));
                     }
                 }
             }

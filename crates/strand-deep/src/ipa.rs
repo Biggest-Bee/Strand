@@ -52,6 +52,14 @@ pub struct PyFile {
     pub ctor_seeds: HashMap<u32, HashMap<String, (String, String)>>,
 }
 
+/// Per-scope inferred seeds (param/return type propagation), same
+/// shape as `PyFile::ctor_seeds`. Consulted after explicit seeds.
+pub type FileSeeds =
+    std::collections::HashMap<u32, std::collections::HashMap<String, (String, String)>>;
+
+/// Inferred seeds for all files, keyed by `parsed` index.
+pub type AllSeeds = std::collections::HashMap<usize, FileSeeds>;
+
 /// Facts about one `def`: params, byte range, qualified name
 /// (`Class.method` for methods), and whether it's a method.
 #[derive(Clone)]
@@ -750,7 +758,9 @@ pub fn collect_py_ctor_seeds(
 }
 
 /// Scan one scope's subtree (pruning nested function/lambda scopes)
-/// for `name = C()` bindings.
+/// for `name = C()` / `self.x = C()` bindings. Candidates are
+/// collected then applied in source order so reassignments resolve
+/// last-write-wins deterministically.
 fn scan_py_scope(
     scope: Node,
     text: &str,
@@ -759,6 +769,7 @@ fn scan_py_scope(
     key: u32,
     out: &mut HashMap<u32, HashMap<String, (String, String)>>,
 ) {
+    let mut cands: Vec<(u32, String, String, String)> = Vec::new();
     let mut stack = vec![scope];
     while let Some(n) = stack.pop() {
         if n.id() != scope.id() && is_py_scope(n.kind()) {
@@ -768,14 +779,15 @@ fn scan_py_scope(
             let left = n.child_by_field_name("left");
             let right = n.child_by_field_name("right");
             if let (Some(l), Some(r)) = (left, right) {
-                if l.kind() == "identifier" && r.kind() == "call" {
-                    if let Some((module, class)) =
-                        py_ctor_target(r, f, rbind, text)
-                    {
-                        if let Ok(var) = l.utf8_text(text.as_bytes()) {
-                            out.entry(key)
-                                .or_default()
-                                .insert(var.to_string(), (module, class));
+                if r.kind() == "call" {
+                    if let Some((module, class)) = py_ctor_target(r, f, rbind, text) {
+                        if let Some(var) = py_seed_lhs(l, text) {
+                            cands.push((
+                                n.start_byte() as u32,
+                                var,
+                                module,
+                                class,
+                            ));
                         }
                     }
                 }
@@ -788,12 +800,47 @@ fn scan_py_scope(
             }
         }
     }
+    cands.sort_by_key(|c| c.0);
+    let scope_map = out.entry(key).or_default();
+    for (_, var, module, class) in cands {
+        scope_map.insert(var, (module, class));
+    }
+}
+
+/// Seed-map key for an assignment LHS: bare `x` or a `self.x[.y]` /
+/// `cls.x` attribute chain (dotted). Other receivers aren't tracked.
+pub fn py_seed_lhs(node: Node, text: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(text.as_bytes()).ok().map(|s| s.to_string()),
+        "attribute" => {
+            let dotted = py_dotted(node, text)?;
+            (dotted.starts_with("self.") || dotted.starts_with("cls."))
+                .then_some(dotted)
+        }
+        _ => None,
+    }
+}
+
+/// Dotted text of an identifier/attribute chain (`self.a.b` ->
+/// "self.a.b"), no module resolution.
+pub fn py_dotted(node: Node, text: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(text.as_bytes()).ok().map(|s| s.to_string()),
+        "attribute" => {
+            let obj = node.child_by_field_name("object")?;
+            let attr = node.child_by_field_name("attribute")?;
+            let base = py_dotted(obj, text)?;
+            let a = attr.utf8_text(text.as_bytes()).ok()?;
+            Some(format!("{base}.{a}"))
+        }
+        _ => None,
+    }
 }
 
 /// Resolve a `C()` / `m.C()` constructor call to (module, class).
 /// Module is already absolutized; same-file guesses use `f.module`
 /// and are verified against the methods index at the call site.
-fn py_ctor_target(
+pub fn py_ctor_target(
     call: Node,
     f: &PyFile,
     rbind: &RBindings,
@@ -852,24 +899,35 @@ pub fn py_name_ctor_target(
 /// Look up a constructor seed for `var` visible at `node`: walk
 /// ancestors innermost-first (closures shadow correctly), then the
 /// module scope. Returns (module, class name).
-pub fn py_ctor_seed_at(node: Node, f: &PyFile, var: &str) -> Option<(String, String)> {
+pub fn py_ctor_seed_at(
+    node: Node,
+    f: &PyFile,
+    var: &str,
+    extra: Option<&FileSeeds>,
+) -> Option<(String, String)> {
     let mut anc = node.parent();
     while let Some(n) = anc {
         if n.kind() == "function_definition" {
             let key = n.start_byte() as u32;
-            if let Some(hit) = f
-                .ctor_seeds
-                .get(&key)
+            // Inferred seeds win: they exist only when every
+            // callsite agrees, while explicit seeds are syntactic
+            // guesses that also fire on factory calls like `x = f()`.
+            if let Some(hit) = extra
+                .and_then(|e| e.get(&key))
                 .and_then(|m| m.get(var))
+                .or_else(|| {
+                    f.ctor_seeds.get(&key).and_then(|m| m.get(var))
+                })
             {
                 return Some(hit.clone());
             }
         }
         anc = n.parent();
     }
-    f.ctor_seeds
-        .get(&u32::MAX)
+    extra
+        .and_then(|e| e.get(&u32::MAX))
         .and_then(|m| m.get(var))
+        .or_else(|| f.ctor_seeds.get(&u32::MAX).and_then(|m| m.get(var)))
         .cloned()
 }
 

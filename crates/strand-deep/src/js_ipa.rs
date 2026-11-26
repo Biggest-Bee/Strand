@@ -137,7 +137,7 @@ fn analyze_file_tree(rel: &str, text: String, tree: Tree) -> JsFile {
 
 /// Node kinds that open a new seed scope (their bodies don't share
 /// locals with the enclosing scope).
-fn is_js_scope(kind: &str) -> bool {
+pub fn is_js_scope(kind: &str) -> bool {
     matches!(
         kind,
         "function_declaration"
@@ -178,7 +178,9 @@ fn collect_ctor_seeds(
 }
 
 /// Scan one scope's subtree (pruning nested scopes) for
-/// `name = new C()` bindings.
+/// `name = new C()` / `this.x = new C()` bindings. Candidates are
+/// collected then applied in source order so reassignments resolve
+/// last-write-wins deterministically.
 fn scan_js_scope(
     scope: Node,
     text: &str,
@@ -186,53 +188,38 @@ fn scan_js_scope(
     key: u32,
     out: &mut HashMap<u32, HashMap<String, (String, String)>>,
 ) {
+    let mut cands: Vec<(u32, String, String, String)> = Vec::new();
     let mut stack = vec![scope];
     while let Some(n) = stack.pop() {
         if n.id() != scope.id() && is_js_scope(n.kind()) {
             continue; // nested scope - scanned under its own key
         }
-        match n.kind() {
-            "variable_declarator" => {
-                let name = n.child_by_field_name("name");
-                let value = n.child_by_field_name("value");
-                if let (Some(nm), Some(v)) = (name, value) {
-                    if nm.kind() == "identifier" && v.kind() == "new_expression" {
-                        if let Some(ctor) = v.child_by_field_name("constructor") {
-                            if let Some((spec, class)) =
-                                js_ctor_target(ctor, text, bindings)
-                            {
-                                if let Ok(var) = nm.utf8_text(text.as_bytes()) {
-                                    out.entry(key).or_default().insert(
-                                        var.to_string(),
-                                        (spec, class),
-                                    );
-                                }
-                            }
+        let (lhs, rhs) = match n.kind() {
+            "variable_declarator" => (
+                n.child_by_field_name("name"),
+                n.child_by_field_name("value"),
+            ),
+            "assignment_expression" => (
+                n.child_by_field_name("left"),
+                n.child_by_field_name("right"),
+            ),
+            _ => (None, None),
+        };
+        if let (Some(l), Some(r)) = (lhs, rhs) {
+            if r.kind() == "new_expression" {
+                if let Some(ctor) = r.child_by_field_name("constructor") {
+                    if let Some((spec, class)) = js_ctor_target(ctor, text, bindings) {
+                        if let Some(var) = js_seed_lhs(l, text) {
+                            cands.push((
+                                n.start_byte() as u32,
+                                var,
+                                spec,
+                                class,
+                            ));
                         }
                     }
                 }
             }
-            "assignment_expression" => {
-                let left = n.child_by_field_name("left");
-                let right = n.child_by_field_name("right");
-                if let (Some(l), Some(r)) = (left, right) {
-                    if l.kind() == "identifier" && r.kind() == "new_expression" {
-                        if let Some(ctor) = r.child_by_field_name("constructor") {
-                            if let Some((spec, class)) =
-                                js_ctor_target(ctor, text, bindings)
-                            {
-                                if let Ok(var) = l.utf8_text(text.as_bytes()) {
-                                    out.entry(key).or_default().insert(
-                                        var.to_string(),
-                                        (spec, class),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {
@@ -241,29 +228,88 @@ fn scan_js_scope(
             }
         }
     }
+    cands.sort_by_key(|c| c.0);
+    let scope_map = out.entry(key).or_default();
+    for (_, var, spec, class) in cands {
+        scope_map.insert(var, (spec, class));
+    }
+}
+
+/// Seed-map key for an assignment LHS: bare `x` or a `this.x[.y]`
+/// member chain (dotted). Other receivers aren't tracked.
+pub fn js_seed_lhs(node: Node, text: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(text.as_bytes()).ok().map(|s| s.to_string()),
+        "member_expression" => {
+            let dotted = js_dotted(node, text)?;
+            dotted.starts_with("this.").then_some(dotted)
+        }
+        _ => None,
+    }
+}
+
+/// Dotted text of an identifier/member chain (`this.a.b` ->
+/// "this.a.b"), no module resolution.
+pub fn js_dotted(node: Node, text: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "this" => node.utf8_text(text.as_bytes()).ok().map(|s| s.to_string()),
+        "member_expression" => {
+            let obj = node.child_by_field_name("object")?;
+            let prop = node.child_by_field_name("property")?;
+            let base = js_dotted(obj, text)?;
+            let p: String = match prop.kind() {
+                "property_identifier" | "private_property_identifier" => {
+                    prop.utf8_text(text.as_bytes()).ok()?.to_string()
+                }
+                "string" | "number" => spec_string(prop, text)?,
+                _ => return None,
+            };
+            Some(format!("{base}.{p}"))
+        }
+        "subscript_expression" => {
+            let obj = node.child_by_field_name("object")?;
+            js_dotted(obj, text)
+        }
+        "parenthesized_expression" => {
+            let inner = node.children(&mut node.walk()).find(|k| k.is_named())?;
+            js_dotted(inner, text)
+        }
+        _ => None,
+    }
 }
 
 /// Look up a constructor seed for `var` visible at `node`: walk
 /// ancestors innermost-first so closures shadow correctly, then the
 /// module scope. Returns (module spec, class name).
-pub fn ctor_seed_at(node: Node, f: &JsFile, var: &str) -> Option<(String, String)> {
+pub fn ctor_seed_at(
+    node: Node,
+    f: &JsFile,
+    var: &str,
+    extra: Option<&crate::ipa::FileSeeds>,
+) -> Option<(String, String)> {
     let mut anc = node.parent();
     while let Some(n) = anc {
         if is_js_scope(n.kind()) {
             let key = n.start_byte() as u32;
-            if let Some(hit) = f
-                .ctor_seeds
-                .get(&key)
+            // Inferred seeds win over explicit guesses (see
+            // py_ctor_seed_at): unanimous callsite agreement beats a
+            // syntactic constructor guess.
+            if let Some(hit) = extra
+                .and_then(|e| e.get(&key))
                 .and_then(|m| m.get(var))
+                .or_else(|| {
+                    f.ctor_seeds.get(&key).and_then(|m| m.get(var))
+                })
             {
                 return Some(hit.clone());
             }
         }
         anc = n.parent();
     }
-    f.ctor_seeds
-        .get(&u32::MAX)
+    extra
+        .and_then(|e| e.get(&u32::MAX))
         .and_then(|m| m.get(var))
+        .or_else(|| f.ctor_seeds.get(&u32::MAX).and_then(|m| m.get(var)))
         .cloned()
 }
 

@@ -646,21 +646,27 @@ cargo test
   require); importers that know the kind collapse them into one edge.
 - `strand deep` analysis is a **may-analysis without type
   information**: dynamic dispatch, reflection, FFI boundaries, and
-  receivers that aren't plain seeded names (`self.x.m()`, `a.b.m()`,
-  values passed through parameters or returned from factories) stay
-  unresolved (counted in the blind-spot report, never guessed).
-  Instance methods do resolve when the receiver is bound by
-  `x = new C()` / `x = C()` in an enclosing scope, `new C()` reaches
-  `constructor`/`__init__`/`__new__`, and `this.m()` / `self.m()`
-  resolve inside the class body. Findings are heuristic -
+  receivers that aren't statically bound stay unresolved (counted in
+  the blind-spot report, never guessed). Resolution is syntactic and
+  scope-aware: `x = new C()` / `x = C()` seeds, `this.x = new C()` /
+  `self.x = C()` attribute seeds, `new C()` reaching
+  `constructor`/`__init__`/`__new__`, `this.m()` / `self.m()` inside
+  the class body, plus a callsite-agreement pass that seeds a
+  parameter or assignment target with a class only when *every*
+  observed callsite/return agrees (disagreement stays unresolved).
+  Remaining gaps: receivers built by unsupported expressions
+  (`a.b.c.m()` chains, values smuggled through containers),
+  callsites the graph never saw (dynamic imports, reflection), and
+  genuinely ambiguous types. Findings are heuristic -
   expect false positives on heavily dynamic code and false negatives
   where values flow through unsupported constructs. Per-language
   coverage differs: Go relies on syntactic type seeding for
   cross-function method calls, and Rust reports no local leak findings
   (RAII closes on drop) though `returns_unclosed` metadata still flows
-  through summaries - note RAII suppression is unsound for
-  `mem::forget`, `Box::leak`, `ManuallyDrop`, and reference cycles,
-  which can leak without a finding. Model files
+  through summaries - explicit leak-intent calls (`mem::forget`,
+  `Box::leak`, `ManuallyDrop::new`) do report Leak findings, but RAII
+  suppression remains unsound for `Rc`/`Arc` reference cycles, which
+  can leak without a finding. Model files
   (`crates/strand-deep/src/models/`) define sources/sinks per language
   and are a starting point, not exhaustive.
 - Store delta is in-memory, but commits auto-compact once it passes

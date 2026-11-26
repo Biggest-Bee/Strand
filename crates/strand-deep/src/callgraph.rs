@@ -61,9 +61,23 @@ impl CallStats {
     }
 }
 
+/// A resolved call site kept for the type-inference pre-pass:
+/// caller/callee ids plus the call node's byte range in `file`.
+#[derive(Clone, Debug)]
+pub struct CallSite {
+    pub caller: (String, String),
+    pub callee: (String, String),
+    /// Project-relative file path of the call node.
+    pub file: String,
+    pub start: u32,
+    pub end: u32,
+}
+
 pub struct CallGraph {
     pub edges: Vec<CallEdge>,
     pub stats: CallStats,
+    /// Every resolved call site (for param/return type inference).
+    pub sites: Vec<CallSite>,
 }
 
 /// Python builtins - not project calls, excluded from resolution
@@ -134,6 +148,8 @@ fn resolve_call(
     rbind: &RBindings,
     methods: &HashSet<(String, String)>, // (module, "Class.method")
     stats: &mut CallStats,
+    extra: &crate::ipa::AllSeeds,
+    file_idx: usize,
 ) -> Vec<((String, String), (String, String))> {
     let Some(func_node) = call.child_by_field_name("function") else {
         stats.complex_callee += 1;
@@ -227,20 +243,25 @@ fn resolve_call(
                     }
                 }
             }
-            // Instance method via constructor seed: `r.m()` where an
-            // enclosing scope binds `r = C()`.
-            if obj.kind() == "identifier" {
-                if let Ok(oname) = obj.utf8_text(text.as_bytes()) {
-                    if let Some((m, class)) =
-                        crate::ipa::py_ctor_seed_at(call, f, oname)
-                    {
-                        let qual = format!("{class}.{fname}");
-                        if methods.contains(&(m.clone(), qual.clone())) {
-                            stats.resolved_method += 1;
-                            return caller
-                                .map(|c| vec![(c, (m, qual))])
-                                .unwrap_or_default();
-                        }
+            // Instance method via constructor seed: `r.m()` /
+            // `self.x.m()` where an enclosing scope binds the
+            // receiver via `r = C()` / `self.x = C()`.
+            let recv_key = match obj.kind() {
+                "identifier" => obj
+                    .utf8_text(text.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string()),
+                "attribute" => crate::ipa::py_dotted(obj, text),
+                _ => None,
+            };
+            if let Some(key) = recv_key {
+                if let Some((m, class)) = crate::ipa::py_ctor_seed_at(call, f, &key, extra.get(&file_idx)) {
+                    let qual = format!("{class}.{fname}");
+                    if methods.contains(&(m.clone(), qual.clone())) {
+                        stats.resolved_method += 1;
+                        return caller
+                            .map(|c| vec![(c, (m, qual))])
+                            .unwrap_or_default();
                     }
                 }
             }
@@ -265,8 +286,10 @@ fn resolve_call(
     }
 }
 
-/// Build the call graph over pre-parsed files.
-pub fn build(parsed: &[PyFile]) -> CallGraph {
+/// Build the call graph over pre-parsed files. `extra` carries
+/// inferred per-file seeds (param/return type propagation) consulted
+/// after explicit constructor seeds.
+pub fn build(parsed: &[PyFile], extra: &crate::ipa::AllSeeds) -> CallGraph {
     // Global method index: (module, "Class.method") -> exists.
     let methods: HashSet<(String, String)> = parsed
         .par_iter()
@@ -282,26 +305,39 @@ pub fn build(parsed: &[PyFile]) -> CallGraph {
 
     // Per-file: resolve bindings once, then walk calls. Each file
     // contributes edges + local stats; merged in order.
-    let per_file: Vec<(Vec<CallEdge>, CallStats)> = parsed
+    let per_file: Vec<(Vec<CallEdge>, CallStats, Vec<CallSite>)> = parsed
         .par_iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(idx, f)| {
             let rbind = resolve_bindings(f);
             let mut stats = CallStats::default();
             let mut edges = Vec::new();
+            let mut sites = Vec::new();
             for node in crate::ipa::call_nodes(f) {
                 stats.total += 1;
-                for (caller, callee) in resolve_call(node, f, &rbind, &methods, &mut stats) {
+                for (caller, callee) in
+                    resolve_call(node, f, &rbind, &methods, &mut stats, extra, idx)
+                {
+                    sites.push(CallSite {
+                        caller: caller.clone(),
+                        callee: callee.clone(),
+                        file: f.rel.clone(),
+                        start: node.start_byte() as u32,
+                        end: node.end_byte() as u32,
+                    });
                     edges.push((caller, callee));
                 }
             }
-            (edges, stats)
+            (edges, stats, sites)
         })
         .collect();
 
     let mut edges = Vec::new();
     let mut stats = CallStats::default();
+    let mut sites = Vec::new();
     let mut seen: HashSet<CallEdge> = HashSet::new();
-    for (fe, fs) in per_file {
+    for (fe, fs, fsites) in per_file {
+        sites.extend(fsites);
         stats.total += fs.total;
         stats.resolved_import += fs.resolved_import;
         stats.resolved_local += fs.resolved_local;
@@ -318,5 +354,5 @@ pub fn build(parsed: &[PyFile]) -> CallGraph {
         }
     }
     edges.sort();
-    CallGraph { edges, stats }
+    CallGraph { edges, stats, sites }
 }

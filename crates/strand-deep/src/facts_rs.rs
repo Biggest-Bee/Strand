@@ -159,9 +159,9 @@ pub fn analyze_function_rs<'a>(
 
     // Rust RAII closes resources at scope end, so an unreleased
     // acquisition is NOT a leak - local leak findings are disabled
-    // for Rust (returns_unclosed still propagates for callers that
-    // explicitly forget/leak). Documented blind spot: mem::forget
-    // and Box::leak are not modeled.
+    // for Rust. Explicit leak-intent calls (mem::forget, Box::leak,
+    // ManuallyDrop::new) are reported at the call site in eval_call;
+    // Rc/Arc cycles remain a documented blind spot.
 
     let mut summary = Summary {
         // `return expr` with expr state; bare `return`/fall-off
@@ -677,6 +677,17 @@ fn resource_kind_of(assign_node: Node, ctx: &CtxRs) -> Option<String> {
         _ => None,
     };
     kind
+}
+
+/// Calls that intentionally leak: they consume the value without
+/// running Drop, so RAII suppression must not apply.
+fn is_leak_intent(dotted: &str) -> bool {
+    dotted.ends_with("::mem::forget")
+        || dotted == "mem::forget"
+        || dotted.ends_with("::Box::leak")
+        || dotted == "Box::leak"
+        || dotted.ends_with("::ManuallyDrop::new")
+        || dotted == "ManuallyDrop::new"
 }
 
 /// Dotted `::` name of a call's callee expression.
@@ -1246,6 +1257,23 @@ fn eval_call(node: Node, ctx: &mut CtxRs, env: &mut HashMap<String, VarState>) -
     }
 
     let args = call_args(node, ctx, env);
+
+    // Explicit leak-intent: `mem::forget`, `Box::leak` and
+    // `ManuallyDrop::new` suppress Drop, so a tracked resource passed
+    // here is a genuine leak - RAII no longer applies. (`Rc`/`Arc`
+    // cycles remain a documented blind spot.)
+    if is_leak_intent(&dotted) {
+        if let Some(kind) = args.first().and_then(|a| a.state.resource.clone()) {
+            push_finding_at(
+                ctx,
+                SinkKind::Leak,
+                &format!("resource:{kind}"),
+                &dotted,
+                node,
+                0.8,
+            );
+        }
+    }
 
     // Receiver value state for method calls (`x.m(...)`): used for
     // panic-method checks, sink checks on arg=None rules, and
@@ -2361,6 +2389,47 @@ fn main() {
                     && f.via.len() >= 1
             }),
             "expected shell finding, got {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn mem_forget_reports_leak() {
+        // mem::forget suppresses Drop -> real leak, unlike RAII locals.
+        let out = run(&[(
+            "src/main.rs",
+            r#"use std::fs::File;
+use std::mem::forget;
+
+fn main() {
+    let f = File::open("x");
+    forget(f);
+}
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Leak
+                && f.source.contains("file")),
+            "mem::forget of a file should report a leak: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn raii_local_no_leak_finding() {
+        // Plain local: Drop runs at scope end -> no leak finding.
+        let out = run(&[(
+            "src/main.rs",
+            r#"use std::fs::File;
+
+fn main() {
+    let f = File::open("x");
+}
+"#,
+        )]);
+        assert!(
+            !out.findings.iter().any(|f| f.class == SinkKind::Leak),
+            "RAII local must not report a leak: {:?}",
             out.findings
         );
     }
