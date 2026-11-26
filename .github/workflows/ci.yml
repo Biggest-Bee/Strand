@@ -50,6 +50,10 @@ jobs:
   security:
     name: cargo audit + deny
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # audit-check posts results as a check run via the API
+      checks: write
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
