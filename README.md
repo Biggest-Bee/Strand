@@ -329,22 +329,39 @@ Store layout and the WAL/op encoding are specified in
 ## Desktop app (`strand-gui`)
 
 A native window (eframe/egui, no webview) for people who'd rather click
-than type. Run it **from the repo root** (cargo needs the workspace
-`Cargo.toml`):
+than type.
+
+**From a repo checkout** (always runs the newest source - the launcher
+pulls `main` then builds only what changed):
+
+- Windows: double-click **`strand-gui.bat`** in the repo root
+- macOS/Linux: run **`./strand-gui.sh`** from the repo root
+
+Both need the Rust toolchain installed; the first launch compiles the
+GUI (a few minutes), later launches are instant. This is the best way
+to try unreleased changes - it never drifts from the checkout.
+
+**Installed binary** (works from any directory, no repo needed):
 
 ```console
-cd path/to/Strand            # the directory containing Cargo.toml
-cargo run -p strand-gui      # or: cargo build --release -p strand-gui
+cargo install strand-cli strand-gui   # full Strand: CLI + GUI
+# or
+cargo install strand-gui              # GUI only (`strand-gui`)
+cargo install --path crates/strand-gui   # build the local checkout instead
 ```
 
-Once installed (`cargo install --path crates/strand-gui`), `strand-gui`
-also works from any directory.
+`strand-gui` then works from any directory.
 
 - **Open .strand…** loads an immutable graph; **Open store…** loads a
   `.strandb` directory (read-write if the lock is free, read-only
   otherwise - analyses work identically on the merged view); **Close**
   unloads the current graph; **Instructions** opens a full reference of
   every button and canvas gesture.
+- `.strand` files carry their **scan warnings** (dynamic imports,
+  parse errors, files the scanner couldn't reach) - they show as an
+  amber "Scan warnings" section in the left panel, and `strand info`
+  lists them on the CLI. A graph with warnings means the edge set may
+  be incomplete.
 - **Deep scan…** picks any project directory and runs the
   `strand-deep` engine on a worker thread - the same taint/null/leak
   solvers as `strand deep --analyze` for Python, JS/TS, Go, and Rust.
