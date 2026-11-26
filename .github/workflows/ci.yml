@@ -43,3 +43,34 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libssl-dev
       - run: cargo build --release --locked -p strand-cli -p strand-gui
+
+  # Supply-chain + advisory scanning so the dependency tree stays
+  # auditable. cargo audit checks Cargo.lock against the RustSec
+  # advisory DB; cargo deny enforces bans/sources policy (deny.toml).
+  security:
+    name: cargo audit + deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Dogfood: run strand's own scanner over the repo so a regression
+  # in manifest/lockfile parsing shows up in CI, not in user reports.
+  self-scan:
+    name: strand scan (self)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p strand-cli
+      - name: strand scan .
+        run: ./target/release/strand scan . -o self.strand
+      - name: strand info self.strand
+        run: ./target/release/strand info self.strand

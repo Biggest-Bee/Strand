@@ -1,0 +1,29 @@
+# cargo-deny configuration: advisories, bans, and sources.
+# Licenses are intentionally not enforced - dependency license
+# review is a maintainer decision, not a CI gate.
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+yanked = "deny"
+ignore = []
+
+[bans]
+# Duplicates are common in transitive trees (windows-sys etc); only
+# fail on exact-version duplicates of direct deps is too noisy, so
+# keep it informational via `multiple-versions = "warn"`.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
