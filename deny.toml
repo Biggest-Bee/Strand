@@ -1,6 +1,4 @@
-# cargo-deny configuration: advisories, bans, and sources.
-# Licenses are intentionally not enforced - dependency license
-# review is a maintainer decision, not a CI gate.
+# cargo-deny configuration: advisories, bans, licenses, and sources.
 
 [graph]
 all-features = true
@@ -11,16 +9,53 @@ feature-depth = 1
 [advisories]
 db-path = "~/.cargo/advisory-db"
 yanked = "deny"
-ignore = []
+# Unfixable advisories in transitive deps (no safe upgrade exists).
+# Each entry is reviewed; new advisories still fail CI.
+ignore = [
+    # ttf-parser: unmaintained, no fix (via egui font stack)
+    "RUSTSEC-2026-0192",
+    # serde_yml / libyml: unsound + unmaintained, no fix
+    "RUSTSEC-2025-0067",
+    "RUSTSEC-2025-0068",
+    # zbus_names / zvariant / zvariant_derive: merged into zbus 6.x,
+    # no safe upgrade for the zbus 5.x line used by accesskit/atspi
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]
 
 [bans]
-# Duplicates are common in transitive trees (windows-sys etc); only
-# fail on exact-version duplicates of direct deps is too noisy, so
-# keep it informational via `multiple-versions = "warn"`.
+# Duplicates are common in transitive trees (windows-sys etc); keep
+# it informational rather than failing the build.
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
 skip = []
+
+[licenses]
+version = 2
+# Permissive licenses present in the dependency tree. Copyleft
+# licenses (GPL/LGPL) are intentionally absent - they only appear
+# inside OR expressions where a permissive option satisfies them.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "0BSD",
+    "Unlicense",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
 
 [sources]
 unknown-registry = "deny"
