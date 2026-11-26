@@ -372,3 +372,45 @@ fn builder_from_btreemap_sorted_names() {
     assert_eq!(g.out_targets(ap), &[m]);
     assert_eq!(g.in_targets(m), &[ap]);
 }
+
+#[test]
+fn warnings_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    b.add_edge("a", "b");
+    b.add_warning("src/x.py: 2 dynamic import site(s) - edges may be incomplete");
+    b.add_warning("lockfile drift check truncated at 10 of 42 pins");
+    let p = dir.path().join("w.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+    assert_eq!(
+        g.warnings(),
+        &[
+            "src/x.py: 2 dynamic import site(s) - edges may be incomplete".to_string(),
+            "lockfile drift check truncated at 10 of 42 pins".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn warnings_empty_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = build(&[("a", "b")], &dir);
+    let g = Graph::open(&p).unwrap();
+    assert!(g.warnings().is_empty());
+}
+
+#[test]
+fn warnings_with_node_kinds() {
+    // Warnings must coexist with the node_meta kind tables.
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = GraphBuilder::new();
+    b.add_edge("a", "b");
+    b.set_kind("a", "crate");
+    b.add_warning("dep: possible drift");
+    let p = dir.path().join("wk.strand");
+    b.build(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+    assert_eq!(g.node_kind(g.node_id("a").unwrap()), Some("crate"));
+    assert_eq!(g.warnings(), &["dep: possible drift".to_string()]);
+}

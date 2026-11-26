@@ -114,6 +114,9 @@ struct StrandApp {
     backend: Option<Backend>,
     source_label: String,
     status: String,
+    /// Scan warnings stored in a `.strand` file at build time
+    /// (empty for stores and pre-feature files).
+    warnings: Vec<String>,
 
     // Node selection (names resolved to ids at query time).
     node_a: String,
@@ -513,6 +516,7 @@ impl StrandApp {
             backend: None,
             source_label: "no graph open - File -> Open...".to_string(),
             status: String::new(),
+            warnings: Vec::new(),
             node_a: String::new(),
             node_b: String::new(),
             sel_a: None,
@@ -573,6 +577,7 @@ impl StrandApp {
                     g.n_nodes(),
                     g.n_edges()
                 );
+                self.warnings = g.warnings().to_vec();
                 self.backend = Some(Backend::File(std::sync::Arc::new(g)));
                 self.reset_query_state();
                 self.collect_names();
@@ -606,6 +611,7 @@ impl StrandApp {
                     if writable { "read-write" } else { "read-only" }
                 );
                 self.backend = Some(Backend::Store(s));
+                self.warnings = Vec::new();
                 self.reset_query_state();
                 self.collect_names();
                 let w = self.cap_warning();
@@ -676,6 +682,7 @@ impl StrandApp {
 
     fn close_graph(&mut self) {
         self.backend = None;
+        self.warnings = Vec::new();
         self.source_label = "no graph open - File -> Open...".to_string();
         self.status = "closed".to_string();
         self.reset_query_state();
@@ -2046,6 +2053,21 @@ impl eframe::App for StrandApp {
                     self.sel_a.map(|i| i.to_string()).unwrap_or("-".into()),
                     self.sel_b.map(|i| i.to_string()).unwrap_or("-".into())
                 ));
+                if !self.warnings.is_empty() {
+                    ui.add_space(4.0);
+                    ui.collapsing(
+                        egui::RichText::new(format!("Scan warnings ({})", self.warnings.len()))
+                            .color(egui::Color32::from_rgb(255, 200, 80)),
+                        |ui| {
+                            for w in &self.warnings {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 200, 80),
+                                    w,
+                                );
+                            }
+                        },
+                    );
+                }
                 ui.add_space(8.0);
                 ui.label("max depth (blank = all):");
                 ui.text_edit_singleline(&mut self.depth_limit);

@@ -531,7 +531,16 @@ fn run(cmd: Commands) -> strand_core::Result<()> {
 // ---------- helpers ----------
 
 fn open_graph(path: &PathBuf) -> strand_core::Result<Graph> {
-    Graph::open(path)
+    let g = Graph::open(path)?;
+    let n = g.warnings().len();
+    if n > 0 {
+        eprintln!(
+            "warning: graph has {n} scan warning(s) - edges may be incomplete \
+             (run `strand info {}` to see them)",
+            path.display()
+        );
+    }
+    Ok(g)
 }
 
 fn node_id(graph: &Graph, name: &str) -> strand_core::Result<u32> {
@@ -625,6 +634,9 @@ fn cmd_scan(a: ScanArgs) -> strand_core::Result<()> {
     let mut b = GraphBuilder::new();
     for n in &scan.nodes {
         b.add_node(n.clone());
+    }
+    for w in &scan.warnings {
+        b.add_warning(w.clone());
     }
     strand_import::fill_builder(edges, &mut b)?;
     let stats = b.build(&out)?;
@@ -764,6 +776,9 @@ fn cmd_trace(a: TraceArgs) -> strand_core::Result<()> {
     let mut b = GraphBuilder::new();
     for n in &scan.nodes {
         b.add_node(n.clone());
+    }
+    for w in &scan.warnings {
+        b.add_warning(w.clone());
     }
     strand_import::fill_builder(edges, &mut b)?;
     let stats = b.build(&out)?;
@@ -1205,6 +1220,9 @@ fn cmd_deep(a: DeepArgs) -> strand_core::Result<()> {
     for n in &scan.nodes {
         b.add_node(n.clone());
     }
+    for w in &scan.warnings {
+        b.add_warning(w.clone());
+    }
     strand_import::fill_builder(scan.edges, &mut b)?;
     for (s, d, k) in &res.edges {
         b.add_edge_weighted_kind(s.clone(), d.clone(), 1.0, *k);
@@ -1239,6 +1257,7 @@ fn root_name(root: &Path) -> String {
 fn cmd_info(a: InfoArgs) -> strand_core::Result<()> {
     let g = open_graph(&a.file)?;
     let size = std::fs::metadata(&a.file).map(|m| m.len()).unwrap_or(0);
+    let warnings: Vec<&str> = g.warnings().iter().map(String::as_str).collect();
     if a.json {
         print_json(serde_json::json!({
             "file": a.file.display().to_string(),
@@ -1246,6 +1265,7 @@ fn cmd_info(a: InfoArgs) -> strand_core::Result<()> {
             "n_edges": g.n_edges(),
             "has_weights": g.has_weights(),
             "size_bytes": size,
+            "warnings": warnings,
         }));
     } else {
         println!("file:        {}", a.file.display());
@@ -1253,6 +1273,10 @@ fn cmd_info(a: InfoArgs) -> strand_core::Result<()> {
         println!("edges:       {}", g.n_edges());
         println!("weighted:    {}", g.has_weights());
         println!("size:        {} bytes", size);
+        println!("warnings:    {}", warnings.len());
+        for w in &warnings {
+            println!("  warn: {w}");
+        }
     }
     Ok(())
 }

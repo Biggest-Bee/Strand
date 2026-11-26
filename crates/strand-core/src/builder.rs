@@ -63,6 +63,10 @@ pub struct GraphBuilder {
     /// True once any edge carries a non-`Static` kind - gates writing
     /// the edge-kind tables into `node_meta`.
     has_edge_kinds: bool,
+    /// Scan warnings persisted into `node_meta` trailing bytes so
+    /// readers (CLI, GUI) can surface "edges may be incomplete" notes
+    /// without re-running the scan.
+    warnings: Vec<String>,
 }
 
 impl Default for GraphBuilder {
@@ -83,6 +87,7 @@ impl GraphBuilder {
             idx_edges: Vec::new(),
             weighted: false,
             has_edge_kinds: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -211,6 +216,14 @@ impl GraphBuilder {
         self.kinds.insert(node.into(), kind.into());
     }
 
+    /// Persist a scan warning (e.g. "3 dynamic import site(s) - edges
+    /// may be incomplete") into the file. Stored as trailing bytes of
+    /// the `node_meta` section; readers that predate this feature
+    /// ignore them.
+    pub fn add_warning(&mut self, warning: impl Into<String>) {
+        self.warnings.push(warning.into());
+    }
+
     pub fn len(&self) -> usize {
         self.edges.len() + self.idx_edges.len()
     }
@@ -303,9 +316,31 @@ impl GraphBuilder {
         }
         let name_index: Vec<u32> = (0..names.len() as u32).collect();
 
-        // 6. Optional node_meta: kind tags + edge-kind tables.
-        let meta_content =
+        // 6. Optional node_meta: kind tags + edge-kind tables + warnings.
+        let mut meta_content =
             self.encode_meta(n_nodes as usize, &name_to_id, &fwd_kinds, &rev_kinds)?;
+        if !self.warnings.is_empty() {
+            // Trailing blob inside the section, after the length-prefixed
+            // payload: [u64 text_len][utf8 warnings joined by '\n'].
+            // Old readers slice exactly payload_len and never see this.
+            //
+            // encode_meta's empty-payload sentinel is payload_len=8
+            // (it only works while the section is exactly 8 bytes).
+            // With warnings appended the section is longer, so rewrite
+            // it as a real payload_len=0 or readers would parse the
+            // warnings blob as kind data.
+            if meta_content.len() == 8 && meta_content == 8u64.to_le_bytes() {
+                meta_content = 0u64.to_le_bytes().to_vec();
+            }
+            let text = self
+                .warnings
+                .iter()
+                .map(|w| w.replace('\n', " "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            meta_content.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            meta_content.extend_from_slice(text.as_bytes());
+        }
 
         // 7. Lay out sections and assemble the body (everything after the
         //    128-byte header), padding each section to 8 bytes.
@@ -408,7 +443,8 @@ impl GraphBuilder {
     /// edge carries a non-`Static` kind, two trailing `u8` tables of
     /// `n_edges` entries each follow - forward-CSR order then
     /// reverse-CSR order. Readers that predate edge kinds stop after
-    /// the node ids and ignore the tail.
+    /// the node ids and ignore the tail. Scan warnings are appended
+    /// by the caller *after* this prefix+payload, outside `payload_len`.
     fn encode_meta(
         &self,
         n_nodes: usize,

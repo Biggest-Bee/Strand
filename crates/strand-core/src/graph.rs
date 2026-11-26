@@ -36,6 +36,9 @@ pub struct Graph {
     /// `node_meta`: `(fwd_off, rev_off)`, each `n_edges` bytes long.
     /// `None` for files written before edge kinds existed.
     edge_kinds: Option<(usize, usize)>,
+    /// Scan warnings persisted as trailing `node_meta` bytes
+    /// (files written before this feature have none).
+    warnings: Vec<String>,
 }
 
 impl Graph {
@@ -106,6 +109,7 @@ impl Graph {
             ranges: [(0, 0); N_SECTIONS],
             kinds: None,
             edge_kinds: None,
+            warnings: Vec::new(),
         };
         for (i, &(off, len)) in lay.iter().enumerate() {
             g.ranges[i] = (off as usize, len as usize);
@@ -115,6 +119,7 @@ impl Graph {
         let (kinds, edge_kinds) = g.parse_meta()?;
         g.kinds = kinds;
         g.edge_kinds = edge_kinds;
+        g.warnings = g.parse_warnings()?;
         Ok(g)
     }
 
@@ -246,6 +251,30 @@ impl Graph {
             )));
         };
         Ok((kinds, edge_kinds))
+    }
+
+    /// Parse the optional warnings blob trailing the `node_meta`
+    /// payload: `[u64 text_len][utf8 warnings joined by '\n']`.
+    /// Anything past `payload_len` that isn't this blob is ignored so
+    /// future extensions stay forward-compatible.
+    fn parse_warnings(&self) -> Result<Vec<String>> {
+        let (off, len) = self.ranges[format::sec::NODE_META];
+        if len < 8 {
+            return Ok(Vec::new());
+        }
+        let payload_len = read_u64(&self.mmap, off)? as usize;
+        let data_end = off + 8 + payload_len;
+        if data_end + 8 > off + len {
+            return Ok(Vec::new()); // no room for the blob header
+        }
+        let trail = &self.mmap[data_end..off + len];
+        let text_len = u64::from_le_bytes(trail[..8].try_into().unwrap()) as usize;
+        if text_len > trail.len() - 8 {
+            return Err(Error::Invalid("node_meta warnings blob truncated".into()));
+        }
+        let text = std::str::from_utf8(&trail[8..8 + text_len])
+            .map_err(|e| Error::Invalid(format!("node_meta warnings not utf-8: {e}")))?;
+        Ok(text.lines().map(str::to_string).collect())
     }
 
     // ---- typed section access (bounds already validated at open) ----
@@ -412,6 +441,14 @@ impl Graph {
         let s = offs[id as usize] as usize;
         let e = offs[id as usize + 1] as usize;
         Some(&w[s..e])
+    }
+
+    /// Scan warnings stored in the file at build time (e.g. dynamic
+    /// imports the scanner could not resolve). Empty for graphs built
+    /// from edge lists or before this feature existed.
+    #[inline]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Number of dependencies of `id`.

@@ -96,6 +96,18 @@ slices. Edge-kind tags are the `EdgeKind` confidence values
 and treat every edge as `Static`; writers omit the tables entirely for
 all-`Static` graphs, so files stay byte-identical to the old format.
 
+After the payload (outside `payload_len`), the section may carry a
+warnings blob written by `strand scan`/`trace`/`deep`:
+
+```
+u64 text_len
+utf8 text                  // warnings joined by '\n', one per line
+```
+
+Readers that predate warnings slice exactly `payload_len` bytes and
+never see the blob; `payload_len` stays payload-only so old files and
+old readers interoperate in both directions.
+
 ## Validation (reader contract)
 
 `Graph::open` must reject, with an error (never a crash or panic):
