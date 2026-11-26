@@ -1,6 +1,6 @@
 [package]
 name = "strand-deep"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Interprocedural analysis engine: call graphs, dynamic-import resolution, and taint/null/leak summary solvers for Python, JS/TS, Go, and Rust"
 license = "Apache-2.0"

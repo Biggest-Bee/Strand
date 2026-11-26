@@ -23,10 +23,10 @@ const LOCK_VERSIONS: &str = include_str!(concat!(env!("OUT_DIR"), "/strand_versi
 const FALLBACK_VERSIONS: &[(&str, &str)] = &[
     ("strand-core", "0.2.1"),
     ("strand-import", "0.14.0"),
-    ("strand-deep", "0.2.0"),
+    ("strand-deep", "0.3.0"),
     ("strand-store", "0.2.2"),
-    ("strand-cli", "0.4.1"),
-    ("strand-gui", "0.3.9"),
+    ("strand-cli", "0.4.2"),
+    ("strand-gui", "0.3.10"),
 ];
 
 const CRATES: &[&str] = &[
