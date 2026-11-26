@@ -1849,8 +1849,12 @@ pub fn resolve_callee(
                     .utf8_text(f.text.as_bytes())
                     .ok()
                     .map(|s| s.to_string()),
-                "member_expression" | "subscript_expression" => {
-                    js_ipa::js_dotted(obj, f.text.as_str())
+                "member_expression" => js_ipa::js_dotted(obj, f.text.as_str()),
+                // `x[i].m()` -> element key "x[]".
+                "subscript_expression" => {
+                    let v = obj.child_by_field_name("object")?;
+                    js_ipa::js_dotted(v, f.text.as_str())
+                        .map(|b| format!("{b}[]"))
                 }
                 _ => None,
             };
@@ -2452,6 +2456,32 @@ main();
                 && f.source.contains("Env")
                 && f.via.len() >= 2),
             "call-result receiver should resolve: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn container_element_seed_resolves_method() {
+        // const rs = [new Runner()] seeds element type; rs[0].run().
+        let out = run(&[(
+            "app.js",
+            r#"
+const cp = require('child_process');
+class Runner {
+  run(cmd) { cp.exec(cmd); }
+}
+function main() {
+  const rs = [new Runner()];
+  rs[0].run(process.env.X);
+}
+main();
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "container element seed should resolve: {:?}",
             out.findings
         );
     }

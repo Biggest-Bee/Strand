@@ -904,6 +904,32 @@ def main():
     }
 
     #[test]
+    fn container_element_seed_resolves_method() {
+        // rs = [Runner()] seeds the element type; rs[0].run resolves.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+class Runner:
+    def run(self, cmd):
+        subprocess.call(cmd)
+
+def main():
+    rs = [Runner()]
+    rs[0].run(os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "container element seed should resolve: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
     fn class_call_resolves_init() {
         // `Runner(x)` invokes Runner.__init__.
         let out = run(&[(

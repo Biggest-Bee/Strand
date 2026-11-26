@@ -790,6 +790,62 @@ fn scan_py_scope(
                             ));
                         }
                     }
+                } else if matches!(r.kind(), "list" | "set" | "dictionary") {
+                    // `x = [C(), ...]` / `x = {"k": C()}` - seed the
+                    // element type "x[]" when all ctor elements agree.
+                    let mut elems: Vec<Node> = Vec::new();
+                    let mut st = vec![r];
+                    while let Some(en) = st.pop() {
+                        match en.kind() {
+                            "list" | "set" | "dictionary" | "tuple" => {
+                                let mut ec = en.walk();
+                                for ch in en.children(&mut ec) {
+                                    if ch.is_named() {
+                                        st.push(ch);
+                                    }
+                                }
+                            }
+                            "pair" => {
+                                if let Some(v) = en.child_by_field_name("value") {
+                                    elems.push(v);
+                                }
+                            }
+                            "call" => elems.push(en),
+                            _ => {}
+                        }
+                    }
+                    let mut cls: Option<(String, String)> = None;
+                    let mut ok = !elems.is_empty();
+                    for e in elems {
+                        match py_ctor_target(e, f, rbind, text) {
+                            Some(c) => match &cls {
+                                None => cls = Some(c),
+                                Some(p) if *p == c => {}
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        if let (Some(var), Some((module, class))) =
+                            (py_seed_lhs(l, text), cls)
+                        {
+                            if !var.ends_with("[]") {
+                                cands.push((
+                                    n.start_byte() as u32,
+                                    format!("{var}[]"),
+                                    module,
+                                    class,
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -817,6 +873,12 @@ pub fn py_seed_lhs(node: Node, text: &str) -> Option<String> {
             (dotted.starts_with("self.") || dotted.starts_with("cls."))
                 .then_some(dotted)
         }
+        // `x[i] = C()` seeds the element type under "x[]".
+        "subscript" => {
+            let v = node.child_by_field_name("value")?;
+            let base = py_dotted(v, text)?;
+            Some(format!("{base}[]"))
+        }
         _ => None,
     }
 }
@@ -832,6 +894,13 @@ pub fn py_dotted(node: Node, text: &str) -> Option<String> {
             let base = py_dotted(obj, text)?;
             let a = attr.utf8_text(text.as_bytes()).ok()?;
             Some(format!("{base}.{a}"))
+        }
+        // `x[i]` collapses to the element key "x[]" (may-analysis:
+        // any element may hold the seeded class).
+        "subscript" => {
+            let v = node.child_by_field_name("value")?;
+            let base = py_dotted(v, text)?;
+            Some(format!("{base}[]"))
         }
         _ => None,
     }

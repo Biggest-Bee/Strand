@@ -219,6 +219,51 @@ fn scan_js_scope(
                         }
                     }
                 }
+            } else if r.kind() == "array" {
+                // `x = [new C(), ...]` - seed element type "x[]" when
+                // all constructor elements agree.
+                let mut cls: Option<(String, String)> = None;
+                let mut ok = false;
+                let mut ac = r.walk();
+                for el in r
+                    .named_children(&mut ac)
+                    .filter(|k| k.kind() == "new_expression")
+                {
+                    ok = true;
+                    if let Some(ctor) = el.child_by_field_name("constructor") {
+                        match js_ctor_target(ctor, text, bindings) {
+                            Some(c) => match &cls {
+                                None => cls = Some(c),
+                                Some(p) if *p == c => {}
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    if let (Some(var), Some((spec, class))) =
+                        (js_seed_lhs(l, text), cls)
+                    {
+                        if !var.ends_with("[]") {
+                            cands.push((
+                                n.start_byte() as u32,
+                                format!("{var}[]"),
+                                spec,
+                                class,
+                            ));
+                        }
+                    }
+                }
             }
         }
         let mut c = n.walk();
@@ -243,6 +288,12 @@ pub fn js_seed_lhs(node: Node, text: &str) -> Option<String> {
         "member_expression" => {
             let dotted = js_dotted(node, text)?;
             dotted.starts_with("this.").then_some(dotted)
+        }
+        // `x[i] = new C()` seeds the element type under "x[]".
+        "subscript_expression" => {
+            let v = node.child_by_field_name("object")?;
+            let base = js_dotted(v, text)?;
+            Some(format!("{base}[]"))
         }
         _ => None,
     }

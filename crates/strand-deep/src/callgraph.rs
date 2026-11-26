@@ -275,7 +275,7 @@ fn resolve_call(
                     .utf8_text(text.as_bytes())
                     .ok()
                     .map(|s| s.to_string()),
-                "attribute" => crate::ipa::py_dotted(obj, text),
+                "attribute" | "subscript" => crate::ipa::py_dotted(obj, text),
                 _ => None,
             };
             if let Some(key) = recv_key {
