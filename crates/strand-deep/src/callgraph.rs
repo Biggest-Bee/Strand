@@ -9,7 +9,7 @@
 //! Everything else is counted in [`CallStats`] by reason - this is
 //! the measurement instrument for spike #1 (call resolution rate).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 use tree_sitter::Node;
@@ -149,6 +149,7 @@ fn resolve_call(
     methods: &HashSet<(String, String)>, // (module, "Class.method")
     stats: &mut CallStats,
     extra: &crate::ipa::AllSeeds,
+    ret: &HashMap<(String, String), (String, String)>,
     file_idx: usize,
 ) -> Vec<((String, String), (String, String))> {
     let Some(func_node) = call.child_by_field_name("function") else {
@@ -243,6 +244,29 @@ fn resolve_call(
                     }
                 }
             }
+            // `f().m()` - resolve the inner call and use its
+            // callee's inferred return class.
+            if obj.kind() == "call" {
+                let mut dummy = CallStats::default();
+                let mut classes: HashSet<(String, String)> = HashSet::new();
+                for (_, callee) in resolve_call(
+                    obj, f, rbind, methods, &mut dummy, extra, ret, file_idx,
+                ) {
+                    if let Some(c) = ret.get(&callee) {
+                        classes.insert(c.clone());
+                    }
+                }
+                if classes.len() == 1 {
+                    let (m, class) = classes.into_iter().next().unwrap();
+                    let qual = format!("{class}.{fname}");
+                    if methods.contains(&(m.clone(), qual.clone())) {
+                        stats.resolved_method += 1;
+                        return caller
+                            .map(|c| vec![(c, (m, qual))])
+                            .unwrap_or_default();
+                    }
+                }
+            }
             // Instance method via constructor seed: `r.m()` /
             // `self.x.m()` where an enclosing scope binds the
             // receiver via `r = C()` / `self.x = C()`.
@@ -289,7 +313,11 @@ fn resolve_call(
 /// Build the call graph over pre-parsed files. `extra` carries
 /// inferred per-file seeds (param/return type propagation) consulted
 /// after explicit constructor seeds.
-pub fn build(parsed: &[PyFile], extra: &crate::ipa::AllSeeds) -> CallGraph {
+pub fn build(
+    parsed: &[PyFile],
+    extra: &crate::ipa::AllSeeds,
+    ret: &HashMap<(String, String), (String, String)>,
+) -> CallGraph {
     // Global method index: (module, "Class.method") -> exists.
     let methods: HashSet<(String, String)> = parsed
         .par_iter()
@@ -316,7 +344,7 @@ pub fn build(parsed: &[PyFile], extra: &crate::ipa::AllSeeds) -> CallGraph {
             for node in crate::ipa::call_nodes(f) {
                 stats.total += 1;
                 for (caller, callee) in
-                    resolve_call(node, f, &rbind, &methods, &mut stats, extra, idx)
+                    resolve_call(node, f, &rbind, &methods, &mut stats, extra, ret, idx)
                 {
                     sites.push(CallSite {
                         caller: caller.clone(),

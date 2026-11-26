@@ -130,6 +130,8 @@ pub struct Ctx<'a> {
     pub findings: Vec<Finding>,
     /// Inferred seeds for this file (param/return type propagation).
     extra: Option<&'a crate::ipa::FileSeeds>,
+    /// Inferred return classes: (module, qualname) -> (module, class).
+    ret_classes: Option<&'a HashMap<(String, String), (String, String)>>,
     pub param_sinks: BTreeMap<usize, Vec<PendingSink>>,
     pub touches_unknown: bool,
     /// Dedup key for findings (same expr evaluated twice via
@@ -163,6 +165,7 @@ pub fn analyze_function<'a>(
     summaries: &'a HashMap<(String, String), Summary>,
     globals: Option<&HashMap<String, VarState>>,
     extra: Option<&'a crate::ipa::FileSeeds>,
+    ret_classes: Option<&'a HashMap<(String, String), (String, String)>>,
 ) -> FuncAnalysis {
     let mut ctx = Ctx {
         f,
@@ -171,6 +174,7 @@ pub fn analyze_function<'a>(
         summaries,
         qualname,
         extra,
+        ret_classes,
         acquired: Vec::new(),
         released: HashSet::new(),
         escaped: HashSet::new(),
@@ -1094,6 +1098,13 @@ fn dotted_expr(node: Node, ctx: &Ctx) -> Option<String> {
             let v = node.child_by_field_name("value")?;
             dotted_expr(v, ctx)
         }
+        // `f().m()` - render the call as `f()` so the attribute chain
+        // still produces a name; resolve_callee does the real work.
+        "call" => {
+            let func = node.child_by_field_name("function")?;
+            let base = dotted_expr(func, ctx)?;
+            Some(format!("{base}()"))
+        }
         _ => None,
     }
 }
@@ -1724,6 +1735,29 @@ fn resolve_callee(node: Node, ctx: &Ctx) -> Option<(String, String)> {
                             }
                         }
                         return None;
+                    }
+                }
+            }
+            // `f().m()` - inner call's callee return class.
+            if obj.kind() == "call" {
+                if let Some((m0, q0)) = resolve_callee(obj, ctx) {
+                    if let Some((m, class)) = ctx
+                        .ret_classes
+                        .and_then(|r| r.get(&(m0, q0)))
+                    {
+                        let qual = format!("{class}.{fname}");
+                        let known = if *m == ctx.f.module {
+                            ctx.f
+                                .funcs
+                                .values()
+                                .flatten()
+                                .any(|i| i.qualname == qual)
+                        } else {
+                            true
+                        };
+                        if known {
+                            return Some((m.clone(), qual));
+                        }
                     }
                 }
             }

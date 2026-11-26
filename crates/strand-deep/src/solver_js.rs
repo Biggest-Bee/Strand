@@ -103,6 +103,7 @@ fn build_callgraph<'a>(
     file_set: &BTreeSet<String>,
     node_set: &HashSet<NodeId>,
     extra: &crate::ipa::AllSeeds,
+    ret: &HashMap<NodeId, (String, String)>,
 ) -> (HashMap<NodeId, Vec<NodeId>>, Vec<JsSite<'a>>) {
     let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     let mut sites = Vec::new();
@@ -128,6 +129,7 @@ fn build_callgraph<'a>(
                 file_index,
                 file_set,
                 extra.get(&fi),
+                Some(ret),
             ) else {
                 continue;
             };
@@ -232,18 +234,13 @@ fn js_assignment_lhs(call: Node, f: &JsFile) -> Option<String> {
     js_ipa::js_seed_lhs(lhs, f.text.as_str())
 }
 
-/// One round of JS param/return type inference; seeds only when all
-/// observed sites agree on a single class.
-fn infer_js_seeds<'a>(
-    parsed: &'a [JsFile],
+/// Return class per JS function: all return exprs agree on one
+/// class (spec, class). Used for `x = f()` seeds and `f().m()`.
+fn js_return_classes(
+    parsed: &[JsFile],
     funcs: &HashMap<NodeId, FuncRef>,
-    sites: &[JsSite<'a>],
     prev: &crate::ipa::AllSeeds,
-) -> crate::ipa::AllSeeds {
-    use std::collections::HashSet;
-    let mut out = prev.clone();
-
-    // Return class per function.
+) -> HashMap<NodeId, (String, String)> {
     let mut ret_cls: HashMap<NodeId, (String, String)> = HashMap::new();
     for (nid, fr) in funcs {
         if fr.qualname == "<module>" {
@@ -280,6 +277,20 @@ fn infer_js_seeds<'a>(
             }
         }
     }
+    ret_cls
+}
+
+/// One round of JS param/return type inference; seeds only when all
+/// observed sites agree on a single class.
+fn infer_js_seeds<'a>(
+    parsed: &'a [JsFile],
+    funcs: &HashMap<NodeId, FuncRef>,
+    sites: &[JsSite<'a>],
+    prev: &crate::ipa::AllSeeds,
+) -> crate::ipa::AllSeeds {
+    use std::collections::HashSet;
+    let mut out = prev.clone();
+    let ret_cls = js_return_classes(parsed, funcs, prev);
 
     let mut votes: HashMap<(usize, u32, String), HashSet<(String, String)>> =
         HashMap::new();
@@ -371,16 +382,18 @@ pub fn solve_js(parsed: &[JsFile], file_set: &BTreeSet<String>, model: &Model) -
     // Type inference fixpoint: inferred seeds widen the callgraph,
     // which can enable further inference. Bounded; seeds only grow.
     let mut extra = crate::ipa::AllSeeds::new();
+    let mut ret = js_return_classes(parsed, &funcs, &extra);
     let (mut adj, mut sites) =
-        build_callgraph(parsed, &file_index, file_set, &node_set, &extra);
+        build_callgraph(parsed, &file_index, file_set, &node_set, &extra, &ret);
     for _ in 0..6 {
         let next = infer_js_seeds(parsed, &funcs, &sites, &extra);
         if next == extra {
             break;
         }
         extra = next;
+        ret = js_return_classes(parsed, &funcs, &extra);
         let rebuilt =
-            build_callgraph(parsed, &file_index, file_set, &node_set, &extra);
+            build_callgraph(parsed, &file_index, file_set, &node_set, &extra, &ret);
         adj = rebuilt.0;
         sites = rebuilt.1;
     }
@@ -410,6 +423,7 @@ pub fn solve_js(parsed: &[JsFile], file_set: &BTreeSet<String>, model: &Model) -
                 &file_index,
                 true,
                 extra.get(&r.file_idx),
+                Some(&ret),
             );
             Some((r.file_idx, analysis.env))
         })
@@ -467,6 +481,7 @@ pub fn solve_js(parsed: &[JsFile], file_set: &BTreeSet<String>, model: &Model) -
                     &file_index,
                     fref.qualname == "<module>",
                     extra.get(&fref.file_idx),
+                    Some(&ret),
                 );
                 if analysis.budget_hit {
                     stats.budget_exceeded += 1;

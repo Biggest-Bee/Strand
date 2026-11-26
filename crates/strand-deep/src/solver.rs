@@ -329,17 +329,14 @@ fn assignment_lhs(call: Node, f: &PyFile) -> Option<String> {
 /// assignment target) gets a seed only when every observed
 /// callsite/return agrees on a single class - disagreement stays
 /// unresolved rather than guessing.
-fn infer_seeds(
+/// Return class per function: all return exprs agree on one class.
+/// Used both for `x = f()` seeds and `f().m()` receiver resolution.
+fn return_classes(
     parsed: &[PyFile],
     funcs: &HashMap<NodeId, FuncRef>,
-    cg: &callgraph::CallGraph,
     prev: &crate::ipa::AllSeeds,
-) -> crate::ipa::AllSeeds {
-    use std::collections::HashSet;
-    let mut out = prev.clone();
+) -> HashMap<NodeId, (String, String)> {
     let mut rb: HashMap<usize, crate::ipa::RBindings> = HashMap::new();
-
-    // Return class per function: all return exprs agree on one class.
     let mut ret_cls: HashMap<NodeId, (String, String)> = HashMap::new();
     for (nid, fr) in funcs {
         if fr.qualname == "<module>" {
@@ -380,6 +377,19 @@ fn infer_seeds(
             }
         }
     }
+    ret_cls
+}
+
+fn infer_seeds(
+    parsed: &[PyFile],
+    funcs: &HashMap<NodeId, FuncRef>,
+    cg: &callgraph::CallGraph,
+    prev: &crate::ipa::AllSeeds,
+) -> crate::ipa::AllSeeds {
+    use std::collections::HashSet;
+    let mut out = prev.clone();
+    let mut rb: HashMap<usize, crate::ipa::RBindings> = HashMap::new();
+    let ret_cls = return_classes(parsed, funcs, prev);
 
     // (file_idx, scope_key, var) -> candidate classes.
     let mut votes: HashMap<(usize, u32, String), HashSet<(String, String)>> =
@@ -516,16 +526,18 @@ pub fn solve(parsed: &[PyFile], model: &Model) -> SolveOutput {
     // Type inference fixpoint: inferred seeds widen the callgraph,
     // which can enable further inference. Bounded; seeds only grow.
     let mut extra = crate::ipa::AllSeeds::new();
-    let mut cg = callgraph::build(parsed, &extra);
+    let mut ret = return_classes(parsed, &funcs, &extra);
+    let mut cg = callgraph::build(parsed, &extra, &ret);
     for _ in 0..6 {
         let next = infer_seeds(parsed, &funcs, &cg, &extra);
         if next == extra {
             break;
         }
         extra = next;
-        cg = callgraph::build(parsed, &extra);
+        ret = return_classes(parsed, &funcs, &extra);
+        cg = callgraph::build(parsed, &extra, &ret);
     }
-    cg = callgraph::build(parsed, &extra);
+    cg = callgraph::build(parsed, &extra, &ret);
     let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     for ((cm, cf), (tm, tf)) in &cg.edges {
         let from = (cm.clone(), cf.clone());
@@ -559,6 +571,7 @@ pub fn solve(parsed: &[PyFile], model: &Model) -> SolveOutput {
                 &empty_sums,
                 None,
                 extra.get(&r.file_idx),
+                Some(&ret),
             );
             Some((r.file_idx, analysis.env))
         })
@@ -608,6 +621,7 @@ pub fn solve(parsed: &[PyFile], model: &Model) -> SolveOutput {
                     &summaries,
                     globals,
                     extra.get(&fref.file_idx),
+                    Some(&ret),
                 );
                 if analysis.budget_hit {
                     stats.budget_exceeded += 1;
@@ -856,6 +870,35 @@ def main():
             !out.findings.iter().any(|f| f.class == SinkKind::Shell
                 && f.source.contains("Env")),
             "disagreement must not guess a class: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn call_result_receiver_resolves_method() {
+        // getRunner().run(...) - the inner call's return class seeds
+        // the receiver without any assignment.
+        let out = run(&[(
+            "app.py",
+            r#"
+import os, subprocess
+
+class Runner:
+    def run(self, cmd):
+        subprocess.call(cmd)
+
+def get_runner():
+    return Runner()
+
+def main():
+    get_runner().run(os.environ["X"])
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "call-result receiver should resolve: {:?}",
             out.findings
         );
     }

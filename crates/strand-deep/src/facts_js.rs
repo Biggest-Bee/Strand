@@ -54,6 +54,8 @@ pub struct CtxJs<'a> {
     pending_result: Option<ExprVal>,
     /// Inferred seeds for this file (param/return type propagation).
     extra: Option<&'a crate::ipa::FileSeeds>,
+    /// Inferred return classes: NodeId -> (spec, class).
+    ret_classes: Option<&'a HashMap<NodeId, (String, String)>>,
 }
 
 /// Analyze a JS function body. `func_node` = function-ish node or
@@ -72,6 +74,7 @@ pub fn analyze_function_js<'a>(
     file_index: &HashMap<String, usize>,
     module_level: bool,
     extra: Option<&'a crate::ipa::FileSeeds>,
+    ret_classes: Option<&'a HashMap<NodeId, (String, String)>>,
 ) -> FuncAnalysis {
     let mut ctx = CtxJs {
         f,
@@ -94,6 +97,7 @@ pub fn analyze_function_js<'a>(
         reported: HashSet::new(),
         pending_result: None,
         extra,
+        ret_classes,
     };
     let mut env: HashMap<String, VarState> = globals.cloned().unwrap_or_default();
     for (i, group) in params.iter().enumerate() {
@@ -1154,6 +1158,17 @@ fn dotted_expr(node: Node, ctx: &CtxJs) -> Option<String> {
             let inner = node.children(&mut node.walk()).find(|k| k.is_named())?;
             dotted_expr(inner, ctx)
         }
+        // `f().m()` / `new C().m()` - render the call so the member
+        // chain still produces a name; resolve_callee resolves it.
+        "call_expression" | "new_expression" => {
+            let func = if node.kind() == "new_expression" {
+                node.child_by_field_name("constructor")?
+            } else {
+                node.child_by_field_name("function")?
+            };
+            let base = dotted_expr(func, ctx)?;
+            Some(format!("{base}()"))
+        }
         _ => None,
     }
 }
@@ -1631,7 +1646,7 @@ fn eval_call(node: Node, ctx: &mut CtxJs, env: &mut HashMap<String, VarState>) -
     }
 
     // 5. Callee resolution + summary application.
-    if let Some((cm, cf)) = resolve_callee(node, ctx.f, ctx.parsed, ctx.file_index, ctx.file_set, ctx.extra) {
+    if let Some((cm, cf)) = resolve_callee(node, ctx.f, ctx.parsed, ctx.file_index, ctx.file_set, ctx.extra, ctx.ret_classes) {
         let key = (cm.clone(), cf.clone());
         if let Some(sum) = ctx.summaries.get(&key) {
             apply_summary(node, ctx, env, &args, sum, &format!("{cm}.{cf}"));
@@ -1761,6 +1776,7 @@ pub fn resolve_callee(
     file_index: &HashMap<String, usize>,
     file_set: &BTreeSet<String>,
     extra: Option<&crate::ipa::FileSeeds>,
+    ret_classes: Option<&HashMap<NodeId, (String, String)>>,
 ) -> Option<NodeId> {
     let func_node = if node.kind() == "new_expression" {
         node.child_by_field_name("constructor")?
@@ -1810,6 +1826,22 @@ pub fn resolve_callee(
                 }
                 return None;
             }
+            // `f().m()` / `new C().m()` - inner call's return class.
+            if matches!(obj.kind(), "call_expression" | "new_expression") {
+                if let Some(callee) = resolve_callee(
+                    obj, f, parsed, file_index, file_set, extra, ret_classes,
+                ) {
+                    if let Some((spec, class)) =
+                        ret_classes.and_then(|r| r.get(&callee))
+                    {
+                        if let Some(hit) = seed_method_target(
+                            f, spec, class, fname, parsed, file_index, file_set,
+                        ) {
+                            return Some(hit);
+                        }
+                    }
+                }
+            }
             // `r.m()` / `this.x.m()` where an enclosing scope binds
             // the receiver via `r = new C()` / `this.x = new C()`.
             let recv_key = match obj.kind() {
@@ -1838,7 +1870,7 @@ pub fn resolve_callee(
                 .children(&mut func_node.walk())
                 .find(|k| k.is_named())?;
             // Recurse with a synthetic check: resolve inner directly.
-            resolve_func_node(inner, f, parsed, file_index, file_set, extra)
+            resolve_func_node(inner, f, parsed, file_index, file_set, extra, ret_classes)
         }
         _ => None,
     }
@@ -1858,13 +1890,27 @@ fn ctor_method_target(
     extra: Option<&crate::ipa::FileSeeds>,
 ) -> Option<NodeId> {
     let (spec, class) = js_ipa::ctor_seed_at(node, f, var, extra)?;
+    seed_method_target(f, &spec, &class, method, parsed, file_index, file_set)
+}
+
+/// `class.method` lookup: empty spec = same file, else resolve the
+/// module spec to its file.
+fn seed_method_target(
+    f: &JsFile,
+    spec: &str,
+    class: &str,
+    method: &str,
+    parsed: &[JsFile],
+    file_index: &HashMap<String, usize>,
+    file_set: &BTreeSet<String>,
+) -> Option<NodeId> {
     if spec.is_empty() {
-        return find_method_qualname(f, &class, method).map(|q| (f.rel.clone(), q));
+        return find_method_qualname(f, class, method).map(|q| (f.rel.clone(), q));
     }
-    let rel = js_ipa::resolve_spec(&f.rel, &spec, file_set)?;
+    let rel = js_ipa::resolve_spec(&f.rel, spec, file_set)?;
     let idx = *file_index.get(&rel)?;
     let tf = parsed.get(idx)?;
-    find_method_qualname(tf, &class, method).map(|q| (rel, q))
+    find_method_qualname(tf, class, method).map(|q| (rel, q))
 }
 
 /// `new C()` -> the `C.constructor` method when defined, in the
@@ -1918,6 +1964,7 @@ fn resolve_func_node(
     file_index: &HashMap<String, usize>,
     file_set: &BTreeSet<String>,
     extra: Option<&crate::ipa::FileSeeds>,
+    ret_classes: Option<&HashMap<NodeId, (String, String)>>,
 ) -> Option<NodeId> {
     // Same logic as resolve_callee's dispatch, minus the call wrapper.
     match func_node.kind() {
@@ -1953,7 +2000,7 @@ fn resolve_func_node(
             let inner = func_node
                 .children(&mut func_node.walk())
                 .find(|k| k.is_named())?;
-            resolve_func_node(inner, f, parsed, file_index, file_set, extra)
+            resolve_func_node(inner, f, parsed, file_index, file_set, extra, ret_classes)
         }
         _ => None,
     }
@@ -2381,6 +2428,30 @@ main();
                 && f.source.contains("Env")
                 && f.via.len() >= 2),
             "return type seed should resolve r.run: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn call_result_receiver_resolves_method() {
+        // getRunner().run(...) resolves via the callee's return class.
+        let out = run(&[(
+            "app.js",
+            r#"
+const cp = require('child_process');
+class Runner {
+  run(cmd) { cp.exec(cmd); }
+}
+function getRunner() { return new Runner(); }
+function main() { getRunner().run(process.env.X); }
+main();
+"#,
+        )]);
+        assert!(
+            out.findings.iter().any(|f| f.class == SinkKind::Shell
+                && f.source.contains("Env")
+                && f.via.len() >= 2),
+            "call-result receiver should resolve: {:?}",
             out.findings
         );
     }

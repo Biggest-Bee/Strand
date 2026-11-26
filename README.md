@@ -653,11 +653,12 @@ cargo test
   `constructor`/`__init__`/`__new__`, `this.m()` / `self.m()` inside
   the class body, plus a callsite-agreement pass that seeds a
   parameter or assignment target with a class only when *every*
-  observed callsite/return agrees (disagreement stays unresolved).
+  observed callsite/return agrees (disagreement stays unresolved),
+  and `f().m()` resolves through the callee's inferred return class.
   Remaining gaps: receivers built by unsupported expressions
-  (`a.b.c.m()` chains, values smuggled through containers),
-  callsites the graph never saw (dynamic imports, reflection), and
-  genuinely ambiguous types. Findings are heuristic -
+  (container elements like `rs[0].m()`, values smuggled through
+  data structures), callsites the graph never saw (dynamic imports,
+  reflection), and genuinely ambiguous types. Findings are heuristic -
   expect false positives on heavily dynamic code and false negatives
   where values flow through unsupported constructs. Per-language
   coverage differs: Go relies on syntactic type seeding for
