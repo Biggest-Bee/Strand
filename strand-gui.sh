@@ -1,9 +1,10 @@
 #!/bin/sh
-# Launch the Strand GUI from the repo root.
-# Uses the installed strand-gui binary if present, else cargo run.
+# Launch the Strand GUI built from this repo's current source.
+# `cargo run` rebuilds only when sources changed, so the GUI always
+# matches the checkout - no drift vs. an installed strand-gui binary.
 cd "$(dirname "$0")"
-if command -v strand-gui >/dev/null 2>&1; then
-    exec strand-gui "$@"
-else
-    exec cargo run -p strand-gui "$@"
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo not found - install Rust from https://rustup.rs first" >&2
+    exit 1
 fi
+exec cargo run --release -p strand-gui "$@"
