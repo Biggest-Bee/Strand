@@ -785,6 +785,5 @@ cargo test
 
 ## License
 
-[Apache-2.0](LICENSE) - permissive, patent-granting, and it explicitly
-allows creating content about the software (reviews, videos, tutorials)
-without permission.
+[MIT](LICENSE) - permissive, do whatever you want, just keep the
+copyright notice.
